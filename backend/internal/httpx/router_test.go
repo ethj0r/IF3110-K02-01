@@ -4,11 +4,23 @@ import (
 	Context "context"
 	Json "encoding/json"
 	Errors "errors"
+	Chi "github.com/go-chi/chi/v5"
 	Http "net/http"
 	Httptest "net/http/httptest"
 	Strings "strings"
 	Testing "testing"
 )
+
+func TestRouterRegistersFeatures(T *Testing.T) {
+	Router := NewRouter(func(Context.Context) error { return nil }, Http.NotFoundHandler(), func(Api Chi.Router) {
+		Api.Get("/feature", func(W Http.ResponseWriter, R *Http.Request) { JSON(W, 200, map[string]bool{"registered": true}) })
+	})
+	Response := Httptest.NewRecorder()
+	Router.ServeHTTP(Response, Httptest.NewRequest("GET", "/api/feature", nil))
+	if Response.Code != 200 || !Strings.Contains(Response.Body.String(), "registered") {
+		T.Fatal("feature routes were not registered inside API router")
+	}
+}
 
 func TestHealthAndAPIErrors(T *Testing.T) {
 	Frontend := Http.HandlerFunc(func(W Http.ResponseWriter, R *Http.Request) {

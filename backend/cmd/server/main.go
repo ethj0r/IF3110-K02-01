@@ -3,6 +3,7 @@ package main
 import (
 	Context "context"
 	Errors "errors"
+	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
@@ -27,18 +28,33 @@ func Run() error {
 	if Err != nil {
 		return Err
 	}
+	Settings, Err := Auth.LoadOptions()
+	if Err != nil {
+		return Err
+	}
 	Ctx, Stop := Signal.NotifyContext(Context.Background(), Os.Interrupt, Syscall.SIGTERM)
 	defer Stop()
 	Startup, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
 	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL)
-	Cancel()
 	if Err != nil {
+		Cancel()
 		return Err
 	}
 	defer Pool.Close()
+	AuthRepository := &Auth.Repository{Pool: Pool}
+	SchemaError := AuthRepository.CheckSchema(Startup)
+	Cancel()
+	if SchemaError != nil {
+		return SchemaError
+	}
+	Authentication, Err := Auth.NewService(AuthRepository, Settings)
+	if Err != nil {
+		return Err
+	}
+	AuthRoutes := &Auth.Handler{Service: Authentication}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(Pool.Ping, Webui.Handler()),
+		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,

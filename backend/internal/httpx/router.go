@@ -8,7 +8,7 @@ import (
 	Time "time"
 )
 
-func NewRouter(Ping func(Context.Context) error, Frontend Http.Handler) Http.Handler {
+func NewRouter(Ping func(Context.Context) error, Frontend Http.Handler, Configure ...func(Chi.Router)) Http.Handler {
 	R := Chi.NewRouter()
 	R.Use(Middleware.RequestID)
 	R.Use(RecoverErrors)
@@ -29,6 +29,9 @@ func NewRouter(Ping func(Context.Context) error, Frontend Http.Handler) Http.Han
 			}
 			JSON(W, Http.StatusOK, map[string]string{"status": "ready"})
 		})
+		for _, Register := range Configure {
+			Register(Api)
+		}
 	})
 	R.Mount("/", Frontend)
 	return R
