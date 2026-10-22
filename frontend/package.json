@@ -10,7 +10,7 @@
     "dev": "vite",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
-    "test": "npm run test:api",
+    "test": "npm run test:api && vitest run",
     "test:api": "node --experimental-strip-types --test tests/*.test.mjs",
     "build": "npm run typecheck && vite build && node scripts/embed.mjs",
     "preview": "vite preview"
