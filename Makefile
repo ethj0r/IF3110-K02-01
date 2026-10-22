@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration lint typecheck check build migrate-up migrate-status clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration lint typecheck check build migrate-up migrate-status seed-admin clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
@@ -12,10 +12,19 @@ help:
 	@echo "test-integration Run real PostgreSQL tests (requires TEST_DATABASE_URL)"
 	@echo "build           Build frontend and single Go binary into bin/server"
 	@echo "migrate-up/migrate-status Run embedded platform migrations"
+	@echo "seed-admin      Bootstrap the initial admin from environment credentials"
 
 setup:
-	@test -f .env || cp .env.example .env
+	@umask 077; test -f .env || cp .env.example .env
+	@chmod 600 .env
 	cd backend && go mod download
+	@umask 077; if [ -z "$$SESSION_KEY" ]; then \
+		SessionKeyFile=$$(mktemp); \
+		trap 'rm -f "$$SessionKeyFile"' EXIT; \
+		(cd backend && go run ./cmd/session-key) > "$$SessionKeyFile" || exit 1; \
+		printf '\nSESSION_KEY=' >> .env; \
+		cat "$$SessionKeyFile" >> .env; \
+	fi
 	npm --prefix frontend ci --no-audit --no-fund
 
 db-up:
@@ -67,6 +76,9 @@ migrate-up:
 
 migrate-status:
 	cd backend && go run ./cmd/migrate status
+
+seed-admin:
+	cd backend && go run ./cmd/seed-admin
 
 clean:
 	rm -rf bin
