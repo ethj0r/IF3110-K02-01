@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration lint typecheck check build migrate-up migrate-status seed-admin clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web lint typecheck check build migrate-up migrate-status seed-admin clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
@@ -64,7 +64,10 @@ lint:
 typecheck:
 	npm --prefix frontend run typecheck
 
-check: check-fmt vet test lint typecheck
+test-web:
+	npm --prefix frontend test
+
+check: check-fmt vet test test-web lint typecheck
 
 build:
 	npm --prefix frontend run build
