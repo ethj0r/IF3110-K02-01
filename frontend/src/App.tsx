@@ -1,9 +1,16 @@
+import { Navigate, Route, Routes } from 'react-router-dom'
+import { AuthGuard } from './auth/Guard'
+import { LoginPage } from './pages/Login'
+import { Workspace } from './pages/Workspace'
+
 export function App() {
   return (
-    <main>
-      <h1>Database Workspace</h1>
-      <p>Ruang kerja untuk mengelola akses, menjelajahi database, dan meninjau migration.</p>
-      <p>Fitur aplikasi sedang disiapkan.</p>
-    </main>
+    <Routes>
+      <Route path="/login" element={<LoginPage />} />
+      <Route element={<AuthGuard />}>
+        <Route path="/" element={<Workspace />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Route>
+    </Routes>
   )
 }
