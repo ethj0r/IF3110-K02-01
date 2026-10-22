@@ -1,0 +1,72 @@
+-include .env
+export
+
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration lint typecheck check build migrate-up migrate-status clean
+
+help:
+	@echo "setup           Copy local env if absent and install dependencies"
+	@echo "db-up/db-down   Start/stop local PostgreSQL services (preserve volumes)"
+	@echo "db-test-up      Start disposable integration-test PostgreSQL"
+	@echo "dev-api/dev-web Run Go API / Vite (separate terminals)"
+	@echo "check           Check formatting, vet, unit tests, lint, and TypeScript"
+	@echo "test-integration Run real PostgreSQL tests (requires TEST_DATABASE_URL)"
+	@echo "build           Build frontend and single Go binary into bin/server"
+	@echo "migrate-up/migrate-status Run embedded platform migrations"
+
+setup:
+	@test -f .env || cp .env.example .env
+	cd backend && go mod download
+	npm --prefix frontend ci --no-audit --no-fund
+
+db-up:
+	docker compose up -d --wait platform-db target-db
+
+db-down:
+	docker compose --profile test down
+
+db-test-up:
+	docker compose --profile test up -d --wait test-db
+
+dev-api:
+	cd backend && go run ./cmd/server
+
+dev-web:
+	npm --prefix frontend run dev
+
+fmt:
+	cd backend && go fmt ./...
+
+check-fmt:
+	@test -z "$$(find backend -name '*.go' -not -path '*/vendor/*' -exec gofmt -l {} +)" || (echo "Run make fmt"; exit 1)
+
+vet:
+	cd backend && go vet ./...
+
+test:
+	cd backend && go test -race ./...
+
+test-integration:
+	@test -n "$$TEST_DATABASE_URL" || (echo "Set TEST_DATABASE_URL to a dedicated test database"; exit 1)
+	cd backend && go test -race -tags=integration ./...
+
+lint:
+	npm --prefix frontend run lint
+
+typecheck:
+	npm --prefix frontend run typecheck
+
+check: check-fmt vet test lint typecheck
+
+build:
+	npm --prefix frontend run build
+	mkdir -p bin
+	cd backend && go build -trimpath -o ../bin/server ./cmd/server
+
+migrate-up:
+	cd backend && go run ./cmd/migrate up
+
+migrate-status:
+	cd backend && go run ./cmd/migrate status
+
+clean:
+	rm -rf bin
