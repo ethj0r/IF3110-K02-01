@@ -1,0 +1,48 @@
+name: if3110-k02-01
+
+x-postgres: &postgres
+  image: postgres:17-alpine
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+    interval: 2s
+    timeout: 5s
+    retries: 30
+
+services:
+  platform-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform_dev
+      POSTGRES_DB: platform
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - platform-data:/var/lib/postgresql/data
+
+  target-db:
+    <<: *postgres
+    environment:
+      POSTGRES_USER: target
+      POSTGRES_PASSWORD: target_dev
+      POSTGRES_DB: target
+    ports:
+      - "127.0.0.1:55433:5432"
+    volumes:
+      - target-data:/var/lib/postgresql/data
+
+  test-db:
+    <<: *postgres
+    profiles: [test]
+    environment:
+      POSTGRES_USER: platform_test
+      POSTGRES_PASSWORD: platform_test_dev
+      POSTGRES_DB: platform_test
+    ports:
+      - "127.0.0.1:55434:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+
+volumes:
+  platform-data:
+  target-data:
