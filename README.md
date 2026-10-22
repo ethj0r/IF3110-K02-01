@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, authorization, administration, database inspection, and target database migrations are not implemented yet. The frontend currently displays a placeholder, and the application schema has not been created.
+Authentication, session management, CSRF protection, administrator bootstrap, and a functional login/logout shell are available. Authorization, administration pages, database inspection, and target database migrations are not implemented yet. Frontend styling remains unchanged.
 
 ## Requirements
 
@@ -27,7 +27,7 @@ make db-up
 make migrate-up
 ```
 
-`make setup` copies `.env.example` to `.env` if the file does not exist and installs dependencies using the lockfiles. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
+`make setup` copies `.env.example` to `.env` if the file does not exist, generates a local session encryption key when absent, restricts `.env` permissions, and installs dependencies using the lockfiles. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
 
 ### Run the Application
 
@@ -79,7 +79,7 @@ make check
 make test-integration
 ```
 
-`check` runs formatting checks, `go vet`, unit tests with the race detector, ESLint, and TypeScript. Integration tests use the `integration` build tag and a real PostgreSQL database. CI runs these checks and builds the application.
+`check` runs formatting checks, `go vet`, backend unit tests with the race detector, API client and DOM tests, ESLint, and TypeScript. Integration tests use the `integration` build tag and a real PostgreSQL database. CI runs these checks and builds the application.
 
 ## Production Build
 
@@ -100,4 +100,51 @@ make migrate-up
 
 The goose runner manages platform metadata separately from target database migrations. Add SQL files to `backend/migrations/sql/` using unique sequential versions, such as `00001_create_users.sql`, with `-- +goose Up` and `-- +goose Down` directives.
 
-The runner reports when no migration files exist. The server does not apply migrations automatically; run `migrate-up` explicitly before using features that require their schema.
+The server does not apply migrations automatically. Run `migrate-up` before starting it; startup and readiness verify that the authentication schema is available.
+
+## Authentication
+
+### Initial Administrator
+
+Provide `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` through the process environment, then run:
+
+```sh
+make seed-admin
+```
+
+There is no default administrator password. Usernames contain 3–64 ASCII letters, digits, dots, underscores, or hyphens and are matched case-insensitively. Passwords contain 12–1024 bytes and are stored using Argon2id with independent salts. Repeating bootstrap for the same active administrator preserves its password; bootstrap cannot promote an existing ordinary account or create an additional administrator.
+
+### Endpoints
+
+| Method | Path | Protection |
+| --- | --- | --- |
+| POST | `/api/auth/login` | Exact trusted Origin and JSON body |
+| GET | `/api/auth/me` | Session cookie |
+| GET | `/api/auth/csrf` | Session cookie |
+| POST | `/api/auth/logout` | Session cookie, trusted Origin, and `X-CSRF-Token` |
+
+Login accepts `{"username":"...","password":"..."}`. Login and `me` return `user`, `csrf_token`, and `expires_at`. The opaque session identifier is sent exclusively in an HttpOnly cookie and never in a response body or URL. Protected unsafe requests require the CSRF header and exact configured Origin. Cookies use SameSite=Lax, Path=/, and Secure on HTTPS. Auth responses are not cached.
+
+The frontend keeps CSRF data in memory, restores it through the authenticated endpoint after reload, and sends cookies through same-origin requests. Login, logout, protected routes, and service errors work without additional styling. Passwords and session identifiers are not stored in browser storage.
+
+### Configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `APP_ENV` | `development` | Production requires HTTPS |
+| `APP_ORIGIN` | `http://127.0.0.1:5173` | Trusted browser origin, without a path |
+| `SESSION_KEY` | Required | Base64-encoded 32-byte AES-GCM key |
+| `SESSION_IDLE_TIMEOUT` | `30m` | Maximum inactivity |
+| `SESSION_ABSOLUTE_TIMEOUT` | `12h` | Maximum authenticated session lifetime |
+| `SESSION_ROTATION_INTERVAL` | `15m` | Periodic identifier rotation |
+| `SESSION_GRACE_PERIOD` | `30s` | Previous identifier validity after rotation |
+
+Set `APP_ORIGIN` to the actual application origin when serving the embedded frontend directly, such as `http://127.0.0.1:8080` locally. Production must use an HTTPS origin. Keep `SESSION_KEY` stable and secret; replacing it requires users to log in again.
+
+Rotation preserves absolute expiration. Re-authenticating an active session rotates its identifier without extending its lifetime. A fully expired session requires a fresh login. During grace, a previous identifier can recover the current cookie if a rotation response was lost. Logout revokes the session and every associated identifier.
+
+### Backend Integration
+
+`Auth.Handler.RequireSession` authenticates protected routes and enforces CSRF on unsafe methods. `Auth.PrincipalFromContext` returns the current user identity. Database permission checks remain separate from authentication; Platform Admin is not a database access level.
+
+Within an existing database transaction, call `Auth.MarkPrivilegeChange` when privileges increase and `Auth.InvalidateUserSessions` when access is revoked. Both accept the affected user ID. The schema automatically invalidates sessions after deactivation, password changes, or administrator demotion, and marks administrator promotion for rotation on the next request.
