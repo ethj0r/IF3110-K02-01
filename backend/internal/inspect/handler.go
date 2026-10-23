@@ -6,6 +6,7 @@ import (
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Chi "github.com/go-chi/chi/v5"
 	Http "net/http"
+	Strconv "strconv"
 )
 
 type Handler struct {
@@ -20,6 +21,10 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Get("/databases", Routes.ListDatabases)
 		R.Get("/databases/{id}/schemas", Routes.ListSchemas)
 		R.Get("/databases/{id}/tables", Routes.ListTables)
+		R.Get("/databases/{id}/tables/{table}/columns", Routes.ListColumns)
+		R.Get("/databases/{id}/tables/{table}/constraints", Routes.ListConstraints)
+		R.Get("/databases/{id}/tables/{table}/indexes", Routes.ListIndexes)
+		R.Get("/databases/{id}/tables/{table}/rows", Routes.ListRows)
 	})
 }
 
@@ -61,4 +66,61 @@ func (Routes *Handler) ListTables(W Http.ResponseWriter, R *Http.Request) {
 		return
 	}
 	Httpx.JSON(W, 200, map[string]any{"tables": Result})
+}
+
+func tableRef(R *Http.Request) (string, string) {
+	return Chi.URLParam(R, "id"), Chi.URLParam(R, "table")
+}
+
+func (Routes *Handler) ListColumns(W Http.ResponseWriter, R *Http.Request) {
+	ID, Table := tableRef(R)
+	Result, Err := Routes.Service.Columns(R.Context(), ID, R.URL.Query().Get("schema"), Table)
+	if Err != nil {
+		WriteInspectError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, map[string]any{"columns": Result})
+}
+
+func (Routes *Handler) ListConstraints(W Http.ResponseWriter, R *Http.Request) {
+	ID, Table := tableRef(R)
+	Result, Err := Routes.Service.Constraints(R.Context(), ID, R.URL.Query().Get("schema"), Table)
+	if Err != nil {
+		WriteInspectError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, map[string]any{"constraints": Result})
+}
+
+func (Routes *Handler) ListIndexes(W Http.ResponseWriter, R *Http.Request) {
+	ID, Table := tableRef(R)
+	Result, Err := Routes.Service.Indexes(R.Context(), ID, R.URL.Query().Get("schema"), Table)
+	if Err != nil {
+		WriteInspectError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, map[string]any{"indexes": Result})
+}
+
+func (Routes *Handler) ListRows(W Http.ResponseWriter, R *Http.Request) {
+	ID, Table := tableRef(R)
+	Query := R.URL.Query()
+	Page, Err := Strconv.Atoi(Query.Get("page"))
+	if Query.Get("page") == "" {
+		Page, Err = 1, nil
+	}
+	PageSize, SizeErr := Strconv.Atoi(Query.Get("page_size"))
+	if Query.Get("page_size") == "" {
+		PageSize, SizeErr = 25, nil
+	}
+	if Err != nil || SizeErr != nil {
+		WriteInspectError(W, ErrInvalidInput)
+		return
+	}
+	Result, Err := Routes.Service.Rows(R.Context(), ID, Query.Get("schema"), Table, Page, PageSize)
+	if Err != nil {
+		WriteInspectError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
 }
