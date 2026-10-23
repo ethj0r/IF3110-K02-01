@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web lint typecheck check build migrate-up migrate-status seed-admin clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web lint typecheck check build bootstrap migrate-up migrate-status seed-admin clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
@@ -11,6 +11,7 @@ help:
 	@echo "check           Check formatting, vet, unit tests, lint, and TypeScript"
 	@echo "test-integration Run real PostgreSQL tests (requires TEST_DATABASE_URL)"
 	@echo "build           Build frontend and single Go binary into bin/server"
+	@echo "bootstrap       Apply platform migrations and create the initial admin"
 	@echo "migrate-up/migrate-status Run embedded platform migrations"
 	@echo "seed-admin      Bootstrap the initial admin from environment credentials"
 
@@ -25,6 +26,8 @@ setup:
 		printf '\nSESSION_KEY=' >> .env; \
 		cat "$$SessionKeyFile" >> .env; \
 	fi
+	@if ! grep -q '^BOOTSTRAP_ADMIN_USERNAME=' .env; then printf '\nBOOTSTRAP_ADMIN_USERNAME=\n' >> .env; fi
+	@if ! grep -q '^BOOTSTRAP_ADMIN_PASSWORD=' .env; then printf 'BOOTSTRAP_ADMIN_PASSWORD=\n' >> .env; fi
 	npm --prefix frontend ci --no-audit --no-fund
 
 db-up:
@@ -73,6 +76,8 @@ build:
 	npm --prefix frontend run build
 	mkdir -p bin
 	cd backend && go build -trimpath -o ../bin/server ./cmd/server
+
+bootstrap: migrate-up seed-admin
 
 migrate-up:
 	cd backend && go run ./cmd/migrate up
