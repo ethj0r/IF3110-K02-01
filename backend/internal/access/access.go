@@ -103,3 +103,4 @@ func Can(Ctx Context.Context, Policy Evaluator, User Auth.Principal, Act Action,
 	}
 	return Policy.Can(Ctx, User, Act, DatabaseID)
 }
+
