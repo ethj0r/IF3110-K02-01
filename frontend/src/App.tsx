@@ -6,6 +6,7 @@ import { Workspace } from './pages/Workspace'
 import { DatabaseDetailPage } from './pages/DatabaseDetail'
 import { AccessMatrixPage } from './pages/admin/AccessMatrix'
 import { AdminLayout } from './pages/admin/AdminLayout'
+import { ConnectionsPage } from './pages/admin/Connections'
 import { GroupsPage } from './pages/admin/Groups'
 import { UsersPage } from './pages/admin/Users'
 
@@ -22,6 +23,7 @@ export function App() {
             <Route path="users" element={<UsersPage />} />
             <Route path="groups" element={<GroupsPage />} />
             <Route path="access" element={<AccessMatrixPage />} />
+            <Route path="connections" element={<ConnectionsPage />} />
           </Route>
         </Route>
         <Route path="*" element={<Navigate to="/" replace />} />

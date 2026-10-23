@@ -17,6 +17,7 @@ export function AdminLayout() {
           <NavLink to="/admin/users">Users</NavLink>
           <NavLink to="/admin/groups">Groups</NavLink>
           <NavLink to="/admin/access">Database access</NavLink>
+          <NavLink to="/admin/connections">Connections</NavLink>
         </nav>
 
         <div className="admin-account">
