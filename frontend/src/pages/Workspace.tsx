@@ -66,7 +66,7 @@ export function Workspace() {
                   {Databases.data.map(Database => (
                     <tr key={Database.id}>
                       <td>
-                        <strong>{Database.name}</strong>
+                        <Link to={`/databases/${Database.id}`}><strong>{Database.name}</strong></Link>
                         <span className="table-subtext">{Database.host}</span>
                       </td>
                       <td><code>{Database.dbname}</code></td>

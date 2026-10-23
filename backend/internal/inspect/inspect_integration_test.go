@@ -8,6 +8,7 @@ import (
 	Rand "crypto/rand"
 	Hex "encoding/hex"
 	Json "encoding/json"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
@@ -84,7 +85,7 @@ func NewFixture(T *Testing.T) *Fixture {
 	}
 	ConnService := &Connection.Service{Cipher: AEAD, Repo: &Connection.Repository{Pool: Pool}}
 	Server := &Service{Connections: ConnService, Driver: Driver.PostgresDriver{}}
-	Routes := &Handler{Auth: AuthRoutes, Service: Server}
+	Routes := &Handler{Auth: AuthRoutes, Policy: Access.AllowAll(), Service: Server}
 	Router := Chi.NewRouter()
 	Router.Route("/api", Routes.Register)
 	Admin, Err := AuthService.Login(Context.Background(), "admin", "correct horse battery staple", "")
@@ -149,26 +150,35 @@ func (App *Fixture) SeedTarget(T *Testing.T) {
 
 func (App *Fixture) ConnectionID(T *Testing.T) string {
 	T.Helper()
-	Items, Err := App.Service.ListDatabases(Context.Background())
+	Items, Err := App.Service.Connections.(*Connection.Service).List(Context.Background())
 	if Err != nil || len(Items) != 1 {
 		T.Fatalf("expected one database, got %+v %v", Items, Err)
 	}
 	return Items[0].ID
 }
 
+func (App *Fixture) RouterWithPolicy(Policy Access.Evaluator) Http.Handler {
+	Router := Chi.NewRouter()
+	Routes := &Handler{Auth: App.Auth, Policy: Policy, Service: App.Service}
+	Router.Route("/api", Routes.Register)
+	return Router
+}
+
+func (App *Fixture) PolicyRequest(Router Http.Handler, Method, Path string, State Auth.Authenticated) *Httptest.ResponseRecorder {
+	Request := Httptest.NewRequest(Method, Path, nil)
+	Request.Header.Set("Origin", App.Auth.Service.Settings.Origin)
+	if State.Identifier != "" {
+		Request.AddCookie(&Http.Cookie{Name: Auth.CookieName, Value: State.Identifier})
+	}
+	Response := Httptest.NewRecorder()
+	Router.ServeHTTP(Response, Request)
+	return Response
+}
+
 func TestBrowseSchemasAndTables(T *Testing.T) {
 	App := NewFixture(T)
 	App.SeedTarget(T)
 	ID := App.ConnectionID(T)
-	if App.Request("GET", "/api/databases", Auth.Authenticated{}).Code != 401 {
-		T.Fatal("anonymous database list was accepted")
-	}
-	for _, State := range []Auth.Authenticated{App.Admin, App.Member} {
-		List := App.Request("GET", "/api/databases", State)
-		if List.Code != 200 || !Strings.Contains(List.Body.String(), "local-target") {
-			T.Fatalf("database list failed: %d %s", List.Code, List.Body.String())
-		}
-	}
 	Schemas := App.Request("GET", "/api/databases/"+ID+"/schemas", App.Member)
 	if Schemas.Code != 200 || !Strings.Contains(Schemas.Body.String(), App.Schema) {
 		T.Fatalf("schema list missed probe schema: %d %s", Schemas.Code, Schemas.Body.String())
@@ -211,5 +221,22 @@ func TestBrowseRejectsBadInput(T *Testing.T) {
 	Response := App.Request("GET", "/api/databases/"+Dead.ID+"/schemas", App.Admin)
 	if Response.Code != 502 || Strings.Contains(Response.Body.String(), "postgres") {
 		T.Fatalf("unreachable target must fail sanitized: %d %s", Response.Code, Response.Body.String())
+	}
+}
+
+func TestBrowseRequiresDatabaseAccess(T *Testing.T) {
+	App := NewFixture(T)
+	App.SeedTarget(T)
+	ID := App.ConnectionID(T)
+	Denied := App.RouterWithPolicy(Access.StaticEvaluator{})
+	if App.PolicyRequest(Denied, "GET", "/api/databases/"+ID+"/schemas", App.Member).Code != 403 {
+		T.Fatal("database browse without group access was accepted")
+	}
+	if App.PolicyRequest(Denied, "GET", "/api/databases/"+ID+"/schemas", Auth.Authenticated{}).Code != 401 {
+		T.Fatal("anonymous database browse did not return 401")
+	}
+	Granted := App.RouterWithPolicy(Access.AllowAll())
+	if Granted == nil || App.PolicyRequest(Granted, "GET", "/api/databases/"+ID+"/schemas", App.Member).Code != 200 {
+		T.Fatal("database browse with access failed")
 	}
 }

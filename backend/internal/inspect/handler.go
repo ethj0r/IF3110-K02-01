@@ -2,6 +2,7 @@ package Inspect
 
 import (
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Chi "github.com/go-chi/chi/v5"
@@ -11,6 +12,7 @@ import (
 
 type Handler struct {
 	Auth    *Auth.Handler
+	Policy  Access.Evaluator
 	Service *Service
 }
 
@@ -18,7 +20,7 @@ func (Routes *Handler) Register(Api Chi.Router) {
 	Api.Group(func(R Chi.Router) {
 		R.Use(Auth.NoStore)
 		R.Use(Routes.Auth.RequireSession)
-		R.Get("/databases", Routes.ListDatabases)
+		R.Use(Access.RequireDatabase(Routes.Policy, Access.ActionView, "id"))
 		R.Get("/databases/{id}/schemas", Routes.ListSchemas)
 		R.Get("/databases/{id}/tables", Routes.ListTables)
 		R.Get("/databases/{id}/tables/{table}/columns", Routes.ListColumns)
@@ -39,15 +41,6 @@ func WriteInspectError(W Http.ResponseWriter, Err error) {
 	default:
 		Httpx.Error(W, 500, "internal_error", "An unexpected error occurred")
 	}
-}
-
-func (Routes *Handler) ListDatabases(W Http.ResponseWriter, R *Http.Request) {
-	Result, Err := Routes.Service.ListDatabases(R.Context())
-	if Err != nil {
-		WriteInspectError(W, Err)
-		return
-	}
-	Httpx.JSON(W, 200, Result)
 }
 
 func (Routes *Handler) ListSchemas(W Http.ResponseWriter, R *Http.Request) {
