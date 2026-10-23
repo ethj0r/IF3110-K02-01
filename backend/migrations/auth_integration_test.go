@@ -31,7 +31,7 @@ func TestAuthSchemaMigration(T *Testing.T) {
 	if _, Err := Pool.Exec(Ctx, "INSERT INTO users (username, password_hash) VALUES ('x', 'test-hash')"); Err == nil {
 		T.Fatal("invalid username was accepted")
 	}
-	if _, Err := Provider.Down(Ctx); Err != nil {
+	if _, Err := Provider.DownTo(Ctx, 0); Err != nil {
 		T.Fatal(Err)
 	}
 	var Removed bool

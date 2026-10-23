@@ -67,7 +67,7 @@ func TestIsolatedSchemasAndGoose(T *Testing.T) {
 	Db := Stdlib.OpenDB(*First.Config().ConnConfig)
 	defer Db.Close()
 	Provider, Err := Goose.NewProvider(Goose.DialectPostgres, Db, Migrations.FS(), Goose.WithGoMigrations(
-		Goose.NewGoMigration(2, &Goose.GoFunc{RunTx: func(Ctx Context.Context, Tx *Sql.Tx) error {
+		Goose.NewGoMigration(999, &Goose.GoFunc{RunTx: func(Ctx Context.Context, Tx *Sql.Tx) error {
 			_, Err := Tx.ExecContext(Ctx, "CREATE TABLE goose_probe (id integer)")
 			return Err
 		}}, nil),
