@@ -10,6 +10,7 @@ var (
 	ErrUnavailable  = Errors.New("target database is unavailable")
 	ErrInvalidDSN   = Errors.New("invalid target database configuration")
 	ErrInvalidInput = Errors.New("invalid connection parameters")
+	ErrExecution    = Errors.New("target SQL execution failed")
 )
 
 var identifierPattern = Regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)

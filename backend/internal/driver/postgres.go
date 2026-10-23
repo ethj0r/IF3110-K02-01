@@ -3,6 +3,7 @@ package Driver
 import (
 	Context "context"
 	Errors "errors"
+	Fmt "fmt"
 	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
 	Net "net"
@@ -12,8 +13,16 @@ import (
 	Time "time"
 )
 
+type Tx interface {
+	Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error)
+	Exec(Ctx Context.Context, SQL string, Args ...any) error
+	Commit(Ctx Context.Context) error
+	Rollback(Ctx Context.Context) error
+}
+
 type Conn interface {
 	Ping(Ctx Context.Context) error
+	Begin(Ctx Context.Context) (Tx, error)
 	Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error)
 	Exec(Ctx Context.Context, SQL string, Args ...any) error
 	Close()
@@ -26,6 +35,8 @@ type Driver interface {
 type PostgresDriver struct{}
 
 type PostgresConn struct{ Pool *Pgxpool.Pool }
+
+type PostgresTx struct{ Raw Pgx.Tx }
 
 func BuildDSN(Host string, Port int, DBName, Username, Password string) (string, error) {
 	Host = Strings.TrimSpace(Host)
@@ -77,6 +88,14 @@ func (Target *PostgresConn) Ping(Ctx Context.Context) error {
 	return nil
 }
 
+func (Target *PostgresConn) Begin(Ctx Context.Context) (Tx, error) {
+	RawTx, Err := Target.Pool.Begin(Ctx)
+	if Err != nil {
+		return nil, ErrUnavailable
+	}
+	return &PostgresTx{Raw: RawTx}, nil
+}
+
 func (Target *PostgresConn) Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error) {
 	Rows, Err := Target.Pool.Query(Ctx, SQL, Args...)
 	if Err != nil {
@@ -94,4 +113,34 @@ func (Target *PostgresConn) Exec(Ctx Context.Context, SQL string, Args ...any) e
 
 func (Target *PostgresConn) Close() {
 	Target.Pool.Close()
+}
+
+func (Current *PostgresTx) Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error) {
+	Rows, Err := Current.Raw.Query(Ctx, SQL, Args...)
+	if Err != nil {
+		return nil, Fmt.Errorf("%w: %v", ErrExecution, Err)
+	}
+	return Rows, nil
+}
+
+func (Current *PostgresTx) Exec(Ctx Context.Context, SQL string, Args ...any) error {
+	if _, Err := Current.Raw.Exec(Ctx, SQL, Args...); Err != nil {
+		return Fmt.Errorf("%w: %v", ErrExecution, Err)
+	}
+	return nil
+}
+
+func (Current *PostgresTx) Commit(Ctx Context.Context) error {
+	if Err := Current.Raw.Commit(Ctx); Err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func (Current *PostgresTx) Rollback(Ctx Context.Context) error {
+	Err := Current.Raw.Rollback(Ctx)
+	if Err != nil && !Errors.Is(Err, Pgx.ErrTxClosed) {
+		return ErrUnavailable
+	}
+	return nil
 }
