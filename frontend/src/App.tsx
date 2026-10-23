@@ -3,6 +3,7 @@ import { AdminGuard } from './auth/AdminGuard'
 import { AuthGuard } from './auth/Guard'
 import { LoginPage } from './pages/Login'
 import { Workspace } from './pages/Workspace'
+import { DatabaseDetailPage } from './pages/DatabaseDetail'
 import { AccessMatrixPage } from './pages/admin/AccessMatrix'
 import { AdminLayout } from './pages/admin/AdminLayout'
 import { GroupsPage } from './pages/admin/Groups'
@@ -14,6 +15,7 @@ export function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AuthGuard />}>
         <Route path="/" element={<Workspace />} />
+        <Route path="/databases/:id" element={<DatabaseDetailPage />} />
         <Route path="/admin" element={<AdminGuard />}>
           <Route element={<AdminLayout />}>
             <Route index element={<Navigate to="users" replace />} />
