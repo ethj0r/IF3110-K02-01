@@ -21,18 +21,25 @@ export function LoginPage() {
     const Values = new FormData(Event.currentTarget)
     Submit.mutate({ username: String(Values.get('username') ?? ''), password: String(Values.get('password') ?? '') })
   }
-  if (Session.isPending) return <p role="status">Loading session…</p>
+  if (Session.isPending) return <p className="state" role="status">Loading session…</p>
   if (Session.data) return <Navigate to="/" replace />
   if (Session.error && !(Session.error instanceof ApiError && Session.error.Status === 401)) {
-    return <main><p role="alert">Unable to reach the authentication service.</p><button onClick={() => void Session.refetch()}>Try again</button></main>
+    return <main className="auth-page"><p role="alert">Unable to reach the authentication service.</p><button onClick={() => void Session.refetch()}>Try again</button></main>
   }
   return (
-    <main>
+    <main className="auth-page">
       <h1>Sign in</h1>
+      <p className="muted">Use your platform account to continue.</p>
       <form method="post" onSubmit={HandleSubmit}>
-        <p><label htmlFor="username">Username</label><br /><input id="username" name="username" autoComplete="username" required maxLength={64} /></p>
-        <p><label htmlFor="password">Password</label><br /><input id="password" name="password" type="password" autoComplete="current-password" required maxLength={1024} /></p>
-        {Submit.isError && <p role="alert">{Submit.error instanceof ApiError ? Submit.error.message : 'Unable to sign in. Try again.'}</p>}
+        <div className="field">
+          <label htmlFor="username">Username</label>
+          <input id="username" name="username" autoComplete="username" required maxLength={64} autoFocus />
+        </div>
+        <div className="field">
+          <label htmlFor="password">Password</label>
+          <input id="password" name="password" type="password" autoComplete="current-password" required maxLength={1024} />
+        </div>
+        {Submit.isError && <p role="alert" className="alert">{Submit.error instanceof ApiError ? Submit.error.message : 'Unable to sign in. Try again.'}</p>}
         <button type="submit" disabled={Submit.isPending}>{Submit.isPending ? 'Signing in…' : 'Sign in'}</button>
       </form>
     </main>

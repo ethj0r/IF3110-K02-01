@@ -3,6 +3,7 @@ package Connection
 import (
 	Json "encoding/json"
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
@@ -21,6 +22,7 @@ func (Routes *Handler) Register(Api Chi.Router) {
 	Api.Group(func(R Chi.Router) {
 		R.Use(Auth.NoStore)
 		R.Use(Routes.Auth.RequireSession)
+		R.Use(Access.RequireAdmin)
 		R.Post("/connections", Routes.Create)
 		R.Get("/connections", Routes.List)
 		R.Get("/connections/{id}", Routes.Show)
@@ -28,11 +30,6 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Delete("/connections/{id}", Routes.Delete)
 		R.Post("/connections/{id}/test", Routes.Test)
 	})
-}
-
-func RequireAdmin(R *Http.Request) (Auth.Principal, bool) {
-	User, Ok := Auth.PrincipalFromContext(R.Context())
-	return User, Ok && User.IsPlatformAdmin
 }
 
 func DecodeInput(W Http.ResponseWriter, R *Http.Request) (ConnectionInput, bool) {
@@ -64,9 +61,9 @@ func WriteStoreError(W Http.ResponseWriter, Err error) {
 }
 
 func (Routes *Handler) Create(W Http.ResponseWriter, R *Http.Request) {
-	Admin, Ok := RequireAdmin(R)
+	Admin, Ok := Auth.PrincipalFromContext(R.Context())
 	if !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
+		Httpx.Error(W, 401, "unauthenticated", "Authentication required")
 		return
 	}
 	Input, Valid := DecodeInput(W, R)
@@ -82,10 +79,6 @@ func (Routes *Handler) Create(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func (Routes *Handler) List(W Http.ResponseWriter, R *Http.Request) {
-	if _, Ok := RequireAdmin(R); !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
-		return
-	}
 	Result, Err := Routes.Service.List(R.Context())
 	if Err != nil {
 		WriteStoreError(W, Err)
@@ -95,10 +88,6 @@ func (Routes *Handler) List(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func (Routes *Handler) Show(W Http.ResponseWriter, R *Http.Request) {
-	if _, Ok := RequireAdmin(R); !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
-		return
-	}
 	Result, Err := Routes.Service.Get(R.Context(), Chi.URLParam(R, "id"))
 	if Err != nil {
 		WriteStoreError(W, Err)
@@ -108,10 +97,6 @@ func (Routes *Handler) Show(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func (Routes *Handler) Update(W Http.ResponseWriter, R *Http.Request) {
-	if _, Ok := RequireAdmin(R); !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
-		return
-	}
 	Input, Valid := DecodeInput(W, R)
 	if !Valid {
 		return
@@ -125,10 +110,6 @@ func (Routes *Handler) Update(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
-	if _, Ok := RequireAdmin(R); !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
-		return
-	}
 	if Err := Routes.Service.Delete(R.Context(), Chi.URLParam(R, "id")); Err != nil {
 		WriteStoreError(W, Err)
 		return
@@ -137,10 +118,6 @@ func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func (Routes *Handler) Test(W Http.ResponseWriter, R *Http.Request) {
-	if _, Ok := RequireAdmin(R); !Ok {
-		Httpx.Error(W, 403, "forbidden", "Platform administrator access required")
-		return
-	}
 	_, DSN, Err := Routes.Service.DialDSN(R.Context(), Chi.URLParam(R, "id"))
 	if Err != nil {
 		WriteStoreError(W, Err)

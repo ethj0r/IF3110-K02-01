@@ -60,7 +60,19 @@ func TestStaticEvaluatorAndPlatformAdminSeparation(T *Testing.T) {
 	if Allowed, Err := Can(Ctx, Policy, Auth.Principal{}, ActionView, "db-1"); Err != nil || Allowed {
 		T.Fatalf("anonymous principal must be denied: allowed=%v err=%v", Allowed, Err)
 	}
-	if Allowed, Err := Can(Ctx, nil, Viewer, ActionEdit, "db-1"); Err != nil || !Allowed {
-		T.Fatalf("nil policy stub should default to AllowAll for Phase 0: allowed=%v err=%v", Allowed, Err)
+	if Allowed, Err := Can(Ctx, nil, Viewer, ActionEdit, "db-1"); Err != nil || Allowed {
+		T.Fatalf("nil policy must fail closed: allowed=%v err=%v", Allowed, Err)
+	}
+	if Selected, Err := ParseLevel(" view_edit "); Err != nil || Selected != LevelViewEdit {
+		T.Fatalf("valid level was rejected: level=%q err=%v", Selected, Err)
+	}
+	if _, Err := ParseLevel(""); !Errors.Is(Err, ErrInvalidLevel) {
+		T.Fatalf("empty level must be rejected, got %v", Err)
+	}
+	if _, Err := ParseLevel("owner"); !Errors.Is(Err, ErrInvalidLevel) {
+		T.Fatalf("unknown level must be rejected, got %v", Err)
+	}
+	if LevelViewEdit.Rank() <= LevelViewOnly.Rank() || LevelNone.Rank() != 0 || FromRank(2) != LevelViewEdit || FromRank(1) != LevelViewOnly {
+		T.Fatal("level ranking is inconsistent")
 	}
 }
