@@ -69,9 +69,10 @@ func Run() error {
 		Slog.Warn("default target connection was not seeded", "error", SeedErr)
 	}
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	AccessRepo := &Access.Repository{Pool: Pool}
 	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: Driver.PostgresDriver{}}
-	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Service: InspectService}
-	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: &Access.Repository{Pool: Pool}}
+	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: AccessRepo, Service: InspectService}
+	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: AccessRepo}
 	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,

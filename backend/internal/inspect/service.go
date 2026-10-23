@@ -9,25 +9,12 @@ import (
 )
 
 type Connector interface {
-	List(Ctx Context.Context) ([]Connection.Connection, error)
 	DialDSN(Ctx Context.Context, ID string) (Connection.Connection, string, error)
 }
 
 type Service struct {
 	Connections Connector
 	Driver      Driver.Driver
-}
-
-func (Server *Service) ListDatabases(Ctx Context.Context) ([]Database, error) {
-	Items, Err := Server.Connections.List(Ctx)
-	if Err != nil {
-		return nil, ErrUnavailable
-	}
-	Result := make([]Database, 0, len(Items))
-	for _, Item := range Items {
-		Result = append(Result, Database{ID: Item.ID, Name: Item.Name})
-	}
-	return Result, nil
 }
 
 func (Server *Service) openTarget(Ctx Context.Context, DBID string) (Driver.Conn, error) {
