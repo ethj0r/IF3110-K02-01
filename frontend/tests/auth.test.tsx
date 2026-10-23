@@ -38,6 +38,7 @@ function InstallAPI() {
       State.SignedIn = false
       return new Response(null, { status: 204 })
     }
+    if (Path === '/api/databases') return Response.json([])
     return Response.json({ user: { id: 'fixture-user', username: 'admin', is_platform_admin: true }, csrf_token: CSRF, expires_at: '2099-01-01T00:00:00Z' })
   }))
   return { State, Calls }

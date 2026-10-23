@@ -1,7 +1,12 @@
 import { Navigate, Route, Routes } from 'react-router-dom'
+import { AdminGuard } from './auth/AdminGuard'
 import { AuthGuard } from './auth/Guard'
 import { LoginPage } from './pages/Login'
 import { Workspace } from './pages/Workspace'
+import { AccessMatrixPage } from './pages/admin/AccessMatrix'
+import { AdminLayout } from './pages/admin/AdminLayout'
+import { GroupsPage } from './pages/admin/Groups'
+import { UsersPage } from './pages/admin/Users'
 
 export function App() {
   return (
@@ -9,6 +14,14 @@ export function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AuthGuard />}>
         <Route path="/" element={<Workspace />} />
+        <Route path="/admin" element={<AdminGuard />}>
+          <Route element={<AdminLayout />}>
+            <Route index element={<Navigate to="users" replace />} />
+            <Route path="users" element={<UsersPage />} />
+            <Route path="groups" element={<GroupsPage />} />
+            <Route path="access" element={<AccessMatrixPage />} />
+          </Route>
+        </Route>
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
