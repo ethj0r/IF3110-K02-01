@@ -3,11 +3,13 @@ package main
 import (
 	Context "context"
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
 	Slog "log/slog"
@@ -66,9 +68,19 @@ func Run() error {
 		Slog.Warn("default target connection was not seeded", "error", SeedErr)
 	}
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	MigrationService := &Migration.Service{
+		Repo:   &Migration.Repository{Pool: Pool},
+		Access: Access.AllowAll(),
+		Resolver: Migration.DSNResolverFunc(func(Ctx Context.Context, DatabaseID string) (string, error) {
+			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
+			return DSN, Err
+		}),
+		Driver: Driver.PostgresDriver{},
+	}
+	MigrationRoutes := &Migration.Handler{Auth: AuthRoutes, Service: MigrationService}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register),
+		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register, MigrationRoutes.Register),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,
