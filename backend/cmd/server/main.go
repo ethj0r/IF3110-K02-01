@@ -5,6 +5,8 @@ import (
 	Errors "errors"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
+	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
+	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
@@ -52,9 +54,21 @@ func Run() error {
 		return Err
 	}
 	AuthRoutes := &Auth.Handler{Service: Authentication}
+	ConnCipher, Err := Connection.NewCipher(Settings.EncryptionKey)
+	if Err != nil {
+		return Err
+	}
+	ConnectionService := &Connection.Service{Cipher: ConnCipher, Repo: &Connection.Repository{Pool: Pool}}
+	SeedCtx, SeedCancel := Context.WithTimeout(Ctx, 5*Time.Second)
+	SeedErr := Connection.SeedDefault(SeedCtx, ConnectionService, Os.Getenv("TARGET_DATABASE_URL"))
+	SeedCancel()
+	if SeedErr != nil {
+		Slog.Warn("default target connection was not seeded", "error", SeedErr)
+	}
+	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register),
+		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,
