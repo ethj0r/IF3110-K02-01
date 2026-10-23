@@ -62,4 +62,3 @@ func TestMigrationInputValidationAndNormalization(T *Testing.T) {
 		}
 	}
 }
-

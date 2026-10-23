@@ -1,3 +1,5 @@
+//go:build integration
+
 package Migration
 
 import (
@@ -183,4 +185,3 @@ func TestConcurrentMigrationCreationLinearity(T *Testing.T) {
 		}
 	}
 }
-

@@ -64,4 +64,3 @@ func TestStaticEvaluatorAndPlatformAdminSeparation(T *Testing.T) {
 		T.Fatalf("nil policy stub should default to AllowAll for Phase 0: allowed=%v err=%v", Allowed, Err)
 	}
 }
-

@@ -80,4 +80,3 @@ func (Input MigrationInput) Normalized() MigrationInput {
 		SQLText: Strings.TrimSpace(Input.SQLText),
 	}
 }
-

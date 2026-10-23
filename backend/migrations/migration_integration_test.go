@@ -71,4 +71,3 @@ func TestMigrationSchema(T *Testing.T) {
 		T.Fatalf("schema cannot be reapplied: %v", Err)
 	}
 }
-
