@@ -3,6 +3,8 @@ package main
 import (
 	Context "context"
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
+	Admin "github.com/ethj0r/IF3110-K02-01/backend/internal/admin"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
@@ -66,9 +68,11 @@ func Run() error {
 		Slog.Warn("default target connection was not seeded", "error", SeedErr)
 	}
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: &Access.Repository{Pool: Pool}}
+	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register),
+		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register, AccessRoutes.Register, AdminRoutes.Register),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,
