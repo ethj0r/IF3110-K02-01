@@ -10,6 +10,7 @@ import (
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Inspect "github.com/ethj0r/IF3110-K02-01/backend/internal/inspect"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
 	Slog "log/slog"
@@ -68,11 +69,13 @@ func Run() error {
 		Slog.Warn("default target connection was not seeded", "error", SeedErr)
 	}
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: Driver.PostgresDriver{}}
+	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Service: InspectService}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: &Access.Repository{Pool: Pool}}
 	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
 	Server := &Http.Server{
 		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register, AccessRoutes.Register, AdminRoutes.Register),
+		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register, InspectRoutes.Register, AccessRoutes.Register, AdminRoutes.Register),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,
