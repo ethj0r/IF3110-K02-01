@@ -23,7 +23,9 @@ export function Workspace() {
   return (
     <main>
       <header>
-        <nav aria-label="Main navigation"><Link to="/">Workspace</Link></nav>
+        <nav aria-label="Main navigation">
+          <Link to="/">Workspace</Link> · <Link to="/migrations">Migrations</Link>
+        </nav>
         <p>Signed in as {Session.data?.user.username}{Session.data?.user.is_platform_admin ? ' · Platform Admin' : ''}</p>
         <button onClick={() => ExitSession.mutate()} disabled={ExitSession.isPending}>Sign out</button>
         {ExitSession.isError && <p role="alert">Unable to sign out. Try again.</p>}

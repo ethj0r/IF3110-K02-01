@@ -145,4 +145,3 @@ func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	}
 	Httpx.JSON(W, 200, Result)
 }
-
