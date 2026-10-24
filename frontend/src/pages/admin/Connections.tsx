@@ -65,13 +65,14 @@ export function ConnectionsPage() {
 
   function HandleCreate(Event: FormEvent<HTMLFormElement>) {
     Event.preventDefault()
-    const Input = readForm(Event.currentTarget)
+    const Form = Event.currentTarget
+    const Input = readForm(Form)
     SetNotice('')
     if (!Input || Input.password === '') {
       SetNotice('Fill every field with a valid port (1–65535).')
       return
     }
-    Create.mutate(Input, { onSuccess: () => Event.currentTarget.reset() })
+    Create.mutate(Input, { onSuccess: () => Form.reset() })
   }
 
   function HandleUpdate(Event: FormEvent<HTMLFormElement>) {

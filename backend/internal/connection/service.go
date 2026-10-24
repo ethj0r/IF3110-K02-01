@@ -4,11 +4,17 @@ import (
 	Context "context"
 	Cipher "crypto/cipher"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Pgtype "github.com/jackc/pgx/v5/pgtype"
 )
 
 type Service struct {
 	Cipher Cipher.AEAD
 	Repo   *Repository
+}
+
+func validID(ID string) bool {
+	var Value Pgtype.UUID
+	return Value.Scan(ID) == nil && Value.Valid
 }
 
 func (Server *Service) Create(Ctx Context.Context, Input ConnectionInput, CreatedBy *string) (Connection, error) {
@@ -23,7 +29,7 @@ func (Server *Service) Create(Ctx Context.Context, Input ConnectionInput, Create
 }
 
 func (Server *Service) Get(Ctx Context.Context, ID string) (Connection, error) {
-	if ID == "" {
+	if !validID(ID) {
 		return Connection{}, ErrNotFound
 	}
 	return Server.Repo.Get(Ctx, ID)
@@ -34,7 +40,7 @@ func (Server *Service) List(Ctx Context.Context) ([]Connection, error) {
 }
 
 func (Server *Service) Update(Ctx Context.Context, ID string, Input ConnectionInput) (Connection, error) {
-	if ID == "" {
+	if !validID(ID) {
 		return Connection{}, ErrNotFound
 	}
 	if Err := Input.Validate(); Err != nil {
@@ -48,7 +54,7 @@ func (Server *Service) Update(Ctx Context.Context, ID string, Input ConnectionIn
 }
 
 func (Server *Service) Delete(Ctx Context.Context, ID string) error {
-	if ID == "" {
+	if !validID(ID) {
 		return ErrNotFound
 	}
 	return Server.Repo.Delete(Ctx, ID)

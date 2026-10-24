@@ -73,6 +73,8 @@ make db-down
 
 `db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup.
 
+The test database user must also be able to create and drop temporary roles for SELECT-only target inspection tests. The Compose test user has these privileges.
+
 ## Validation
 
 ```sh

@@ -25,7 +25,7 @@ export interface TableIndex {
 
 export interface TablePage {
   columns: string[]
-  rows: unknown[][]
+  rows: (string | null)[][]
   page: number
   page_size: number
   total: number

@@ -34,9 +34,9 @@ type Index struct {
 }
 
 type TablePage struct {
-	Columns  []string `json:"columns"`
-	Rows     [][]any  `json:"rows"`
-	Page     int      `json:"page"`
-	PageSize int      `json:"page_size"`
-	Total    int      `json:"total"`
+	Columns  []string    `json:"columns"`
+	Rows     [][]*string `json:"rows"`
+	Page     int         `json:"page"`
+	PageSize int         `json:"page_size"`
+	Total    int         `json:"total"`
 }

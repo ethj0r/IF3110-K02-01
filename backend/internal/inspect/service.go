@@ -151,12 +151,19 @@ func (Server *Service) Constraints(Ctx Context.Context, DBID, Schema, Table stri
 		return nil, Err
 	}
 	defer Target.Close()
-	Rows, Err := Target.Query(Ctx, `SELECT C.constraint_name, C.constraint_type,
-COALESCE(string_agg(K.column_name, ', ' ORDER BY K.ordinal_position), '') AS columns
-FROM information_schema.table_constraints C LEFT JOIN information_schema.key_column_usage K
-ON K.constraint_name = C.constraint_name AND K.constraint_schema = C.constraint_schema AND K.table_name = C.table_name
-WHERE C.table_schema = $1 AND C.table_name = $2
-GROUP BY C.constraint_name, C.constraint_type ORDER BY C.constraint_name`, Schema, Table)
+	Rows, Err := Target.Query(Ctx, `SELECT C.conname,
+CASE C.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'u' THEN 'UNIQUE'
+WHEN 'f' THEN 'FOREIGN KEY' WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE'
+WHEN 'n' THEN 'NOT NULL' ELSE C.contype::text END,
+COALESCE(string_agg(A.attname, ', ' ORDER BY K.ordinality), '')
+FROM pg_catalog.pg_constraint C
+JOIN pg_catalog.pg_class T ON T.oid = C.conrelid
+JOIN pg_catalog.pg_namespace N ON N.oid = T.relnamespace
+LEFT JOIN LATERAL unnest(C.conkey) WITH ORDINALITY K(attnum, ordinality) ON true
+LEFT JOIN pg_catalog.pg_attribute A ON A.attrelid = T.oid AND A.attnum = K.attnum
+WHERE N.nspname = $1 AND T.relname = $2
+AND has_schema_privilege(N.oid, 'USAGE') AND has_table_privilege(T.oid, 'SELECT')
+GROUP BY C.oid, C.conname, C.contype ORDER BY C.conname`, Schema, Table)
 	if Err != nil {
 		return nil, ErrUnavailable
 	}
@@ -263,7 +270,7 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 	if Err := Count.Err(); Err != nil {
 		return TablePage{}, ErrUnavailable
 	}
-	Data, Err := Target.Query(Ctx, "SELECT * FROM "+Pgx.Identifier{Schema, Table}.Sanitize()+" LIMIT $1 OFFSET $2", PageSize, (Page-1)*PageSize)
+	Data, Err := Target.Query(Ctx, "SELECT * FROM "+Pgx.Identifier{Schema, Table}.Sanitize()+" LIMIT $1 OFFSET $2", Pgx.QueryResultFormats{Pgx.TextFormatCode}, PageSize, (Page-1)*PageSize)
 	if Err != nil {
 		return TablePage{}, ErrUnavailable
 	}
@@ -272,11 +279,15 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 	for _, Field := range Data.FieldDescriptions() {
 		Fields = append(Fields, Field.Name)
 	}
-	Result := TablePage{Columns: Fields, Rows: [][]any{}, Page: Page, PageSize: PageSize, Total: Total}
+	Result := TablePage{Columns: Fields, Rows: [][]*string{}, Page: Page, PageSize: PageSize, Total: Total}
 	for Data.Next() {
-		Values, Err := Data.Values()
-		if Err != nil {
-			return TablePage{}, ErrUnavailable
+		// PostgreSQL text preserves numeric precision and supports every target type.
+		Values := make([]*string, len(Fields))
+		for Index, Raw := range Data.RawValues() {
+			if Raw != nil {
+				Value := string(Raw)
+				Values[Index] = &Value
+			}
 		}
 		Result.Rows = append(Result.Rows, Values)
 	}

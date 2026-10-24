@@ -120,7 +120,7 @@ func (App *Fixture) SeedTarget(T *Testing.T) {
 	if Err != nil {
 		T.Fatal(Err)
 	}
-	defer Target.Close()
+	T.Cleanup(Target.Close)
 	var Nonce [8]byte
 	if _, Err := Rand.Read(Nonce[:]); Err != nil {
 		T.Fatal(Err)
@@ -133,8 +133,11 @@ func (App *Fixture) SeedTarget(T *Testing.T) {
 		T.Fatal(Err)
 	}
 	T.Cleanup(func() {
-		_ = Target.Exec(Context.Background(), "DROP SCHEMA "+Pgx.Identifier{App.Schema}.Sanitize()+" CASCADE")
-		Target.Close()
+		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		if Err := Target.Exec(Cleanup, "DROP SCHEMA "+Pgx.Identifier{App.Schema}.Sanitize()+" CASCADE"); Err != nil {
+			T.Error("cannot remove target test schema")
+		}
 	})
 	if Err := Target.Exec(Ctx, "CREATE TABLE "+Quoted+" (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"); Err != nil {
 		T.Fatal(Err)
