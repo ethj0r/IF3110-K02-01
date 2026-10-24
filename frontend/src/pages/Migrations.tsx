@@ -226,7 +226,7 @@ export function MigrationsPage() {
                           <button onClick={() => setSelectedMigration(Item)} style={{ fontSize: '0.85rem' }}>
                             View
                           </button>
-                          {(Item.status === 'draft' || Item.status === 'pending') && (
+                          {Item.status === 'draft' && (
                             <>
                               <button onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>
                                 Edit

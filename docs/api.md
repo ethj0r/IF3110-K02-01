@@ -50,13 +50,16 @@ Base Route: `/databases/{dbId}/migrations` (alias: `/connections/{dbId}/migratio
 
 | Status | Terminal | Description |
 | --- | --- | --- |
-| `draft` / `pending` | No | Migration created or edited, awaiting execution |
+| `draft` | No | Migration created or edited, awaiting execution |
+| `pending` | No | Execution started; SQL is immutable and automatic retry is blocked |
 | `committed` / `applied` | Yes | Migration executed and committed successfully on target |
 | `rolled_back` / `failed` | Yes | SQL failed on target; transaction rolled back and error message recorded |
 
 ### Execution Model
 
-1. **Isolation & Atomicity:** The migration SQL executes in a dedicated PostgreSQL transaction on the target database (`BEGIN` -> `Exec` -> `COMMIT`).
-2. **Rollback & Persistence:** If execution encounters any SQL error, target transaction rolls back (`ROLLBACK`) leaving target data untouched. Failure status and error details are stored in the platform database.
-3. **Linear Locking:** Sequential versioning is enforced using transaction-level advisory locks (`pg_advisory_xact_lock`) serialized per target database ID to prevent race conditions during concurrent creation.
+1. **Isolation & Atomicity:** SQL runs in an atomic PL/pgSQL `DO` block within the target transaction. Explicit transaction control, including nested `COMMIT`, is rejected by PostgreSQL.
+2. **Rollback & Persistence:** Confirmed rollback records a generic error. Raw PostgreSQL errors are neither persisted nor returned, including legacy history responses.
+3. **Linear Locking:** A session advisory lock covers creation, draft mutations, execution, and result recording per database. Earlier versions must have a terminal outcome before the next executes; only the latest attempted version may be retried after failure.
+4. **Uncertain Outcomes:** `pending` is persisted before SQL runs. A lost commit response, process interruption, or failed result write leaves it pending, blocks retry, and blocks later versions. An operator must verify target effects and reconcile the platform record to `committed` or `rolled_back` before proceeding; never blindly reset it to draft. This also applies to legacy pending records. Target and platform commits are separate transactions.
+5. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording have a separate five-second cleanup window.
 

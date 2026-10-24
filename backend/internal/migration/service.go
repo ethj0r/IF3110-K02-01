@@ -2,8 +2,8 @@ package Migration
 
 import (
 	Context "context"
-	Fmt "fmt"
 	Strings "strings"
+	Time "time"
 
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
@@ -21,11 +21,13 @@ func (F DSNResolverFunc) DialTargetDSN(Ctx Context.Context, DatabaseID string) (
 }
 
 type MigrationRepository interface {
+	WithDatabaseLock(Context.Context, string, func(MigrationRepository) (Migration, error)) (Migration, error)
 	Create(Ctx Context.Context, DatabaseID string, Input MigrationInput, CreatedBy *string) (Migration, error)
 	Get(Ctx Context.Context, DatabaseID string, ID string) (Migration, error)
 	GetByVersion(Ctx Context.Context, DatabaseID string, Version int64) (Migration, error)
 	List(Ctx Context.Context, DatabaseID string) ([]Migration, error)
 	UpdateDraft(Ctx Context.Context, DatabaseID string, ID string, Input MigrationInput) (Migration, error)
+	StartExecution(Ctx Context.Context, DatabaseID, ID string, ExecutedBy *string) (Migration, error)
 	RecordExecution(Ctx Context.Context, DatabaseID string, ID string, ExecutedBy *string, Succeeded bool, ExecutionErr *string) (Migration, error)
 	DeleteDraft(Ctx Context.Context, DatabaseID string, ID string) error
 }
@@ -124,6 +126,8 @@ func (Server *Service) DeleteDraft(Ctx Context.Context, User Auth.Principal, Dat
 }
 
 func (Server *Service) Execute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Migration, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 30*Time.Second)
+	defer Cancel()
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	ID = Strings.TrimSpace(ID)
 	if DatabaseID == "" || ID == "" {
@@ -133,20 +137,37 @@ func (Server *Service) Execute(Ctx Context.Context, User Auth.Principal, Databas
 		return Migration{}, Err
 	}
 
-	Current, Err := Server.Repo.Get(Ctx, DatabaseID, ID)
-	if Err != nil {
-		return Migration{}, Err
-	}
-	if Current.Status.IsSuccess() {
-		return Current, ErrAlreadyExecuted
-	}
-
 	if Server.Resolver == nil {
 		return Migration{}, ErrUnavailable
 	}
 	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, DatabaseID)
 	if Err != nil {
 		return Migration{}, Err
+	}
+	return Server.Repo.WithDatabaseLock(Ctx, DatabaseID, func(Locked MigrationRepository) (Migration, error) {
+		return Server.execute(Ctx, Locked, User, DatabaseID, ID, DSN)
+	})
+}
+
+func (Server *Service) execute(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, DatabaseID, ID, DSN string) (Migration, error) {
+	Current, Err := Repo.Get(Ctx, DatabaseID, ID)
+	if Err != nil {
+		return Migration{}, Err
+	}
+	if Current.Status.IsSuccess() {
+		return Current, ErrAlreadyExecuted
+	}
+	if Current.Status == StatusPending {
+		return Current, ErrPending
+	}
+	History, Err := Repo.List(Ctx, DatabaseID)
+	if Err != nil {
+		return Migration{}, Err
+	}
+	for _, Item := range History {
+		if (Item.Version < Current.Version && !Item.Status.IsTerminal()) || (Item.Version > Current.Version && !Item.Status.IsDraft()) {
+			return Migration{}, ErrOutOfOrder
+		}
 	}
 
 	TargetConn, Err := Server.getDriver().Open(DSN)
@@ -159,34 +180,39 @@ func (Server *Service) Execute(Ctx Context.Context, User Auth.Principal, Databas
 	if Err != nil {
 		return Migration{}, ErrUnavailable
 	}
-	defer func() { _ = TargetTx.Rollback(Ctx) }()
+	defer func() {
+		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		_ = TargetTx.Rollback(Cleanup)
+	}()
 
 	var UserID *string
 	if User.ID != "" {
 		UserID = &User.ID
 	}
 
-	// Execute inside target database transaction
-	ExecErr := TargetTx.Exec(Ctx, Current.SQLText)
+	if _, Err := Repo.StartExecution(Ctx, DatabaseID, ID, UserID); Err != nil {
+		return Migration{}, Err
+	}
+	ExecErr := TargetTx.ExecScript(Ctx, Current.SQLText)
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
 	if ExecErr != nil {
-		_ = TargetTx.Rollback(Ctx)
-		ErrDetail := ExecErr.Error()
-		Updated, RecordErr := Server.Repo.RecordExecution(Ctx, DatabaseID, ID, UserID, false, &ErrDetail)
+		if Err := TargetTx.Rollback(RecordCtx); Err != nil {
+			return Migration{}, ErrUnavailable
+		}
+		ErrDetail := Driver.ErrExecution.Error()
+		Updated, RecordErr := Repo.RecordExecution(RecordCtx, DatabaseID, ID, UserID, false, &ErrDetail)
 		if RecordErr != nil {
 			return Migration{}, RecordErr
 		}
-		return Updated, Fmt.Errorf("%w: %v", Driver.ErrExecution, ExecErr)
+		return Updated, Driver.ErrExecution
 	}
 
 	if Err := TargetTx.Commit(Ctx); Err != nil {
-		_ = TargetTx.Rollback(Ctx)
-		ErrDetail := Err.Error()
-		Updated, RecordErr := Server.Repo.RecordExecution(Ctx, DatabaseID, ID, UserID, false, &ErrDetail)
-		if RecordErr != nil {
-			return Migration{}, RecordErr
-		}
-		return Updated, ErrUnavailable
+		// A failed commit response does not prove the target rolled back.
+		return Migration{}, ErrUnavailable
 	}
 
-	return Server.Repo.RecordExecution(Ctx, DatabaseID, ID, UserID, true, nil)
+	return Repo.RecordExecution(RecordCtx, DatabaseID, ID, UserID, true, nil)
 }

@@ -7,8 +7,8 @@ import (
 )
 
 func TestStatusHelpers(T *Testing.T) {
-	if !StatusDraft.IsDraft() || !StatusPending.IsDraft() {
-		T.Fatal("draft and pending must be recognized as draft")
+	if !StatusDraft.IsDraft() || StatusPending.IsDraft() {
+		T.Fatal("only draft may be edited or deleted")
 	}
 	if StatusCommitted.IsDraft() || StatusRolledBack.IsDraft() {
 		T.Fatal("committed and rolled_back are not draft")

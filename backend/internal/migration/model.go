@@ -30,7 +30,7 @@ func (S Status) IsFailure() bool {
 }
 
 func (S Status) IsDraft() bool {
-	return S == StatusDraft || S == StatusPending
+	return S == StatusDraft
 }
 
 var (
@@ -38,6 +38,8 @@ var (
 	ErrNotFound        = Errors.New("migration not found")
 	ErrConflict        = Errors.New("migration version already exists")
 	ErrAlreadyExecuted = Errors.New("migration has already been executed")
+	ErrPending         = Errors.New("migration execution outcome requires verification")
+	ErrOutOfOrder      = Errors.New("migration must execute in version order")
 	ErrUnavailable     = Errors.New("migration store is unavailable")
 	ErrForbidden       = Errors.New("permission denied for database migration")
 )

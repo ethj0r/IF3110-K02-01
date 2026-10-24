@@ -12,11 +12,26 @@ import (
 )
 
 type MockRepo struct {
-	Items map[string]Migration
+	Items       map[string]Migration
+	RecordError error
 }
 
 func NewMockRepo() *MockRepo {
 	return &MockRepo{Items: make(map[string]Migration)}
+}
+
+func (M *MockRepo) WithDatabaseLock(_ Context.Context, _ string, Run func(MigrationRepository) (Migration, error)) (Migration, error) {
+	return Run(M)
+}
+
+func (M *MockRepo) StartExecution(Ctx Context.Context, DatabaseID, ID string, _ *string) (Migration, error) {
+	Item, Err := M.Get(Ctx, DatabaseID, ID)
+	if Err != nil {
+		return Item, Err
+	}
+	Item.Status = StatusPending
+	M.Items[ID] = Item
+	return Item, Err
 }
 
 func (M *MockRepo) Create(_ Context.Context, DatabaseID string, Input MigrationInput, CreatedBy *string) (Migration, error) {
@@ -75,6 +90,9 @@ func (M *MockRepo) UpdateDraft(_ Context.Context, DatabaseID string, ID string, 
 }
 
 func (M *MockRepo) RecordExecution(_ Context.Context, DatabaseID string, ID string, ExecutedBy *string, Succeeded bool, ExecutionErr *string) (Migration, error) {
+	if M.RecordError != nil {
+		return Migration{}, M.RecordError
+	}
 	Item, Ok := M.Items[ID]
 	if !Ok || Item.DatabaseID != DatabaseID {
 		return Migration{}, ErrNotFound
@@ -88,6 +106,35 @@ func (M *MockRepo) RecordExecution(_ Context.Context, DatabaseID string, ID stri
 	Item.ErrorMessage = ExecutionErr
 	M.Items[ID] = Item
 	return Item, nil
+}
+
+func TestUncertainExecutionCannotBeRetried(T *Testing.T) {
+	for _, Stage := range []string{"commit", "record"} {
+		T.Run(Stage, func(T *Testing.T) {
+			Repo, Tx := NewMockRepo(), &MockTx{}
+			if Stage == "commit" {
+				Tx.CommitError = Driver.ErrUnavailable
+			} else {
+				Repo.RecordError = ErrUnavailable
+			}
+			Server := &Service{Repo: Repo, Access: Access.AllowAll(), Driver: &MockDriver{Conn: &MockConn{Tx: Tx}},
+				Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil })}
+			Ctx, User := Context.Background(), Auth.Principal{ID: "editor"}
+			Item, Err := Server.Create(Ctx, User, "db", MigrationInput{Title: "Uncertain", SQLText: "SELECT 1"})
+			if Err != nil {
+				T.Fatal(Err)
+			}
+			if _, Err := Server.Execute(Ctx, User, "db", Item.ID); !Errors.Is(Err, ErrUnavailable) {
+				T.Fatalf("unexpected execution error: %v", Err)
+			}
+			if Repo.Items[Item.ID].Status != StatusPending {
+				T.Fatal("uncertain execution must remain pending")
+			}
+			if _, Err := Server.Execute(Ctx, User, "db", Item.ID); !Errors.Is(Err, ErrPending) {
+				T.Fatalf("uncertain execution was retried: %v", Err)
+			}
+		})
+	}
 }
 
 func (M *MockRepo) DeleteDraft(_ Context.Context, DatabaseID string, ID string) error {
@@ -117,6 +164,10 @@ func (T *MockTx) Query(_ Context.Context, _ string, _ ...any) (Pgx.Rows, error) 
 func (T *MockTx) Exec(_ Context.Context, SQL string, _ ...any) error {
 	T.ExecutedSQL = SQL
 	return T.ExecError
+}
+
+func (T *MockTx) ExecScript(Ctx Context.Context, SQL string) error {
+	return T.Exec(Ctx, SQL)
 }
 
 func (T *MockTx) Commit(_ Context.Context) error {
@@ -269,7 +320,7 @@ func TestServiceExecutionSuccessAndFailure(T *Testing.T) {
 	if ExecutedFail.Status != StatusRolledBack || !TxFail.RolledBack || TxFail.Committed {
 		T.Fatalf("expected rolled back transaction on failure, got %+v", ExecutedFail)
 	}
-	if ExecutedFail.ErrorMessage == nil || *ExecutedFail.ErrorMessage != SQLFailErr.Error() {
+	if ExecutedFail.ErrorMessage == nil || *ExecutedFail.ErrorMessage != Driver.ErrExecution.Error() {
 		T.Fatalf("expected error message recorded, got %v", ExecutedFail.ErrorMessage)
 	}
 }

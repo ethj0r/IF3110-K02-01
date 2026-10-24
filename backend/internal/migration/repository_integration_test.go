@@ -9,6 +9,7 @@ import (
 	Sync "sync"
 	Testing "testing"
 
+	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Testutil "github.com/ethj0r/IF3110-K02-01/backend/internal/testutil"
 	Migrations "github.com/ethj0r/IF3110-K02-01/backend/migrations"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
@@ -114,8 +115,19 @@ func TestRepositoryLifecycleAndLinearVersions(T *Testing.T) {
 	// Record execution: rollback M2 with error message
 	ErrMsg := "syntax error at or near INVALID"
 	RolledBack2, Err := Repo.RecordExecution(Ctx, DBID, M2.ID, &UserID, false, &ErrMsg)
-	if Err != nil || RolledBack2.Status != StatusRolledBack || RolledBack2.ErrorMessage == nil || *RolledBack2.ErrorMessage != ErrMsg {
+	if Err != nil || RolledBack2.Status != StatusRolledBack || RolledBack2.ErrorMessage == nil || *RolledBack2.ErrorMessage != Driver.ErrExecution.Error() {
 		T.Fatalf("failed to record rolled back execution m2: %v", Err)
+	}
+	var SavedError string
+	if Err := Pool.QueryRow(Ctx, "SELECT error_message FROM migrations WHERE id = $1", M2.ID).Scan(&SavedError); Err != nil || SavedError != Driver.ErrExecution.Error() {
+		T.Fatal("raw PostgreSQL error was persisted")
+	}
+	if _, Err := Pool.Exec(Ctx, "UPDATE migrations SET error_message = 'legacy-private-marker' WHERE id = $1", M2.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Legacy, Err := Repo.Get(Ctx, DBID, M2.ID)
+	if Err != nil || Legacy.ErrorMessage == nil || *Legacy.ErrorMessage != Driver.ErrExecution.Error() {
+		T.Fatal("legacy PostgreSQL error was exposed")
 	}
 
 	// Create and delete M3 draft

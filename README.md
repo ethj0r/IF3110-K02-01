@@ -120,7 +120,7 @@ Target database migrations represent ordered, linear schema and data modificatio
 | `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
 
-Migrations are serialized per target database using advisory locks (`pg_advisory_xact_lock`) ensuring consecutive versions. Execution runs inside a target database transaction: successfully applied SQL commits to the target database and updates status to `committed`, while errors trigger immediate rollback on the target database and persist the failure and error details in the platform database with status `rolled_back`.
+Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
 
 See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
 
