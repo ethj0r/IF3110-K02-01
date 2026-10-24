@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from 'react-router-dom'
 import { AdminGuard } from './auth/AdminGuard'
 import { AuthGuard } from './auth/Guard'
 import { LoginPage } from './pages/Login'
+import { MigrationsPage } from './pages/Migrations'
 import { Workspace } from './pages/Workspace'
 import { DatabaseDetailPage } from './pages/DatabaseDetail'
 import { AccessMatrixPage } from './pages/admin/AccessMatrix'
@@ -16,6 +17,8 @@ export function App() {
       <Route path="/login" element={<LoginPage />} />
       <Route element={<AuthGuard />}>
         <Route path="/" element={<Workspace />} />
+        <Route path="/databases/:dbId/migrations" element={<MigrationsPage />} />
+        <Route path="/migrations" element={<MigrationsPage />} />
         <Route path="/databases/:id" element={<DatabaseDetailPage />} />
         <Route path="/admin" element={<AdminGuard />}>
           <Route element={<AdminLayout />}>

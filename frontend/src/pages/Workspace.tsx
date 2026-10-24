@@ -18,6 +18,7 @@ export function Workspace() {
           <small>Workspace</small>
         </Link>
         <div className="app-header-actions">
+          <Link to="/migrations" className="back-link">Migrations</Link>
           {IsAdmin && <Link to="/admin" className="back-link">Administration</Link>}
           <span className="muted">Signed in as {Session.data?.user.username}</span>
           <SignOutButton />

@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, role-based database access, administrator APIs, and the administration UI are available. Platform administrators manage users, groups, and database grants from `/admin`. Database inspection and target database migrations are not implemented yet.
+Authentication, session management, CSRF protection, administrator bootstrap, role-based database access, administrator APIs, the administration UI, encrypted target database connection management, and transactional target database migrations are available. Platform administrators manage users, groups, and database grants from `/admin`. Database inspection remains to be completed.
 
 ## Requirements
 
@@ -102,6 +102,25 @@ make migrate-up
 The goose runner manages platform metadata separately from target database migrations. Add SQL files to `backend/migrations/sql/` using unique sequential versions, such as `00001_create_users.sql`, with `-- +goose Up` and `-- +goose Down` directives.
 
 The server does not apply migrations automatically. Run `migrate-up` before starting it; startup and readiness verify that the authentication schema is available.
+
+## Target Database Migrations
+
+Target database migrations represent ordered, linear schema and data modifications executed on managed target PostgreSQL databases.
+
+### Endpoints
+
+| Method | Path | Required Access |
+| --- | --- | --- |
+| `GET` | `/api/databases/{dbId}/migrations` | View Only / View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations` | View + Edit |
+| `GET` | `/api/databases/{dbId}/migrations/{id}` | View Only / View + Edit |
+| `PUT` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
+| `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
+
+Migrations are serialized per target database using advisory locks (`pg_advisory_xact_lock`) ensuring consecutive versions. Execution runs inside a target database transaction: successfully applied SQL commits to the target database and updates status to `committed`, while errors trigger immediate rollback on the target database and persist the failure and error details in the platform database with status `rolled_back`.
+
+See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
 
 ## Authentication
 

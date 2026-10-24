@@ -4,6 +4,28 @@ export interface User {
   is_platform_admin: boolean
 }
 
+export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed'
+
+export interface Migration {
+  id: string
+  database_id: string
+  version: number
+  title: string
+  sql_text: string
+  status: MigrationStatus
+  error_message?: string
+  created_by?: string
+  executed_by?: string
+  created_at: string
+  updated_at: string
+  executed_at?: string
+}
+
+export interface MigrationInput {
+  title: string
+  sql_text: string
+}
+
 export interface AuthResponse {
   user: User
   csrf_token: string
@@ -72,3 +94,38 @@ export async function Logout(): Promise<void> {
   await ApiRequest<void>('/api/auth/logout', { method: 'POST' })
   CSRFToken = null
 }
+
+export async function ListMigrations(DatabaseID: string, Signal?: AbortSignal): Promise<Migration[]> {
+  return ApiRequest<Migration[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations`, { signal: Signal })
+}
+
+export async function GetMigration(DatabaseID: string, MigrationID: string, Signal?: AbortSignal): Promise<Migration> {
+  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}`, { signal: Signal })
+}
+
+export async function CreateMigration(DatabaseID: string, Input: MigrationInput): Promise<Migration> {
+  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations`, {
+    method: 'POST',
+    body: JSON.stringify(Input),
+  })
+}
+
+export async function UpdateMigrationDraft(DatabaseID: string, MigrationID: string, Input: MigrationInput): Promise<Migration> {
+  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}`, {
+    method: 'PUT',
+    body: JSON.stringify(Input),
+  })
+}
+
+export async function DeleteMigrationDraft(DatabaseID: string, MigrationID: string): Promise<void> {
+  return ApiRequest<void>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}`, {
+    method: 'DELETE',
+  })
+}
+
+export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<Migration> {
+  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
+    method: 'POST',
+  })
+}
+
