@@ -16,6 +16,7 @@ export interface Migration {
   error_message?: string
   created_by?: string
   executed_by?: string
+  executed_by_username?: string
   created_at: string
   updated_at: string
   executed_at?: string

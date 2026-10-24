@@ -23,9 +23,10 @@ type Column struct {
 }
 
 type Constraint struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Columns string `json:"columns"`
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Columns    string `json:"columns"`
+	Definition string `json:"definition"`
 }
 
 type Index struct {

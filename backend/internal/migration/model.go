@@ -45,18 +45,19 @@ var (
 )
 
 type Migration struct {
-	ID           string     `json:"id"`
-	DatabaseID   string     `json:"database_id"`
-	Version      int64      `json:"version"`
-	Title        string     `json:"title"`
-	SQLText      string     `json:"sql_text"`
-	Status       Status     `json:"status"`
-	ErrorMessage *string    `json:"error_message,omitempty"`
-	CreatedBy    *string    `json:"created_by,omitempty"`
-	ExecutedBy   *string    `json:"executed_by,omitempty"`
-	CreatedAt    Time.Time  `json:"created_at"`
-	UpdatedAt    Time.Time  `json:"updated_at"`
-	ExecutedAt   *Time.Time `json:"executed_at,omitempty"`
+	ID                 string     `json:"id"`
+	DatabaseID         string     `json:"database_id"`
+	Version            int64      `json:"version"`
+	Title              string     `json:"title"`
+	SQLText            string     `json:"sql_text"`
+	Status             Status     `json:"status"`
+	ErrorMessage       *string    `json:"error_message,omitempty"`
+	CreatedBy          *string    `json:"created_by,omitempty"`
+	ExecutedBy         *string    `json:"executed_by,omitempty"`
+	ExecutedByUsername *string    `json:"executed_by_username,omitempty"`
+	CreatedAt          Time.Time  `json:"created_at"`
+	UpdatedAt          Time.Time  `json:"updated_at"`
+	ExecutedAt         *Time.Time `json:"executed_at,omitempty"`
 }
 
 type MigrationInput struct {

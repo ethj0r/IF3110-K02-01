@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, role-based database access, administrator APIs, the administration UI, encrypted target database connection management, and transactional target database migrations are available. Platform administrators manage users, groups, and database grants from `/admin`. Database inspection remains to be completed.
+Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, and transactional target migrations are available.
 
 ## Requirements
 
@@ -105,6 +105,26 @@ The goose runner manages platform metadata separately from target database migra
 
 The server does not apply migrations automatically. Run `migrate-up` before starting it; startup and readiness verify that the authentication schema is available.
 
+## Database Viewer
+
+1. Run setup/bootstrap and sign in as the platform administrator.
+2. Open `/admin/connections`, add the target PostgreSQL connection, and use **Test** to verify reachability. Editing requires re-entering its password.
+3. Create a group, add members (including the administrator if they need database access), and assign its database grant in `/admin/access`.
+4. Open the workspace, select the database, then choose a schema and table to inspect columns, constraints, indexes, and paginated data.
+5. Use **Migrations** in the viewer to open that database's history. The global migration page also provides a dropdown of assigned databases. View Only can inspect history; View + Edit enables draft and execution controls.
+
+Connections use `SESSION_KEY` to encrypt target passwords. Keep it stable: replacing it invalidates sessions and makes saved target passwords unreadable until re-entered. Passwords and ciphertext are never returned by connection metadata APIs.
+
+On server startup, a non-empty `TARGET_DATABASE_URL` seeds `local-target` only when the connection table is empty. Seeding grants no access automatically. Restarting with an existing connection does not overwrite it; manage it through the administration page.
+
+Rows default to 25 per page, with a maximum of 100. Cells use PostgreSQL text representations to preserve numeric precision; SQL NULL remains distinct from empty text. Schema/table identifiers must match `[A-Za-z_][A-Za-z0-9_]*` and contain at most 63 characters. Quoted names containing spaces or punctuation are currently unsupported.
+
+Rows are ordered by primary key, with full-row text as a tie-breaker or fallback for tables/views without a key. Count and data share one read-only repeatable-read snapshot per request; a new page request sees a fresh snapshot. Inspection queries have a ten-second request budget and connection setup a five-second timeout. Column types include length/precision, and constraints include their PostgreSQL definitions.
+
+Target connections currently use `sslmode=disable`; URL TLS options are not retained by the connection store. Use the local Compose target or an appropriately protected database network. Targets requiring TLS need additional connection configuration support.
+
+Deleting a connection also deletes its platform grants and migration history; it does not drop the target database. Verification commands are `make check`, `make db-test-up`, `make test-integration`, and `make build`.
+
 ## Target Database Migrations
 
 Target database migrations represent ordered, linear schema and data modifications executed on managed target PostgreSQL databases.
@@ -184,5 +204,6 @@ The administration UI is available at `/admin` for platform administrators:
 | `/admin/users` | Create and deactivate users, reset passwords, and delete accounts |
 | `/admin/groups` | Manage groups and memberships |
 | `/admin/access` | Assign or remove group database grants |
+| `/admin/connections` | Add, edit, test, and remove target connections |
 
 The admin API is under `/api/admin` and every route requires an authenticated platform administrator. Creating or promoting administrators is not supported through the API. Deactivating or deleting the last active administrator is rejected with `last_admin`.

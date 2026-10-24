@@ -7,6 +7,7 @@ import (
 	Json "encoding/json"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Pgx "github.com/jackc/pgx/v5"
+	Math "math"
 	Strings "strings"
 	Testing "testing"
 )
@@ -57,6 +58,14 @@ func TestTableRowsPagination(T *Testing.T) {
 	App := NewFixture(T)
 	App.SeedTarget(T)
 	App.SeedRows(T, 3)
+	Target, Err := Driver.PostgresDriver{}.Open(App.Target)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	defer Target.Close()
+	if Err := Target.Exec(Context.Background(), "UPDATE "+Pgx.Identifier{App.Schema, "items"}.Sanitize()+" SET name = 'moved' WHERE id = 1"); Err != nil {
+		T.Fatal(Err)
+	}
 	ID := App.ConnectionID(T)
 	var First TablePage
 	Response := App.Request("GET", "/api/databases/"+ID+"/tables/items/rows?schema="+App.Schema+"&page=1&page_size=2", App.Member)
@@ -69,6 +78,9 @@ func TestTableRowsPagination(T *Testing.T) {
 	if First.Total != 3 || len(First.Rows) != 2 || len(First.Columns) != 2 || First.Page != 1 || First.PageSize != 2 {
 		T.Fatalf("unexpected first page: %+v", First)
 	}
+	if *First.Rows[0][0] != "1" || *First.Rows[1][0] != "2" {
+		T.Fatal("pagination must follow the primary key, not heap order")
+	}
 	var Second TablePage
 	Next := App.Request("GET", "/api/databases/"+ID+"/tables/items/rows?schema="+App.Schema+"&page=2&page_size=2", App.Member)
 	if Next.Code != 200 {
@@ -76,6 +88,12 @@ func TestTableRowsPagination(T *Testing.T) {
 	}
 	if Err := Json.Unmarshal(Next.Body.Bytes(), &Second); Err != nil || Second.Total != 3 || len(Second.Rows) != 1 {
 		T.Fatalf("unexpected second page: %s %v", Next.Body.String(), Err)
+	}
+	if *Second.Rows[0][0] != "3" {
+		T.Fatal("pagination repeated or skipped a primary key")
+	}
+	if _, Err := App.Service.Rows(Context.Background(), ID, App.Schema, "items", Math.MaxInt, 100); Err != ErrInvalidInput {
+		T.Fatal("overflowing pagination offset was accepted")
 	}
 	for _, Path := range []string{
 		"/api/databases/" + ID + "/tables/items/rows?schema=" + App.Schema + "&page=1&page_size=101",

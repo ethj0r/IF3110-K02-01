@@ -49,9 +49,9 @@ func (Repo *Repository) WithDatabaseLock(Ctx Context.Context, DatabaseID string,
 	return Run(&Repository{Pool: Repo.Pool, Conn: Conn})
 }
 
-const MigrationColumns = "M.id::text, M.database_id::text, M.version, M.title, M.sql_text, M.status, M.error_message, M.created_by::text, M.executed_by::text, M.created_at, M.updated_at, M.executed_at"
+const MigrationColumns = "M.id::text, M.database_id::text, M.version, M.title, M.sql_text, M.status, M.error_message, M.created_by::text, M.executed_by::text, M.created_at, M.updated_at, M.executed_at, (SELECT U.username FROM users U WHERE U.id = M.executed_by)"
 
-const MigrationReturning = "id::text, database_id::text, version, title, sql_text, status, error_message, created_by::text, executed_by::text, created_at, updated_at, executed_at"
+const MigrationReturning = "id::text, database_id::text, version, title, sql_text, status, error_message, created_by::text, executed_by::text, created_at, updated_at, executed_at, (SELECT U.username FROM users U WHERE U.id = migrations.executed_by)"
 
 func isConflict(Err error) bool {
 	var PgErr *Pgconn.PgError
@@ -74,6 +74,7 @@ func scanMigration(Row Pgx.Row) (Migration, error) {
 		&Item.CreatedAt,
 		&Item.UpdatedAt,
 		&Item.ExecutedAt,
+		&Item.ExecutedByUsername,
 	)
 	if Errors.Is(Err, Pgx.ErrNoRows) {
 		return Migration{}, ErrNotFound

@@ -6,6 +6,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { App } from '../src/App'
 
 const Clients: QueryClient[] = []
+const Databases = [{ id: 'db-1', name: 'Reporting', host: '127.0.0.1', dbname: 'reporting', level: 'view_edit' }]
 
 AfterEach(() => {
   Cleanup()
@@ -16,19 +17,21 @@ AfterEach(() => {
 function Mount(InitialPath = '/databases/db-1/migrations') {
   const Client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: Infinity } } })
   Clients.push(Client)
-  return Render(
+  const View = Render(
     <QueryClientProvider client={Client}>
       <MemoryRouter initialEntries={[InitialPath]}>
         <App />
       </MemoryRouter>
     </QueryClientProvider>,
   )
+  return { ...View, Client }
 }
 
 Test('loads and displays linear migrations table and views details', async () => {
   Vi.stubGlobal(
     'fetch',
     Vi.fn(async (Path: string) => {
+      if (Path === '/api/databases') return Response.json(Databases)
       if (Path === '/api/auth/me') {
         return Response.json({
           user: { id: 'u1', username: 'tester', is_platform_admin: false },
@@ -47,6 +50,7 @@ Test('loads and displays linear migrations table and views details', async () =>
             status: 'committed',
             created_at: '2026-01-01T00:00:00Z',
             executed_at: '2026-01-01T00:05:00Z',
+            executed_by_username: 'operator',
           },
         ])
       }
@@ -64,6 +68,7 @@ Test('loads and displays linear migrations table and views details', async () =>
 
   await User.click(Screen.getByRole('button', { name: 'View' }))
   Expect(await Screen.findByText('CREATE TABLE sample (id INT);')).toBeTruthy()
+  Expect(Screen.getByText('Executed by:').closest('p')?.textContent).toContain('operator')
 })
 
 Test('creates and executes draft migration', async () => {
@@ -84,6 +89,7 @@ Test('creates and executes draft migration', async () => {
   Vi.stubGlobal(
     'fetch',
     Vi.fn(async (Path: string, Options?: RequestInit) => {
+      if (Path === '/api/databases') return Response.json(Databases)
       if (Path === '/api/auth/me') {
         return Response.json({
           user: { id: 'u1', username: 'tester', is_platform_admin: false },
@@ -124,7 +130,9 @@ Test('creates and executes draft migration', async () => {
     }),
   )
 
-  Mount()
+  const { Client } = Mount()
+  const SchemaKey = ['databases', 'db-1', 'schemas'] as const
+  Client.setQueryData(SchemaKey, { schemas: ['public'] })
   const User = UserEvent.setup()
 
   await Screen.findByRole('heading', { name: 'Database Migrations' })
@@ -141,5 +149,67 @@ Test('creates and executes draft migration', async () => {
   // Execute
   await User.click(Screen.getAllByRole('button', { name: 'Execute' })[0])
   Expect(await Screen.findByText(/committed successfully/)).toBeTruthy()
+  Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true)
+})
+
+function InstallMigrationAPI(Level = 'view_edit', Status = 'draft') {
+  const Fetch = Vi.fn(async (Path: string) => {
+    if (Path === '/api/auth/me') return Response.json({ user: { id: 'u1', username: 'tester', is_platform_admin: false }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
+    if (Path === '/api/databases') return Response.json([...Databases.map(Item => ({ ...Item, level: Level })), { ...Databases[0], id: 'db-2', name: 'Analytics' }])
+    if (Path.endsWith('/schemas')) return Response.json({ schemas: ['public'] })
+    if (Path.includes('/tables?')) return Response.json({ tables: [] })
+    if (Path.endsWith('/migrations')) return Response.json([
+      { id: 'first', database_id: 'db-1', version: 1, title: Path.includes('db-2') ? 'Analytics history' : 'First migration', sql_text: 'SELECT 1;', status: Status, created_at: '2026-01-01T00:00:00Z' },
+      { id: 'second', database_id: 'db-1', version: 2, title: 'Second migration', sql_text: 'SELECT 2;', status: 'draft', created_at: '2026-01-01T00:00:00Z' },
+    ])
+    return new Response(null, { status: 404 })
+  })
+  Vi.stubGlobal('fetch', Fetch)
+  return Fetch
+}
+
+Test('view-only users can inspect history without mutation controls', async () => {
+  InstallMigrationAPI('view_only', 'rolled_back')
+  Mount()
+  const User = UserEvent.setup()
+  await Screen.findByText('First migration')
+  for (const Name of ['+ Create Migration', 'Edit', 'Execute', 'Delete', 'Retry']) {
+    Expect(Screen.queryByRole('button', { name: Name })).toBeNull()
+  }
+  await User.click(Screen.getAllByRole('button', { name: 'View' })[0])
+  Expect(await Screen.findByText('SELECT 1;')).toBeTruthy()
+})
+
+Test('viewer opens its migrations and switching database clears the editor', async () => {
+  InstallMigrationAPI()
+  Mount('/databases/db-1')
+  const User = UserEvent.setup()
+  await User.click(await Screen.findByRole('link', { name: 'Migrations' }))
+  await Screen.findByText('First migration')
+  const Execute = Screen.getAllByRole('button', { name: 'Execute' })
+  Expect((Execute[0] as HTMLButtonElement).disabled).toBe(false)
+  Expect((Execute[1] as HTMLButtonElement).disabled).toBe(true)
+  await User.click(Screen.getAllByRole('button', { name: 'View' })[0])
+  await User.click(Screen.getByRole('button', { name: '+ Create Migration' }))
+  await User.type(Screen.getByLabelText(/SQL Query/), 'CREATE TABLE old_database_only (id int);')
+  await User.selectOptions(Screen.getByLabelText('Database:'), 'db-2')
+  await Screen.findByText('Analytics history')
+  Expect(Screen.queryByLabelText(/SQL Query/)).toBeNull()
+  Expect(Screen.queryByText('SELECT 1;')).toBeNull()
+})
+
+Test('pending execution disables later execution and explains recovery', async () => {
+  InstallMigrationAPI('view_edit', 'pending')
+  Mount()
+  await Screen.findByText('First migration')
+  Expect((Screen.getByRole('button', { name: 'Execute' }) as HTMLButtonElement).disabled).toBe(true)
+  Expect(Screen.getByRole('status').textContent).toContain('verify the target outcome')
+})
+
+Test('unknown database routes do not load migration history', async () => {
+  const Fetch = InstallMigrationAPI()
+  Mount('/databases/no-grant/migrations')
+  Expect((await Screen.findByRole('alert')).textContent).toBe('No access to this database.')
+  Expect(Fetch.mock.calls.some(([Path]) => Path.includes('/no-grant/migrations'))).toBe(false)
 })
 

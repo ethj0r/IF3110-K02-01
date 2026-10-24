@@ -253,7 +253,7 @@ export function ConnectionsPage() {
       {DeleteTarget && (
         <ConfirmDialog
           Title="Delete connection"
-          Description={`Delete ${DeleteTarget.name}? Its group grants will be removed and members lose access.`}
+          Description={`Delete ${DeleteTarget.name}? Its group grants and platform migration history will be removed. The target database is kept.`}
           ConfirmLabel="Delete connection"
           Pending={Remove.isPending}
           OnConfirm={() => Remove.mutate(DeleteTarget.id)}

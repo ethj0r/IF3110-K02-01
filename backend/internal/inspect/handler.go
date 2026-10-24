@@ -1,6 +1,7 @@
 package Inspect
 
 import (
+	Context "context"
 	Errors "errors"
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
@@ -8,6 +9,7 @@ import (
 	Chi "github.com/go-chi/chi/v5"
 	Http "net/http"
 	Strconv "strconv"
+	Time "time"
 )
 
 type Handler struct {
@@ -20,6 +22,13 @@ func (Routes *Handler) Register(Api Chi.Router) {
 	Api.Group(func(R Chi.Router) {
 		R.Use(Auth.NoStore)
 		R.Use(Routes.Auth.RequireSession)
+		R.Use(func(Next Http.Handler) Http.Handler {
+			return Http.HandlerFunc(func(W Http.ResponseWriter, R *Http.Request) {
+				Ctx, Cancel := Context.WithTimeout(R.Context(), 10*Time.Second)
+				defer Cancel()
+				Next.ServeHTTP(W, R.WithContext(Ctx))
+			})
+		})
 		R.Use(Access.RequireDatabase(Routes.Policy, Access.ActionView, "id"))
 		R.Get("/databases/{id}/schemas", Routes.ListSchemas)
 		R.Get("/databases/{id}/tables", Routes.ListTables)

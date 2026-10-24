@@ -103,6 +103,9 @@ func TestRepositoryLifecycleAndLinearVersions(T *Testing.T) {
 	if Err != nil || Committed1.Status != StatusCommitted || Committed1.ExecutedAt == nil {
 		T.Fatalf("failed to commit execution m1: %v", Err)
 	}
+	if Committed1.ExecutedByUsername == nil || *Committed1.ExecutedByUsername != "test_migrator" {
+		T.Fatal("execution response is missing the actor username")
+	}
 
 	// Updating or deleting committed migration must fail
 	if _, Err := Repo.UpdateDraft(Ctx, DBID, M1.ID, MigrationInput{Title: "Hacked", SQLText: "DROP TABLE a;"}); !Errors.Is(Err, ErrAlreadyExecuted) {
