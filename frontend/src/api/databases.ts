@@ -16,6 +16,7 @@ export interface TableConstraint {
   name: string
   type: string
   columns: string
+  definition: string
 }
 
 export interface TableIndex {

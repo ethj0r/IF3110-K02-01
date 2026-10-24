@@ -82,6 +82,7 @@ export function DatabaseDetailPage() {
           <small>Workspace</small>
         </Link>
         <div className="app-header-actions">
+          {Database && <Link to={`/databases/${Database.id}/migrations`} className="back-link">Migrations</Link>}
           <Link to="/" className="back-link">← Databases</Link>
         </div>
       </header>
@@ -177,17 +178,18 @@ export function DatabaseDetailPage() {
                       <RequestError error={Indexes.error} />
                       <div className="table-wrap">
                         <table className="data-table">
-                          <thead><tr><th>Constraint</th><th>Type</th><th>Columns</th></tr></thead>
+                          <thead><tr><th>Constraint</th><th>Type</th><th>Columns</th><th>Definition</th></tr></thead>
                           <tbody>
                             {(Constraints.data?.constraints ?? []).map(Item => (
                               <tr key={Item.name}>
                                 <td><code>{Item.name}</code></td>
                                 <td>{Item.type}</td>
                                 <td><code>{Item.columns === '' ? '—' : Item.columns}</code></td>
+                                <td><code>{Item.definition}</code></td>
                               </tr>
                             ))}
                             {(Constraints.data?.constraints.length ?? 0) === 0 && (
-                              <tr><td colSpan={3}><span className="muted">No constraints</span></td></tr>
+                              <tr><td colSpan={4}><span className="muted">No constraints</span></td></tr>
                             )}
                           </tbody>
                         </table>
@@ -223,7 +225,7 @@ export function DatabaseDetailPage() {
                       {Rows.data && (
                         <>
                           <div className="table-wrap">
-                            <table className="data-table">
+                            <table className="data-table row-data">
                               <thead><tr>{Rows.data.columns.map(Name => <th key={Name}><code>{Name}</code></th>)}</tr></thead>
                               <tbody>
                                 {Rows.data.rows.map((Row, Index) => (

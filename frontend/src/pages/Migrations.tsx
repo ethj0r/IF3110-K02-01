@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState, type FormEvent } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { useState } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
+import { AccessQueryKeys, ListAccessibleDatabases } from '../api/access'
+import { RequestError } from '../components/Feedback'
 import {
   ApiError,
   CreateMigration,
@@ -12,10 +14,15 @@ import {
 } from '../api/client'
 
 export function MigrationsPage() {
-  const RouteParams = useParams<{ dbId?: string }>()
-  const [DatabaseID, setDatabaseID] = useState<string>(RouteParams.dbId ?? '')
-  const [ActiveDatabase, setActiveDatabase] = useState<string>(RouteParams.dbId ?? '')
-  const [SelectedMigration, setSelectedMigration] = useState<Migration | null>(null)
+  const { dbId = '' } = useParams<{ dbId?: string }>()
+  return <DatabaseMigrations key={dbId} ActiveDatabase={dbId} />
+}
+
+function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
+  const NavigateTo = useNavigate()
+  const Databases = useQuery({ queryKey: AccessQueryKeys.databases, queryFn: ListAccessibleDatabases })
+  const Database = Databases.data?.find(Item => Item.id === ActiveDatabase)
+  const [SelectedMigrationID, setSelectedMigrationID] = useState<string | null>(null)
   const [IsEditorOpen, setIsEditorOpen] = useState(false)
   const [EditingMigration, setEditingMigration] = useState<Migration | null>(null)
   const [EditorTitle, setEditorTitle] = useState('')
@@ -28,8 +35,15 @@ export function MigrationsPage() {
   const MigrationsQuery = useQuery({
     queryKey: ['migrations', ActiveDatabase],
     queryFn: ({ signal }) => ListMigrations(ActiveDatabase, signal),
-    enabled: Boolean(ActiveDatabase),
+    enabled: Boolean(Database),
   })
+  const History = MigrationsQuery.data ?? []
+  const SelectedMigration = History.find(Item => Item.id === SelectedMigrationID)
+  const CanEdit = Database?.level === 'view_edit' && !MigrationsQuery.isError
+  const Pending = History.some(Item => Item.status === 'pending')
+  const LastAttempt = Math.max(0, ...History.filter(Item => Item.status !== 'draft').map(Item => Item.version))
+  const CanExecute = (Item: Migration) => !Pending && Item.version >= LastAttempt &&
+    !History.some(Earlier => Earlier.version < Item.version && Earlier.status === 'draft')
 
   const SaveMutation = useMutation({
     mutationFn: async () => {
@@ -59,16 +73,14 @@ export function MigrationsPage() {
     onSuccess: Executed => {
       setExecutionError(null)
       setSuccessMessage(`Migration v${Executed.version} committed successfully!`)
-      if (SelectedMigration?.id === Executed.id) {
-        setSelectedMigration(Executed)
-      }
       void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+      void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
     },
     onError: Error => {
       if (Error instanceof ApiError) {
         setExecutionError(Error.message)
       } else {
-        setExecutionError('Migration execution failed and was rolled back.')
+        setExecutionError('Unable to confirm execution. Reload history before retrying.')
       }
       void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
     },
@@ -78,20 +90,12 @@ export function MigrationsPage() {
     mutationFn: (MigrationID: string) => DeleteMigrationDraft(ActiveDatabase, MigrationID),
     onSuccess: () => {
       setSuccessMessage('Draft migration deleted.')
-      if (SelectedMigration) setSelectedMigration(null)
+      setSelectedMigrationID(null)
       void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
     },
   })
 
-  function handleSelectDatabase(Event: FormEvent) {
-    Event.preventDefault()
-    if (DatabaseID.trim()) {
-      setActiveDatabase(DatabaseID.trim())
-      setSelectedMigration(null)
-      setExecutionError(null)
-      setSuccessMessage(null)
-    }
-  }
+  const Busy = SaveMutation.isPending || ExecuteMutation.isPending || DeleteMutation.isPending
 
   function openCreateEditor() {
     setEditingMigration(null)
@@ -124,10 +128,11 @@ export function MigrationsPage() {
   }
 
   return (
-    <main>
+    <main className="workspace-main">
       <header>
-        <nav aria-label="Main navigation">
+        <nav aria-label="Main navigation" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
           <Link to="/">← Back to Workspace</Link>
+          {Database && <Link to={`/databases/${Database.id}`}>Browse database</Link>}
         </nav>
       </header>
 
@@ -135,18 +140,23 @@ export function MigrationsPage() {
       <p>Manage, inspect, and execute strictly linear transactional database migrations.</p>
 
       <section style={{ marginBottom: '2rem' }}>
-        <form onSubmit={handleSelectDatabase} style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
-          <label htmlFor="target-db-id"><strong>Target Database ID:</strong></label>
-          <input
+        <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+          <label htmlFor="target-db-id"><strong>Database:</strong></label>
+          <select
             id="target-db-id"
-            value={DatabaseID}
-            onChange={E => setDatabaseID(E.target.value)}
-            placeholder="e.g. UUID of connection"
-            required
+            value={ActiveDatabase}
+            disabled={Busy || Databases.isPending}
+            onChange={Event => void NavigateTo(Event.target.value ? `/databases/${encodeURIComponent(Event.target.value)}/migrations` : '/migrations')}
             style={{ padding: '0.4rem 0.6rem', flex: 1, maxWidth: '24rem' }}
-          />
-          <button type="submit">Load Migrations</button>
-        </form>
+          >
+            <option value="">Select a database…</option>
+            {Databases.data?.map(Item => <option key={Item.id} value={Item.id}>{Item.name}</option>)}
+          </select>
+        </div>
+        <p className="muted">Changing database clears unsaved editor changes.</p>
+        <RequestError error={Databases.error} />
+        {Databases.data?.length === 0 && <p>No databases assigned. Ask an administrator for group access.</p>}
+        {ActiveDatabase && !Databases.isPending && !Databases.isError && !Database && <p role="alert">No access to this database.</p>}
       </section>
 
       {SuccessMessage && (
@@ -161,12 +171,13 @@ export function MigrationsPage() {
         </div>
       )}
 
-      {ActiveDatabase && (
+      {Database && (
         <section>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+          <div className="migration-toolbar">
             <h2>Migration History (Linear)</h2>
-            <button onClick={openCreateEditor}>+ Create Migration</button>
+            {CanEdit && <button disabled={Busy} onClick={openCreateEditor}>+ Create Migration</button>}
           </div>
+          {Pending && <p role="status">Execution is pending. If it remains pending after a failure, ask an administrator to verify the target outcome before retrying.</p>}
 
           {MigrationsQuery.isPending && <p role="status">Loading migration history…</p>}
           {MigrationsQuery.isError && (
@@ -178,15 +189,16 @@ export function MigrationsPage() {
           {MigrationsQuery.data && (
             <>
               {MigrationsQuery.data.length === 0 ? (
-                <p>No migrations recorded for this database yet. Click <strong>+ Create Migration</strong> to prepare one.</p>
+                <p>No migrations recorded for this database yet.</p>
               ) : (
-                <table style={{ width: '100%', borderCollapse: 'collapse', textAlign: 'left', marginBottom: '1.5rem' }}>
+                <div className="table-wrap"><table className="data-table migration-table" style={{ marginBottom: '1.5rem' }}>
                   <thead>
                     <tr style={{ borderBottom: '2px solid #ccc' }}>
                       <th style={{ padding: '0.5rem' }}>Version</th>
                       <th style={{ padding: '0.5rem' }}>Title</th>
                       <th style={{ padding: '0.5rem' }}>Status</th>
                       <th style={{ padding: '0.5rem' }}>Executed At</th>
+                      <th style={{ padding: '0.5rem' }}>Executed By</th>
                       <th style={{ padding: '0.5rem' }}>Actions</th>
                     </tr>
                   </thead>
@@ -197,6 +209,7 @@ export function MigrationsPage() {
                         <td style={{ padding: '0.5rem' }}>{Item.title}</td>
                         <td style={{ padding: '0.5rem' }}>
                           <span
+                            className="migration-status"
                             style={{
                               padding: '0.2rem 0.5rem',
                               borderRadius: '4px',
@@ -222,41 +235,44 @@ export function MigrationsPage() {
                         <td style={{ padding: '0.5rem', fontSize: '0.9rem', color: '#555' }}>
                           {Item.executed_at ? new Date(Item.executed_at).toLocaleString() : '—'}
                         </td>
-                        <td style={{ padding: '0.5rem', display: 'flex', gap: '0.4rem' }}>
-                          <button onClick={() => setSelectedMigration(Item)} style={{ fontSize: '0.85rem' }}>
-                            View
-                          </button>
-                          {(Item.status === 'draft' || Item.status === 'pending') && (
-                            <>
-                              <button onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>
-                                Edit
-                              </button>
+                        <td style={{ padding: '0.5rem' }}>{Item.executed_by_username ?? Item.executed_by ?? '—'}</td>
+                        <td style={{ padding: '0.5rem' }}>
+                          <div className="row-actions migration-row-actions">
+                            <button onClick={() => setSelectedMigrationID(Item.id)} style={{ fontSize: '0.85rem' }}>
+                              View
+                            </button>
+                            {CanEdit && Item.status === 'draft' && (
+                              <>
+                                <button disabled={Busy} onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>
+                                  Edit
+                                </button>
+                                <button
+                                  onClick={() => handleExecute(Item)}
+                                  disabled={Busy || !CanExecute(Item)}
+                                  style={{ fontSize: '0.85rem', fontWeight: 'bold', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
+                                >
+                                  Execute
+                                </button>
+                                <button disabled={Busy} onClick={() => handleDelete(Item)} style={{ fontSize: '0.85rem', color: '#c5221f' }}>
+                                  Delete
+                                </button>
+                              </>
+                            )}
+                            {CanEdit && (Item.status === 'rolled_back' || Item.status === 'failed') && (
                               <button
                                 onClick={() => handleExecute(Item)}
-                                disabled={ExecuteMutation.isPending}
-                                style={{ fontSize: '0.85rem', fontWeight: 'bold', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
+                                disabled={Busy || !CanExecute(Item)}
+                                style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
                               >
-                                Execute
+                                Retry
                               </button>
-                              <button onClick={() => handleDelete(Item)} style={{ fontSize: '0.85rem', color: '#c5221f' }}>
-                                Delete
-                              </button>
-                            </>
-                          )}
-                          {(Item.status === 'rolled_back' || Item.status === 'failed') && (
-                            <button
-                              onClick={() => handleExecute(Item)}
-                              disabled={ExecuteMutation.isPending}
-                              style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
-                            >
-                              Retry
-                            </button>
-                          )}
+                            )}
+                          </div>
                         </td>
                       </tr>
                     ))}
                   </tbody>
-                </table>
+                </table></div>
               )}
             </>
           )}
@@ -266,14 +282,15 @@ export function MigrationsPage() {
       {/* Details */}
       {SelectedMigration && (
         <section style={{ background: '#fff', padding: '1.25rem', border: '1px solid #ccc', borderRadius: '6px', marginTop: '1.5rem' }}>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <div className="migration-toolbar">
             <h3>Migration Details: v{SelectedMigration.version} - {SelectedMigration.title}</h3>
-            <button onClick={() => setSelectedMigration(null)}>Close</button>
+            <button onClick={() => setSelectedMigrationID(null)}>Close</button>
           </div>
           <p>
             <strong>Status:</strong> {SelectedMigration.status} &nbsp;|&nbsp;
             <strong>Created:</strong> {new Date(SelectedMigration.created_at).toLocaleString()} &nbsp;|&nbsp;
             <strong>Executed:</strong> {SelectedMigration.executed_at ? new Date(SelectedMigration.executed_at).toLocaleString() : 'Not executed'}
+            {' '}| <strong>Executed by:</strong> {SelectedMigration.executed_by_username ?? SelectedMigration.executed_by ?? '—'}
           </p>
 
           {SelectedMigration.error_message && (
@@ -303,7 +320,7 @@ export function MigrationsPage() {
       )}
 
       {/* Editor */}
-      {IsEditorOpen && (
+      {IsEditorOpen && CanEdit && (
         <section style={{ background: '#fff', padding: '1.5rem', border: '2px solid #333', borderRadius: '6px', marginTop: '1.5rem' }}>
           <h3>{EditingMigration ? `Edit Migration v${EditingMigration.version}` : 'Create New Migration'}</h3>
           <form
@@ -356,7 +373,7 @@ export function MigrationsPage() {
               </p>
             )}
 
-            <div style={{ display: 'flex', gap: '0.75rem' }}>
+            <div className="page-actions">
               <button type="submit" disabled={SaveMutation.isPending}>
                 {SaveMutation.isPending ? 'Saving…' : 'Save Draft'}
               </button>

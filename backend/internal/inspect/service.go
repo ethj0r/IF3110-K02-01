@@ -6,6 +6,9 @@ import (
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Pgx "github.com/jackc/pgx/v5"
+	Math "math"
+	Strings "strings"
+	Time "time"
 )
 
 type Connector interface {
@@ -119,8 +122,12 @@ func (Server *Service) Columns(Ctx Context.Context, DBID, Schema, Table string) 
 		return nil, Err
 	}
 	defer Target.Close()
-	Rows, Err := Target.Query(Ctx, `SELECT C.column_name, C.data_type, C.is_nullable = 'YES', C.column_default
-FROM information_schema.columns C WHERE C.table_schema = $1 AND C.table_name = $2 ORDER BY C.ordinal_position`, Schema, Table)
+	Rows, Err := Target.Query(Ctx, `SELECT C.column_name, pg_catalog.format_type(A.atttypid, A.atttypmod), C.is_nullable = 'YES', C.column_default
+FROM information_schema.columns C
+JOIN pg_catalog.pg_namespace N ON N.nspname = C.table_schema
+JOIN pg_catalog.pg_class T ON T.relnamespace = N.oid AND T.relname = C.table_name
+JOIN pg_catalog.pg_attribute A ON A.attrelid = T.oid AND A.attnum = C.ordinal_position
+WHERE C.table_schema = $1 AND C.table_name = $2 ORDER BY C.ordinal_position`, Schema, Table)
 	if Err != nil {
 		return nil, ErrUnavailable
 	}
@@ -155,7 +162,7 @@ func (Server *Service) Constraints(Ctx Context.Context, DBID, Schema, Table stri
 CASE C.contype WHEN 'p' THEN 'PRIMARY KEY' WHEN 'u' THEN 'UNIQUE'
 WHEN 'f' THEN 'FOREIGN KEY' WHEN 'c' THEN 'CHECK' WHEN 'x' THEN 'EXCLUDE'
 WHEN 'n' THEN 'NOT NULL' ELSE C.contype::text END,
-COALESCE(string_agg(A.attname, ', ' ORDER BY K.ordinality), '')
+COALESCE(string_agg(A.attname, ', ' ORDER BY K.ordinality), ''), pg_catalog.pg_get_constraintdef(C.oid, true)
 FROM pg_catalog.pg_constraint C
 JOIN pg_catalog.pg_class T ON T.oid = C.conrelid
 JOIN pg_catalog.pg_namespace N ON N.oid = T.relnamespace
@@ -171,7 +178,7 @@ GROUP BY C.oid, C.conname, C.contype ORDER BY C.conname`, Schema, Table)
 	Result := []Constraint{}
 	for Rows.Next() {
 		var Item Constraint
-		if Err := Rows.Scan(&Item.Name, &Item.Type, &Item.Columns); Err != nil {
+		if Err := Rows.Scan(&Item.Name, &Item.Type, &Item.Columns, &Item.Definition); Err != nil {
 			return nil, ErrUnavailable
 		}
 		Result = append(Result, Item)
@@ -214,7 +221,7 @@ WHERE I.schemaname = $1 AND I.tablename = $2 ORDER BY I.indexname`, Schema, Tabl
 	return Result, nil
 }
 
-func (Server *Service) tableExists(Ctx Context.Context, Target Driver.Conn, Schema, Table string) (bool, error) {
+func (Server *Service) tableExists(Ctx Context.Context, Target Driver.Tx, Schema, Table string) (bool, error) {
 	Rows, Err := Target.Query(Ctx, `SELECT EXISTS(SELECT 1 FROM information_schema.tables T
 WHERE T.table_schema = $1 AND T.table_name = $2)`, Schema, Table)
 	if Err != nil {
@@ -233,14 +240,45 @@ WHERE T.table_schema = $1 AND T.table_name = $2)`, Schema, Table)
 	return Exists, nil
 }
 
+func tableOrder(Ctx Context.Context, Target Driver.Tx, Schema, Table string) (string, error) {
+	Rows, Err := Target.Query(Ctx, `SELECT A.attname FROM pg_catalog.pg_index I
+JOIN pg_catalog.pg_class T ON T.oid = I.indrelid
+JOIN pg_catalog.pg_namespace N ON N.oid = T.relnamespace
+JOIN LATERAL unnest(I.indkey) WITH ORDINALITY K(attnum, ordinality) ON K.ordinality <= I.indnkeyatts
+JOIN pg_catalog.pg_attribute A ON A.attrelid = T.oid AND A.attnum = K.attnum
+WHERE N.nspname = $1 AND T.relname = $2 AND I.indisprimary ORDER BY K.ordinality`, Schema, Table)
+	if Err != nil {
+		return "", ErrUnavailable
+	}
+	defer Rows.Close()
+	Columns := []string{}
+	for Rows.Next() {
+		var Name string
+		if Err := Rows.Scan(&Name); Err != nil {
+			return "", ErrUnavailable
+		}
+		Columns = append(Columns, Pgx.Identifier{"browse_row", Name}.Sanitize())
+	}
+	if Rows.Err() != nil {
+		return "", ErrUnavailable
+	}
+	Fallback := `ROW(browse_row.*)::text COLLATE "C"`
+	if len(Columns) == 0 {
+		return Fallback, nil
+	}
+	return Strings.Join(Columns, ", ") + ", " + Fallback, nil
+}
+
 func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Page, PageSize int) (TablePage, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
+	defer Cancel()
 	if Schema == "" {
 		Schema = "public"
 	}
 	if Err := checkTableRef(Schema, Table); Err != nil {
 		return TablePage{}, Err
 	}
-	if Page < 1 || PageSize < 1 || PageSize > 100 {
+	if Page < 1 || PageSize < 1 || PageSize > 100 || Page-1 > Math.MaxInt/PageSize {
 		return TablePage{}, ErrInvalidInput
 	}
 	Target, Err := Server.openTarget(Ctx, DBID)
@@ -248,14 +286,26 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 		return TablePage{}, Err
 	}
 	defer Target.Close()
-	Exists, Err := Server.tableExists(Ctx, Target, Schema, Table)
+	Snapshot, Err := Target.Begin(Ctx)
+	if Err != nil {
+		return TablePage{}, ErrUnavailable
+	}
+	defer func() {
+		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		_ = Snapshot.Rollback(Cleanup)
+	}()
+	if Err := Snapshot.Exec(Ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"); Err != nil {
+		return TablePage{}, ErrUnavailable
+	}
+	Exists, Err := Server.tableExists(Ctx, Snapshot, Schema, Table)
 	if Err != nil {
 		return TablePage{}, Err
 	}
 	if !Exists {
 		return TablePage{}, ErrNotFound
 	}
-	Count, Err := Target.Query(Ctx, "SELECT COUNT(*) FROM "+Pgx.Identifier{Schema, Table}.Sanitize())
+	Count, Err := Snapshot.Query(Ctx, "SELECT COUNT(*) FROM "+Pgx.Identifier{Schema, Table}.Sanitize())
 	if Err != nil {
 		return TablePage{}, ErrUnavailable
 	}
@@ -270,7 +320,11 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 	if Err := Count.Err(); Err != nil {
 		return TablePage{}, ErrUnavailable
 	}
-	Data, Err := Target.Query(Ctx, "SELECT * FROM "+Pgx.Identifier{Schema, Table}.Sanitize()+" LIMIT $1 OFFSET $2", Pgx.QueryResultFormats{Pgx.TextFormatCode}, PageSize, (Page-1)*PageSize)
+	Order, Err := tableOrder(Ctx, Snapshot, Schema, Table)
+	if Err != nil {
+		return TablePage{}, Err
+	}
+	Data, Err := Snapshot.Query(Ctx, "SELECT browse_row.* FROM "+Pgx.Identifier{Schema, Table}.Sanitize()+" AS browse_row ORDER BY "+Order+" LIMIT $1 OFFSET $2", Pgx.QueryResultFormats{Pgx.TextFormatCode}, PageSize, (Page-1)*PageSize)
 	if Err != nil {
 		return TablePage{}, ErrUnavailable
 	}

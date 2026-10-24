@@ -3,7 +3,6 @@ package Driver
 import (
 	Context "context"
 	Errors "errors"
-	Fmt "fmt"
 	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
 	Net "net"
@@ -16,6 +15,7 @@ import (
 type Tx interface {
 	Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error)
 	Exec(Ctx Context.Context, SQL string, Args ...any) error
+	ExecScript(Ctx Context.Context, SQL string) error
 	Commit(Ctx Context.Context) error
 	Rollback(Ctx Context.Context) error
 }
@@ -118,16 +118,27 @@ func (Target *PostgresConn) Close() {
 func (Current *PostgresTx) Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error) {
 	Rows, Err := Current.Raw.Query(Ctx, SQL, Args...)
 	if Err != nil {
-		return nil, Fmt.Errorf("%w: %v", ErrExecution, Err)
+		return nil, ErrExecution
 	}
 	return Rows, nil
 }
 
 func (Current *PostgresTx) Exec(Ctx Context.Context, SQL string, Args ...any) error {
 	if _, Err := Current.Raw.Exec(Ctx, SQL, Args...); Err != nil {
-		return Fmt.Errorf("%w: %v", ErrExecution, Err)
+		return ErrExecution
 	}
 	return nil
+}
+
+func (Current *PostgresTx) ExecScript(Ctx Context.Context, SQL string) error {
+	var Block string
+	Err := Current.Raw.QueryRow(Ctx, `SELECT pg_catalog.format('DO LANGUAGE plpgsql %L',
+pg_catalog.format('BEGIN EXECUTE %L; END', $1::text))`, SQL).Scan(&Block)
+	if Err != nil {
+		return ErrExecution
+	}
+	// PostgreSQL rejects transaction control inside this atomic DO block.
+	return Current.Exec(Ctx, Block)
 }
 
 func (Current *PostgresTx) Commit(Ctx Context.Context) error {

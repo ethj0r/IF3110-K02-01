@@ -8,6 +8,7 @@ import (
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Pgx "github.com/jackc/pgx/v5"
+	Strings "strings"
 	Testing "testing"
 )
 
@@ -77,6 +78,7 @@ func TestConstraintsVisibleToReadOnlyTargetRole(T *Testing.T) {
 	}()
 	Table := Pgx.Identifier{App.Schema, "items"}.Sanitize()
 	SQL := "ALTER TABLE " + Table + " ADD COLUMN parent_id integer CONSTRAINT parent_fk REFERENCES " + Table + " (id), " +
+		"ADD COLUMN code varchar(12), ADD COLUMN amount numeric(12,2), " +
 		"ADD CONSTRAINT name_check CHECK (name <> ''), ADD CONSTRAINT name_unique UNIQUE (name); " +
 		"GRANT USAGE ON SCHEMA " + Pgx.Identifier{App.Schema}.Sanitize() + " TO " + Role + "; " +
 		"GRANT SELECT ON " + Table + " TO " + Role
@@ -99,10 +101,24 @@ func TestConstraintsVisibleToReadOnlyTargetRole(T *Testing.T) {
 	Found := map[string]string{}
 	for _, Item := range Constraints {
 		Found[Item.Name] = Item.Type
+		if Item.Definition == "" || (Item.Name == "parent_fk" && !Strings.Contains(Item.Definition, "REFERENCES")) {
+			T.Fatalf("constraint definition was omitted: %+v", Item)
+		}
 	}
 	for Name, Kind := range map[string]string{"items_pkey": "PRIMARY KEY", "name_check": "CHECK", "name_unique": "UNIQUE", "parent_fk": "FOREIGN KEY"} {
 		if Found[Name] != Kind {
 			T.Fatalf("read-only role cannot inspect %s: %+v", Name, Constraints)
 		}
+	}
+	Columns, Err := App.Service.Columns(Ctx, Stored.ID, App.Schema, "items")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Types := map[string]string{}
+	for _, Column := range Columns {
+		Types[Column.Name] = Column.DataType
+	}
+	if Types["code"] != "character varying(12)" || Types["amount"] != "numeric(12,2)" {
+		T.Fatalf("column type details were omitted: %+v", Columns)
 	}
 }

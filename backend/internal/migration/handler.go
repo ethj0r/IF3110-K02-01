@@ -58,6 +58,10 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 404, "not_found", "Migration or target database not found")
 	case Errors.Is(Err, ErrAlreadyExecuted):
 		Httpx.Error(W, 409, "already_executed", "Migration has already been executed or terminal")
+	case Errors.Is(Err, ErrOutOfOrder):
+		Httpx.Error(W, 409, "out_of_order", "Earlier migrations must finish first; only the latest attempt can be retried")
+	case Errors.Is(Err, ErrPending):
+		Httpx.Error(W, 409, "execution_pending", "Verify the previous execution outcome before retrying")
 	case Errors.Is(Err, ErrConflict):
 		Httpx.Error(W, 409, "conflict", "Migration version conflict")
 	case Errors.Is(Err, Driver.ErrExecution):
