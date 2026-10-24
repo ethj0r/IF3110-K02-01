@@ -1,10 +1,29 @@
 package Connection
 
 import (
+	Context "context"
 	Json "encoding/json"
 	Strings "strings"
 	Testing "testing"
 )
+
+func TestServiceRejectsMalformedIDs(T *Testing.T) {
+	Server := &Service{}
+	for _, ID := range []string{"", "not-a-uuid", "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx", "' OR true --"} {
+		if _, Err := Server.Get(Context.Background(), ID); Err != ErrNotFound {
+			T.Fatalf("invalid ID accepted by get: %q", ID)
+		}
+		if _, Err := Server.Update(Context.Background(), ID, validInput()); Err != ErrNotFound {
+			T.Fatalf("invalid ID accepted by update: %q", ID)
+		}
+		if Err := Server.Delete(Context.Background(), ID); Err != ErrNotFound {
+			T.Fatalf("invalid ID accepted by delete: %q", ID)
+		}
+	}
+	if !validID("01234567-89ab-cdef-0123-456789abcdef") {
+		T.Fatal("valid UUID rejected")
+	}
+}
 
 func validInput() ConnectionInput {
 	return ConnectionInput{Name: "local-target", Host: "127.0.0.1", Port: 55433, DBName: "target", Username: "target", Password: "target_dev"}

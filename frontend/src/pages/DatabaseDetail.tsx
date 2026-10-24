@@ -15,10 +15,9 @@ import {
 import { PageHeading } from '../components/PageHeading'
 import { LevelBadge, RequestError } from '../components/Feedback'
 
-function formatCell(Value: unknown) {
-  if (Value === null || Value === undefined) return <span className="muted">NULL</span>
-  if (typeof Value === 'object') return <code>{JSON.stringify(Value)}</code>
-  return <span>{String(Value)}</span>
+function formatCell(Value: string | null) {
+  if (Value === null) return <span className="muted">NULL</span>
+  return <span>{Value}</span>
 }
 
 function isForbidden(Error: unknown) {

@@ -5,6 +5,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { App } from '../src/App'
 import type { AdminGroup, AdminMatrix, AdminUser } from '../src/api/admin'
+import type { ManagedConnection } from '../src/api/connections'
 
 const Clients: QueryClient[] = []
 const CSRF = 'c'.repeat(43)
@@ -38,7 +39,7 @@ function Fixture() {
 }
 
 function InstallAPI(IsAdmin = true) {
-  const State = { ...Fixture(), IsAdmin }
+  const State = { ...Fixture(), IsAdmin, Connections: [] as ManagedConnection[] }
   Vi.stubGlobal('fetch', Vi.fn(async (Path: string, Options?: RequestInit) => {
     const Method = (Options?.method ?? 'GET').toUpperCase()
     if (Path === '/api/auth/me') {
@@ -46,6 +47,16 @@ function InstallAPI(IsAdmin = true) {
     }
     if (Path === '/api/databases') return Response.json([])
     if (!State.IsAdmin) return Response.json({ error: { code: 'forbidden', message: 'Platform administrator access required' } }, { status: 403 })
+    if (Path === '/api/connections' && Method === 'GET') return Response.json(State.Connections)
+    if (Path === '/api/connections' && Method === 'POST') {
+      const Input = JSON.parse(String(Options?.body)) as ManagedConnection
+      const Created: ManagedConnection = {
+        id: 'connection-1', name: Input.name, host: Input.host, port: Input.port, dbname: Input.dbname, username: Input.username,
+        created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z',
+      }
+      State.Connections = [...State.Connections, Created]
+      return Response.json(Created, { status: 201 })
+    }
     if (Path === '/api/admin/users' && Method === 'GET') return Response.json(State.Users)
     if (Path === '/api/admin/users' && Method === 'POST') {
       const Input = JSON.parse(String(Options?.body)) as { username: string }
@@ -101,4 +112,23 @@ Test('ordinary users are redirected away from administration routes', async () =
   Mount('/admin/users')
   await Screen.findByRole('heading', { name: 'Database Workspace' })
   Expect(Screen.queryByRole('heading', { name: 'Users' })).toBeNull()
+})
+
+Test('administrator can create a connection without an asynchronous form error', async () => {
+  const API = InstallAPI()
+  const Errors = Vi.spyOn(console, 'error')
+  Mount('/admin/connections')
+  const User = UserEvent.setup()
+  await Screen.findByRole('heading', { name: 'Connections' })
+  await User.click(Screen.getByRole('button', { name: 'New connection' }))
+  await User.type(Screen.getByLabelText('Name'), 'Reporting target')
+  await User.type(Screen.getByLabelText('Host'), '127.0.0.1')
+  await User.type(Screen.getByLabelText('Database'), 'reporting')
+  await User.type(Screen.getByLabelText('Username'), 'reader')
+  await User.type(Screen.getByLabelText('Password'), 'reader fixture password')
+  await User.click(Screen.getByRole('button', { name: 'Create connection' }))
+  await Screen.findByText('Reporting target')
+  Expect(Screen.queryByRole('heading', { name: 'Create connection' })).toBeNull()
+  Expect(API.Connections).toHaveLength(1)
+  Expect(Errors).not.toHaveBeenCalled()
 })

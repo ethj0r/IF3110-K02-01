@@ -25,6 +25,14 @@ CSRF Protection: Unsafe methods require `X-CSRF-Token` header and trusted `Origi
 | `DELETE` | `/connections/{id}` | Platform Admin | None | `204 No Content` | Removes a database connection |
 | `POST` | `/connections/{id}/test` | Platform Admin | None | `200` `{"status":"ok"}` | Tests connection to the target database |
 
+## Database Inspection
+
+`GET /databases/{id}/tables/{table}/rows?schema=public&page=1&page_size=25`
+requires group-based view access. The response contains `columns`, `rows`, `page`,
+`page_size`, and `total`; page size is limited to 100. Every non-null cell is a
+PostgreSQL text string, preserving bigint/numeric precision, UUIDs, arrays, JSON,
+and special floating-point values. SQL NULL is JSON `null`; empty text is `""`.
+
 ## Database Migrations
 
 Base Route: `/databases/{dbId}/migrations` (alias: `/connections/{dbId}/migrations`)

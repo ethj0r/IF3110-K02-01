@@ -132,6 +132,15 @@ func TestConnectionEndpointsRequireAdmin(T *Testing.T) {
 	if App.Request("GET", "/api/connections/00000000-0000-0000-0000-000000000000", "", App.Admin, false).Code != 404 {
 		T.Fatal("unknown connection did not return 404")
 	}
+	for _, Method := range []string{"GET", "PUT", "DELETE", "POST"} {
+		Path := "/api/connections/not-a-uuid"
+		if Method == "POST" {
+			Path += "/test"
+		}
+		if Response := App.Request(Method, Path, Input, App.Admin, true); Response.Code != 404 {
+			T.Fatalf("malformed ID returned %d for %s", Response.Code, Method)
+		}
+	}
 	Changed := App.ConnectionBody(ConnectionInput{Name: "main", Host: "10.0.0.2", Port: 5432, DBName: "target", Username: "target", Password: "target_dev"})
 	if App.Request("PUT", "/api/connections/"+Item.ID, Changed, App.Admin, true).Code != 200 {
 		T.Fatal("admin connection update failed")
