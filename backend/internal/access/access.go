@@ -26,10 +26,34 @@ var (
 	ErrForbidden     = Errors.New("database access denied")
 	ErrInvalidAction = Errors.New("invalid access action")
 	ErrInvalidLevel  = Errors.New("invalid access level")
+	ErrNotFound      = Errors.New("database access not found")
+	ErrUnavailable   = Errors.New("access store is unavailable")
 )
 
 func (Current Level) Valid() bool {
 	return Current == LevelNone || Current == LevelViewOnly || Current == LevelViewEdit
+}
+
+func (Current Level) Rank() int {
+	switch Current {
+	case LevelViewEdit:
+		return 2
+	case LevelViewOnly:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func FromRank(Rank int) Level {
+	switch {
+	case Rank >= 2:
+		return LevelViewEdit
+	case Rank == 1:
+		return LevelViewOnly
+	default:
+		return LevelNone
+	}
 }
 
 func (Current Level) Allows(Act Action) bool {
@@ -41,6 +65,14 @@ func (Current Level) Allows(Act Action) bool {
 	default:
 		return false
 	}
+}
+
+func ParseLevel(Value string) (Level, error) {
+	Selected := Level(Strings.TrimSpace(Value))
+	if !Selected.Valid() || Selected == LevelNone {
+		return LevelNone, ErrInvalidLevel
+	}
+	return Selected, nil
 }
 
 func ResolveEffectiveLevel(Levels ...Level) Level {
@@ -99,7 +131,7 @@ func (Policy StaticEvaluator) Can(Ctx Context.Context, User Auth.Principal, Act 
 
 func Can(Ctx Context.Context, Policy Evaluator, User Auth.Principal, Act Action, DatabaseID string) (bool, error) {
 	if Policy == nil {
-		Policy = AllowAll()
+		return false, nil
 	}
 	return Policy.Can(Ctx, User, Act, DatabaseID)
 }

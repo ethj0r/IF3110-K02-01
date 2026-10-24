@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, encrypted target database connection management, and transactional target database migrations are available. Group access matrices and database schema introspection remain to be completed. Frontend styling remains unchanged.
+Authentication, session management, CSRF protection, administrator bootstrap, role-based database access, administrator APIs, the administration UI, encrypted target database connection management, and transactional target database migrations are available. Platform administrators manage users, groups, and database grants from `/admin`. Database inspection remains to be completed.
 
 ## Requirements
 
@@ -24,10 +24,11 @@ Run from the repository root:
 ```sh
 make setup
 make db-up
-make migrate-up
+# Set BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD in .env first.
+make bootstrap
 ```
 
-`make setup` copies `.env.example` to `.env` if the file does not exist, generates a local session encryption key when absent, restricts `.env` permissions, and installs dependencies using the lockfiles. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
+`make setup` copies `.env.example` to `.env` if the file does not exist, generates a local session encryption key when absent, adds placeholder bootstrap administrator variables when missing, restricts `.env` permissions, and installs dependencies using the lockfiles. `make bootstrap` applies platform migrations and creates the initial administrator. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
 
 ### Run the Application
 
@@ -131,7 +132,7 @@ Provide `BOOTSTRAP_ADMIN_USERNAME` and `BOOTSTRAP_ADMIN_PASSWORD` through the pr
 make seed-admin
 ```
 
-There is no default administrator password. Usernames contain 3–64 ASCII letters, digits, dots, underscores, or hyphens and are matched case-insensitively. Passwords contain 12–1024 bytes and are stored using Argon2id with independent salts. Repeating bootstrap for the same active administrator preserves its password; bootstrap cannot promote an existing ordinary account or create an additional administrator.
+`make bootstrap` combines `migrate-up` and `seed-admin`. There is no default administrator password. Usernames contain 3–64 ASCII letters, digits, dots, underscores, or hyphens and are matched case-insensitively. Passwords contain 12–1024 bytes and are stored using Argon2id with independent salts. Repeating bootstrap for the same active administrator preserves its password; bootstrap cannot promote an existing ordinary account or create an additional administrator.
 
 ### Endpoints
 
@@ -157,6 +158,8 @@ The frontend keeps CSRF data in memory, restores it through the authenticated en
 | `SESSION_ABSOLUTE_TIMEOUT` | `12h` | Maximum authenticated session lifetime |
 | `SESSION_ROTATION_INTERVAL` | `15m` | Periodic identifier rotation |
 | `SESSION_GRACE_PERIOD` | `30s` | Previous identifier validity after rotation |
+| `BOOTSTRAP_ADMIN_USERNAME` | Required by `seed-admin` | Initial administrator username |
+| `BOOTSTRAP_ADMIN_PASSWORD` | Required by `seed-admin` | Initial administrator password, 12–1024 bytes |
 
 Set `APP_ORIGIN` to the actual application origin when serving the embedded frontend directly, such as `http://127.0.0.1:8080` locally. Production must use an HTTPS origin. Keep `SESSION_KEY` stable and secret; replacing it requires users to log in again.
 
@@ -167,3 +170,17 @@ Rotation preserves absolute expiration. Re-authenticating an active session rota
 `Auth.Handler.RequireSession` authenticates protected routes and enforces CSRF on unsafe methods. `Auth.PrincipalFromContext` returns the current user identity. Database permission checks remain separate from authentication; Platform Admin is not a database access level.
 
 Within an existing database transaction, call `Auth.MarkPrivilegeChange` when privileges increase and `Auth.InvalidateUserSessions` when access is revoked. Both accept the affected user ID. The schema automatically invalidates sessions after deactivation, password changes, or administrator demotion, and marks administrator promotion for rotation on the next request.
+
+## Access Control and Administration
+
+Database access is granted to groups, and users inherit the highest grant across their groups. `view_only` permits viewing, while `view_edit` permits viewing and editing. Platform administrators do not bypass database grants; an administrator without a group grant cannot access that database. Missing or unavailable policy evaluators deny access.
+
+The administration UI is available at `/admin` for platform administrators:
+
+| Route | Purpose |
+| --- | --- |
+| `/admin/users` | Create and deactivate users, reset passwords, and delete accounts |
+| `/admin/groups` | Manage groups and memberships |
+| `/admin/access` | Assign or remove group database grants |
+
+The admin API is under `/api/admin` and every route requires an authenticated platform administrator. Creating or promoting administrators is not supported through the API. Deactivating or deleting the last active administrator is rejected with `last_admin`.

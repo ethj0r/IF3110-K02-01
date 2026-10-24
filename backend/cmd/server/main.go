@@ -4,11 +4,13 @@ import (
 	Context "context"
 	Errors "errors"
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
+	Admin "github.com/ethj0r/IF3110-K02-01/backend/internal/admin"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Inspect "github.com/ethj0r/IF3110-K02-01/backend/internal/inspect"
 	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
@@ -68,9 +70,14 @@ func Run() error {
 		Slog.Warn("default target connection was not seeded", "error", SeedErr)
 	}
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	AccessRepo := &Access.Repository{Pool: Pool}
+	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: Driver.PostgresDriver{}}
+	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: AccessRepo, Service: InspectService}
+	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: AccessRepo}
+	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
 	MigrationService := &Migration.Service{
 		Repo:   &Migration.Repository{Pool: Pool},
-		Access: Access.AllowAll(),
+		Access: AccessRepo,
 		Resolver: Migration.DSNResolverFunc(func(Ctx Context.Context, DatabaseID string) (string, error) {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err
@@ -79,8 +86,17 @@ func Run() error {
 	}
 	MigrationRoutes := &Migration.Handler{Auth: AuthRoutes, Service: MigrationService}
 	Server := &Http.Server{
-		Addr:              Cfg.HTTPAddr,
-		Handler:           Httpx.NewRouter(AuthRepository.CheckSchema, Webui.Handler(), AuthRoutes.Register, ConnRoutes.Register, MigrationRoutes.Register),
+		Addr: Cfg.HTTPAddr,
+		Handler: Httpx.NewRouter(
+			AuthRepository.CheckSchema,
+			Webui.Handler(),
+			AuthRoutes.Register,
+			ConnRoutes.Register,
+			InspectRoutes.Register,
+			AccessRoutes.Register,
+			AdminRoutes.Register,
+			MigrationRoutes.Register,
+		),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,
 		WriteTimeout:      30 * Time.Second,
