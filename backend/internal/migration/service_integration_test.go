@@ -8,8 +8,45 @@ import (
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Pgx "github.com/jackc/pgx/v5"
+	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
 	Testing "testing"
 )
+
+type testTargetDriver struct {
+	Pool *Pgxpool.Pool
+}
+
+func (D testTargetDriver) Open(_ string) (Driver.Conn, error) {
+	return &testTargetConn{Pool: D.Pool}, nil
+}
+
+type testTargetConn struct {
+	Pool *Pgxpool.Pool
+}
+
+func (C *testTargetConn) Ping(Ctx Context.Context) error {
+	return C.Pool.Ping(Ctx)
+}
+
+func (C *testTargetConn) Begin(Ctx Context.Context) (Driver.Tx, error) {
+	RawTx, Err := C.Pool.Begin(Ctx)
+	if Err != nil {
+		return nil, Driver.ErrUnavailable
+	}
+	return &Driver.PostgresTx{Raw: RawTx}, nil
+}
+
+func (C *testTargetConn) Query(Ctx Context.Context, SQL string, Args ...any) (Pgx.Rows, error) {
+	return C.Pool.Query(Ctx, SQL, Args...)
+}
+
+func (C *testTargetConn) Exec(Ctx Context.Context, SQL string, Args ...any) error {
+	_, Err := C.Pool.Exec(Ctx, SQL, Args...)
+	return Err
+}
+
+func (C *testTargetConn) Close() {}
 
 func TestServiceRealDatabaseExecution(T *Testing.T) {
 	PlatformPool := NewMigrationDatabase(T)
@@ -19,15 +56,13 @@ func TestServiceRealDatabaseExecution(T *Testing.T) {
 	DBID, UserID := setupFixture(T, PlatformPool)
 	Editor := Auth.Principal{ID: UserID, Username: "test_migrator"}
 
-	TargetDsnStr := TargetPool.Config().ConnConfig.ConnString()
-
 	Service := &Service{
 		Repo:   &Repository{Pool: PlatformPool},
 		Access: Access.AllowAll(),
 		Resolver: DSNResolverFunc(func(_ Context.Context, _ string) (string, error) {
-			return TargetDsnStr, nil
+			return "postgres://target-db", nil
 		}),
-		Driver: Driver.PostgresDriver{},
+		Driver: testTargetDriver{Pool: TargetPool},
 	}
 
 	// 1. Valid migration: create real table
