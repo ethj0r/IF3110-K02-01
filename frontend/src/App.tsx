@@ -3,6 +3,7 @@ import { AdminGuard } from './auth/AdminGuard'
 import { AuthGuard } from './auth/Guard'
 import { LoginPage } from './pages/Login'
 import { MigrationsPage } from './pages/Migrations'
+import { SchemaDiffPage } from './pages/SchemaDiff'
 import { Workspace } from './pages/Workspace'
 import { DatabaseDetailPage } from './pages/DatabaseDetail'
 import { AccessMatrixPage } from './pages/admin/AccessMatrix'
@@ -18,6 +19,7 @@ export function App() {
       <Route element={<AuthGuard />}>
         <Route path="/" element={<Workspace />} />
         <Route path="/databases/:dbId/migrations" element={<MigrationsPage />} />
+        <Route path="/databases/:dbId/schema-diff" element={<SchemaDiffPage />} />
         <Route path="/migrations" element={<MigrationsPage />} />
         <Route path="/databases/:id" element={<DatabaseDetailPage />} />
         <Route path="/admin" element={<AdminGuard />}>

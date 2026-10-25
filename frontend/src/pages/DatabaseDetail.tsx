@@ -83,6 +83,7 @@ export function DatabaseDetailPage() {
         </Link>
         <div className="app-header-actions">
           {Database && <Link to={`/databases/${Database.id}/migrations`} className="back-link">Migrations</Link>}
+          {Database?.level === 'view_edit' && <Link to={`/databases/${Database.id}/schema-diff`} className="back-link">Compare schemas</Link>}
           <Link to="/" className="back-link">← Databases</Link>
         </div>
       </header>

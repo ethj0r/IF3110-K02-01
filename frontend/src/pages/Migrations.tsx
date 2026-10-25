@@ -1,6 +1,8 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { ReadGeneratedMigration } from '../api/schemaDiff'
+import type { GeneratedMigration } from '../api/schemaDiff'
 import { AccessQueryKeys, ListAccessibleDatabases } from '../api/access'
 import { RequestError } from '../components/Feedback'
 import {
@@ -15,18 +17,20 @@ import {
 
 export function MigrationsPage() {
   const { dbId = '' } = useParams<{ dbId?: string }>()
-  return <DatabaseMigrations key={dbId} ActiveDatabase={dbId} />
+  const Location = useLocation()
+  const InitialDraft = ReadGeneratedMigration(Location.state, dbId)
+  return <DatabaseMigrations key={`${dbId}:${Location.key}`} ActiveDatabase={dbId} InitialDraft={InitialDraft} />
 }
 
-function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
+function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: string; InitialDraft?: GeneratedMigration }) {
   const NavigateTo = useNavigate()
   const Databases = useQuery({ queryKey: AccessQueryKeys.databases, queryFn: ListAccessibleDatabases })
   const Database = Databases.data?.find(Item => Item.id === ActiveDatabase)
   const [SelectedMigrationID, setSelectedMigrationID] = useState<string | null>(null)
-  const [IsEditorOpen, setIsEditorOpen] = useState(false)
+  const [IsEditorOpen, setIsEditorOpen] = useState(Boolean(InitialDraft))
   const [EditingMigration, setEditingMigration] = useState<Migration | null>(null)
-  const [EditorTitle, setEditorTitle] = useState('')
-  const [EditorSQL, setEditorSQL] = useState('')
+  const [EditorTitle, setEditorTitle] = useState(InitialDraft?.Title ?? '')
+  const [EditorSQL, setEditorSQL] = useState(InitialDraft?.SQLText ?? '')
   const [ExecutionError, setExecutionError] = useState<string | null>(null)
   const [SuccessMessage, setSuccessMessage] = useState<string | null>(null)
 
@@ -133,6 +137,7 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
         <nav aria-label="Main navigation" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap' }}>
           <Link to="/">← Back to Workspace</Link>
           {Database && <Link to={`/databases/${Database.id}`}>Browse database</Link>}
+          {Database?.level === 'view_edit' && <Link to={`/databases/${Database.id}/schema-diff`}>Compare schemas</Link>}
         </nav>
       </header>
 
@@ -279,7 +284,6 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
         </section>
       )}
 
-      {/* Details */}
       {SelectedMigration && (
         <section style={{ background: '#fff', padding: '1.25rem', border: '1px solid #ccc', borderRadius: '6px', marginTop: '1.5rem' }}>
           <div className="migration-toolbar">
@@ -319,7 +323,6 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
         </section>
       )}
 
-      {/* Editor */}
       {IsEditorOpen && CanEdit && (
         <section style={{ background: '#fff', padding: '1.5rem', border: '2px solid #333', borderRadius: '6px', marginTop: '1.5rem' }}>
           <h3>{EditingMigration ? `Edit Migration v${EditingMigration.version}` : 'Create New Migration'}</h3>
