@@ -12,6 +12,7 @@
     "lint": "eslint . --max-warnings 0",
     "test": "npm run test:api && vitest run",
     "test:api": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:e2e": "playwright test",
     "build": "npm run typecheck && vite build && node scripts/embed.mjs",
     "preview": "vite preview"
   },
@@ -23,6 +24,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@playwright/test": "1.64.1",
     "@testing-library/react": "16.3.3",
     "@testing-library/user-event": "14.6.8",
     "@types/node": "22.20.5",

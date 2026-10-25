@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web lint typecheck check build bootstrap migrate-up migrate-status seed-admin clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web test-e2e lint typecheck check build bootstrap migrate-up migrate-status seed-admin clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
@@ -10,6 +10,7 @@ help:
 	@echo "dev-api/dev-web Run Go API / Vite (separate terminals)"
 	@echo "check           Check formatting, vet, unit tests, lint, and TypeScript"
 	@echo "test-integration Run real PostgreSQL tests (requires TEST_DATABASE_URL)"
+	@echo "test-e2e        Test running local app in Chromium with temporary fixtures"
 	@echo "build           Build frontend and single Go binary into bin/server"
 	@echo "bootstrap       Apply platform migrations and create the initial admin"
 	@echo "migrate-up/migrate-status Run embedded platform migrations"
@@ -69,6 +70,9 @@ typecheck:
 
 test-web:
 	npm --prefix frontend test
+
+test-e2e:
+	npm --prefix frontend run test:e2e
 
 check: check-fmt vet test test-web lint typecheck
 

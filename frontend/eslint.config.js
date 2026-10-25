@@ -21,4 +21,8 @@ export default TsEslint.config(
       'react-refresh/only-export-components': ['error', { allowConstantExport: true }],
     },
   },
+  {
+    files: ['e2e/**/*.ts', 'playwright.config.ts'],
+    languageOptions: { globals: Globals.node },
+  },
 )

@@ -4,6 +4,8 @@
 /bin/
 /frontend/node_modules/
 /frontend/dist/
+/frontend/test-results/
+/frontend/playwright-report/
 /backend/internal/webui/dist/*
 !/backend/internal/webui/dist/.gitkeep
 *.log
