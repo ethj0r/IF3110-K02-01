@@ -33,3 +33,24 @@ func TestCandidateFitsMigrationRequestLimit(T *Testing.T) {
 		}
 	}
 }
+
+func TestEnumPreparationOnlyIncludesEnumAdditions(T *Testing.T) {
+	Enum := `ALTER TYPE "quoted"."a"" ADD VALUE enum" ADD VALUE 'it''s new'`
+	Dependent := `ALTER TABLE "quoted".items ALTER COLUMN state SET DEFAULT 'it''s new'`
+	Candidate, Err := FormatPlan(Diff.Plan{Statements: []Diff.Statement{{DDL: Enum}, {DDL: Dependent}}})
+	if Err != nil || !Candidate.RequiresRecomparison || Candidate.SQLText != Enum+";" || len(Candidate.Statements) != 2 {
+		T.Fatal("enum additions were not isolated before dependent changes")
+	}
+	Only, Err := FormatPlan(Diff.Plan{Statements: []Diff.Statement{{DDL: Enum}}})
+	if Err != nil || Only.RequiresRecomparison || Only.SQLText != Enum+";" {
+		T.Fatal("enum-only migration incorrectly requires another comparison")
+	}
+	QuotedTable := `ALTER TABLE "ALTER TYPE fake ADD VALUE".items ADD COLUMN value text`
+	Unrelated, Err := FormatPlan(Diff.Plan{Statements: []Diff.Statement{{DDL: QuotedTable}}})
+	if Err != nil || Unrelated.RequiresRecomparison {
+		T.Fatal("quoted SQL-like name was treated as an enum addition")
+	}
+	if _, Err := FormatPlan(Diff.Plan{Statements: []Diff.Statement{{DDL: `DROP TYPE "public"."state"`}}}); !Errors.Is(Err, ErrUnsupported) {
+		T.Fatal("enum removal can produce an invalid dependent plan")
+	}
+}

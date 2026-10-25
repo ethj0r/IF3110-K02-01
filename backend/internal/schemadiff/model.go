@@ -48,10 +48,11 @@ type Statement struct {
 }
 
 type Result struct {
-	CurrentDatabaseID   string      `json:"current_database_id"`
-	ReferenceDatabaseID string      `json:"reference_database_id"`
-	Schema              string      `json:"schema"`
-	CurrentSchemaHash   string      `json:"current_schema_hash"`
-	Statements          []Statement `json:"statements"`
-	SQLText             string      `json:"sql_text"`
+	CurrentDatabaseID    string      `json:"current_database_id"`
+	ReferenceDatabaseID  string      `json:"reference_database_id"`
+	Schema               string      `json:"schema"`
+	CurrentSchemaHash    string      `json:"current_schema_hash"`
+	RequiresRecomparison bool        `json:"requires_recomparison"`
+	Statements           []Statement `json:"statements"`
+	SQLText              string      `json:"sql_text"`
 }

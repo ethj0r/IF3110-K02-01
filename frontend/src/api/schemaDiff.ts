@@ -10,6 +10,7 @@ export interface SchemaComparison {
   reference_database_id: string
   schema: string
   current_schema_hash: string
+  requires_recomparison: boolean
   statements: SchemaChange[]
   sql_text: string
 }

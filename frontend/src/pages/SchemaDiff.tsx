@@ -61,7 +61,8 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
               <h2>Schema differences</h2>
               {Compare.data.statements.length === 0 ? <p role="status">No schema differences found.</p> : (
                 <>
-                  <p>{Compare.data.statements.length} SQL statements proposed. Neither database has been changed.</p>
+                  <p>{Compare.data.statements.length} schema change statements found. Neither database has been changed.</p>
+                  {Compare.data.requires_recomparison && <p role="status">This migration only adds enum values. Save and execute it first, then compare again to generate the remaining changes. New enum values must be committed before they can be used.</p>}
                   <ol>
                     {Compare.data.statements.map((Change, Index) => (
                       <li key={Index}>
@@ -74,7 +75,7 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
                     <label htmlFor="generated-sql">Generated SQL</label>
                     <textarea id="generated-sql" value={Compare.data.sql_text} readOnly rows={12} />
                   </div>
-                  <button type="button" onClick={() => NavigateTo(`/databases/${DatabaseID}/migrations`, { state: { GeneratedMigration: { DatabaseID, Title: `Sync schema ${Compare.data.schema}`, SQLText: Compare.data.sql_text } } })}>Use SQL in migration editor</button>
+                  <button type="button" onClick={() => NavigateTo(`/databases/${DatabaseID}/migrations`, { state: { GeneratedMigration: { DatabaseID, Title: `${Compare.data.requires_recomparison ? 'Prepare enums in' : 'Sync schema'} ${Compare.data.schema}`, SQLText: Compare.data.sql_text } } })}>Use SQL in migration editor</button>
                   <p>Run comparison again if either schema changes before execution.</p>
                 </>
               )}

@@ -21,7 +21,7 @@ function Mount(Path = '/databases/current/schema-diff', State?: unknown) {
   Render(<QueryClientProvider client={Client}><MemoryRouter initialEntries={[{ pathname: Path, state: State }]}><App /></MemoryRouter></QueryClientProvider>)
 }
 
-function InstallAPI(Level = 'view_edit', Changes = true, Fail = false) {
+function InstallAPI(Level = 'view_edit', Changes = true, Fail = false, Phased = false) {
   const Fetch = Vi.fn(async (Path: string, Options?: RequestInit) => {
     if (Path === '/api/auth/me') return Response.json({ user: { id: 'u1', username: 'tester', is_platform_admin: false }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
     if (Path === '/api/databases') return Response.json([
@@ -30,7 +30,7 @@ function InstallAPI(Level = 'view_edit', Changes = true, Fail = false) {
     if (Path.endsWith('/schemas')) return Response.json({ schemas: ['public', 'quoted 表'] })
     if (Path.endsWith('/schema-diff')) {
       if (Fail) return Response.json({ error: { code: 'schema_diff_unavailable', message: 'Unable to compare the database schemas' } }, { status: 502 })
-      return Response.json({ current_database_id: 'current', reference_database_id: 'reference', schema: 'public', current_schema_hash: 'hash', statements: Changes ? [{ sql: SQL, hazards: [{ type: 'ACQUIRES_ACCESS_EXCLUSIVE_LOCK', message: 'Locks the table' }] }] : [], sql_text: Changes ? SQL : '' })
+      return Response.json({ current_database_id: 'current', reference_database_id: 'reference', schema: 'public', current_schema_hash: 'hash', requires_recomparison: Phased, statements: Changes ? [...(Phased ? [{ sql: `ALTER TYPE public.state ADD VALUE 'done';`, hazards: [] }] : []), { sql: SQL, hazards: [{ type: 'ACQUIRES_ACCESS_EXCLUSIVE_LOCK', message: 'Locks the table' }] }] : [], sql_text: Changes ? Phased ? `ALTER TYPE public.state ADD VALUE 'done';` : SQL : '' })
     }
     if (Path.endsWith('/migrations') && Options?.method === 'POST') {
       return Response.json({ ...JSON.parse(String(Options.body)) as object, id: 'draft', version: 1, status: 'draft', created_at: '2026-01-01T00:00:00Z' }, { status: 201 })
@@ -109,4 +109,52 @@ Test('rejects malformed or different database migration route state', () => {
   for (const State of [null, {}, { GeneratedMigration: null }, { GeneratedMigration: { DatabaseID: 'other', Title: 'x', SQLText: SQL } }, { GeneratedMigration: { DatabaseID: 'current', Title: 7, SQLText: SQL } }, { GeneratedMigration: { DatabaseID: 'current', Title: 'x', SQLText: ' ' } }]) {
     Expect(ReadGeneratedMigration(State, 'current')).toBeUndefined()
   }
+})
+
+Test('explains staged enum generation and imports only the first transactional phase', async () => {
+  InstallAPI('view_edit', true, false, true)
+  Mount()
+  const User = await Compare()
+  await Screen.findByText(/This migration only adds enum values/)
+  Expect((Screen.getByLabelText('Generated SQL') as HTMLTextAreaElement).value).toBe("ALTER TYPE public.state ADD VALUE 'done';")
+  await User.click(Screen.getByRole('button', { name: 'Use SQL in migration editor' }))
+  Expect((await Screen.findByLabelText('SQL Query (Transactional):') as HTMLTextAreaElement).value).not.toContain('ALTER TABLE')
+  Expect((Screen.getByLabelText('Title:') as HTMLInputElement).value).toBe('Prepare enums in public')
+})
+
+Test('removes an earlier candidate after a failed comparison and can recover', async () => {
+  const Fetch = InstallAPI()
+  const Original = Fetch.getMockImplementation()!
+  let Attempts = 0
+  Fetch.mockImplementation(async (Path: string, Options?: RequestInit) => {
+    if (Path.endsWith('/schema-diff') && ++Attempts === 2) return Response.json({ error: { code: 'schema_diff_unavailable', message: 'Unable to compare the database schemas' } }, { status: 502 })
+    return Original(Path, Options)
+  })
+  Mount()
+  const User = await Compare()
+  await Screen.findByLabelText('Generated SQL')
+  await User.click(Screen.getByRole('button', { name: 'Compare schemas' }))
+  await Screen.findByText('Unable to compare the database schemas')
+  Expect(Screen.queryByLabelText('Generated SQL')).toBeNull()
+  Expect(Screen.queryByRole('button', { name: 'Use SQL in migration editor' })).toBeNull()
+  await User.click(Screen.getByRole('button', { name: 'Compare schemas' }))
+  await Screen.findByLabelText('Generated SQL')
+})
+
+Test('blocks generation when reference schemas cannot be loaded and recovers after changing reference', async () => {
+  const Fetch = InstallAPI()
+  const Original = Fetch.getMockImplementation()!
+  Fetch.mockImplementation(async (Path: string, Options?: RequestInit) => {
+    if (Path === '/api/databases/reference/schemas') return Response.json({ error: { code: 'target_unavailable', message: 'Reference database unavailable' } }, { status: 502 })
+    return Original(Path, Options)
+  })
+  Mount()
+  const User = UserEvent.setup()
+  await User.selectOptions(await Screen.findByLabelText('Reference database'), 'reference')
+  await Screen.findByText('Reference database unavailable')
+  Expect((Screen.getByRole('button', { name: 'Compare schemas' }) as HTMLButtonElement).disabled).toBe(true)
+  Expect(Fetch.mock.calls.some(([Path]) => Path.endsWith('/schema-diff'))).toBe(false)
+  await User.selectOptions(Screen.getByLabelText('Reference database'), 'current')
+  await Screen.findByRole('option', { name: 'public' })
+  Expect((Screen.getByRole('button', { name: 'Compare schemas' }) as HTMLButtonElement).disabled).toBe(false)
 })
