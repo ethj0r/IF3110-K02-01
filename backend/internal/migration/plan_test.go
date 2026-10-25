@@ -68,6 +68,16 @@ func TestParseQueryPlanJSON(T *Testing.T) {
 	if len(Analysis.JoinStrategies) != 1 || Analysis.JoinStrategies[0] != "Hash Join" {
 		T.Errorf("expected join strategy [Hash Join], got %v", Analysis.JoinStrategies)
 	}
+
+	// Verify Nested Loop join recognition
+	NestedLoopJSON := []byte(`[{"Plan": {"Node Type": "Nested Loop", "Join Type": "Inner"}}]`)
+	NLAnalysis, Err := ParseQueryPlanJSON(NestedLoopJSON)
+	if Err != nil {
+		T.Fatalf("unexpected error parsing nested loop: %v", Err)
+	}
+	if len(NLAnalysis.JoinStrategies) != 1 || NLAnalysis.JoinStrategies[0] != "Nested Loop" {
+		T.Errorf("expected [Nested Loop], got %v", NLAnalysis.JoinStrategies)
+	}
 }
 
 func TestParseQueryPlanJSONInvalid(T *Testing.T) {
@@ -86,4 +96,3 @@ func TestParseQueryPlanJSONInvalid(T *Testing.T) {
 		T.Fatal("expected error on missing Plan object, got nil")
 	}
 }
-

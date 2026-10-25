@@ -33,7 +33,7 @@ func parsePlanNode(node map[string]any, analysis *QueryPlanAnalysis) {
 		if Strings.Contains(lower, "scan") && !containsString(analysis.ScanTypes, nodeType) {
 			analysis.ScanTypes = append(analysis.ScanTypes, nodeType)
 		}
-		if Strings.Contains(lower, "join") && !containsString(analysis.JoinStrategies, nodeType) {
+		if (Strings.Contains(lower, "join") || Strings.Contains(lower, "nested loop") || node["Join Type"] != nil) && !containsString(analysis.JoinStrategies, nodeType) {
 			analysis.JoinStrategies = append(analysis.JoinStrategies, nodeType)
 		}
 	}

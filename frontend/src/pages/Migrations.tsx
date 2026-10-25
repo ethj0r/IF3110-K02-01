@@ -356,6 +356,9 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
             <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginTop: '0.75rem', fontSize: '0.85rem' }}>
               <strong>Plan Analysis Failed:</strong>{' '}
               {DetailsAnalyze.error instanceof ApiError ? DetailsAnalyze.error.message : 'Unable to analyze query plan.'}
+              <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
+                <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
+              </div>
             </div>
           )}
 
@@ -438,6 +441,9 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
               <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem', fontSize: '0.85rem' }}>
                 <strong>Plan Analysis Failed:</strong>{' '}
                 {EditorAnalyze.error instanceof ApiError ? EditorAnalyze.error.message : 'Unable to analyze query plan.'}
+                <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
+                  <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
+                </div>
               </div>
             )}
 
