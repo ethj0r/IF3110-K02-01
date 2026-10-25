@@ -50,6 +50,13 @@ requires group-based view access. The response contains `columns`, `rows`, `page
 PostgreSQL text string, preserving bigint/numeric precision, UUIDs, arrays, JSON,
 and special floating-point values. SQL NULL is JSON `null`; empty text is `""`.
 
+Object names are literal UTF-8 identifiers without NUL, at most 63 bytes. The
+client URL-encodes names; the API binds catalog filters and quotes SQL identifiers.
+The same inspection endpoints also accept `/databases/{id}/table/{endpoint}` with
+`table` and `schema` query parameters. The client uses this form for literal `.`
+and `..` table names, which browsers otherwise normalize as URL path segments.
+For example: `/databases/{id}/table/rows?schema=public&table=..&page=1&page_size=25`.
+
 Count and rows use one read-only repeatable-read transaction per request. Ordering
 uses primary-key columns plus full-row text, or full-row text alone without a key.
 Each page request has a fresh snapshot; concurrent changes between requests can

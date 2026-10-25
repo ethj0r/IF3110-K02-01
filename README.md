@@ -84,6 +84,19 @@ make test-integration
 
 `check` runs formatting checks, `go vet`, backend unit tests with the race detector, API client and DOM tests, ESLint, and TypeScript. Integration tests use the `integration` build tag and a real PostgreSQL database. CI runs these checks and builds the application.
 
+### Browser Workflow Tests
+
+Install Chromium once, start the API and frontend in separate terminals, and run:
+
+```sh
+(cd frontend && npx playwright install --no-shell chromium)
+make test-e2e
+```
+
+The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and a local PostgreSQL target. It creates temporary users, groups, a connection, and a uniquely named schema, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
+
+Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, and logout. Traces and video are disabled; a screenshot of the viewer is saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
+
 ## Production Build
 
 ```sh
@@ -117,7 +130,7 @@ Connections use `SESSION_KEY` to encrypt target passwords. Keep it stable: repla
 
 On server startup, a non-empty `TARGET_DATABASE_URL` seeds `local-target` only when the connection table is empty. Seeding grants no access automatically. Restarting with an existing connection does not overwrite it; manage it through the administration page.
 
-Rows default to 25 per page, with a maximum of 100. Cells use PostgreSQL text representations to preserve numeric precision; SQL NULL remains distinct from empty text. Schema/table identifiers must match `[A-Za-z_][A-Za-z0-9_]*` and contain at most 63 characters. Quoted names containing spaces or punctuation are currently unsupported.
+Rows default to 25 per page, with a maximum of 100. Cells use PostgreSQL text representations to preserve numeric precision; SQL NULL remains distinct from empty text. Schema/table names are literal UTF-8 PostgreSQL identifiers, limited to 63 bytes without NUL. Spaces, Unicode, punctuation, embedded quotes, slash, and percent characters are supported. Values are bound as query parameters or quoted with `pgx.Identifier`; SQL-like text in a name remains a literal name. The frontend URL-encodes names and the API preserves their exact spelling.
 
 Rows are ordered by primary key, with full-row text as a tie-breaker or fallback for tables/views without a key. Count and data share one read-only repeatable-read snapshot per request; a new page request sees a fresh snapshot. Inspection queries have a ten-second request budget and connection setup a five-second timeout. Column types include length/precision, and constraints include their PostgreSQL definitions.
 
