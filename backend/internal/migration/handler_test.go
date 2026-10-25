@@ -44,6 +44,7 @@ func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Han
 		Routes := &Handler{Service: Service}
 		R.Get(Prefix, Routes.List)
 		R.Post(Prefix, Routes.Create)
+		R.Post(Prefix+"/analyze", Routes.Analyze)
 		R.Get(Prefix+"/{migrationID}", Routes.Show)
 		R.Put(Prefix+"/{migrationID}", Routes.Update)
 		R.Delete(Prefix+"/{migrationID}", Routes.Delete)
@@ -211,5 +212,28 @@ func TestHandlerExecutionFailureResponse(T *Testing.T) {
 	}
 	if !Strings.Contains(Res.Body.String(), "execution_failed") {
 		T.Fatalf("response body should contain execution_failed: %s", Res.Body.String())
+	}
+}
+
+func TestHandlerAnalyzeEndpoint(T *Testing.T) {
+	Policy := Access.StaticEvaluator{
+		DefaultLevel: Access.LevelViewOnly,
+	}
+	Router, _, _ := newTestHandler(Policy, nil)
+
+	// Bad JSON -> 400
+	Req := Httptest.NewRequest("POST", "/databases/db-1/migrations/analyze", Bytes.NewBufferString("invalid json"))
+	Res := Httptest.NewRecorder()
+	Router.ServeHTTP(Res, Req)
+	if Res.Code != 400 {
+		T.Fatalf("expected 400 for invalid json, got %d", Res.Code)
+	}
+
+	// Empty SQL -> 400
+	Req = Httptest.NewRequest("POST", "/databases/db-1/migrations/analyze", Bytes.NewBufferString(`{"sql_text": "   "}`))
+	Res = Httptest.NewRecorder()
+	Router.ServeHTTP(Res, Req)
+	if Res.Code != 400 {
+		T.Fatalf("expected 400 for empty sql, got %d", Res.Code)
 	}
 }
