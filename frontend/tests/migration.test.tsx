@@ -213,3 +213,49 @@ Test('unknown database routes do not load migration history', async () => {
   Expect(Fetch.mock.calls.some(([Path]) => Path.includes('/no-grant/migrations'))).toBe(false)
 })
 
+Test('analyzes execution plan in editor and details view', async () => {
+  const Fetch = Vi.fn(async (Path: string, Options?: RequestInit) => {
+    if (Path === '/api/auth/me') return Response.json({ user: { id: 'u1', username: 'tester', is_platform_admin: false }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
+    if (Path === '/api/auth/csrf') return Response.json({ csrf_token: 'c'.repeat(43) })
+    if (Path === '/api/databases') return Response.json(Databases)
+    if (Path.endsWith('/migrations')) return Response.json([
+      { id: 'first', database_id: 'db-1', version: 1, title: 'First migration', sql_text: 'SELECT * FROM users;', status: 'draft', created_at: '2026-01-01T00:00:00Z' },
+    ])
+    if (Path.endsWith('/migrations/analyze') && Options?.method === 'POST') {
+      return Response.json({
+        scan_types: ['Seq Scan'],
+        indexes_used: ['users_pkey'],
+        join_strategies: [],
+        estimated_cost: 14.5,
+        actual_execution_time: 1.234,
+        rows_processed: 42,
+        planning_time: 0.123,
+        raw_plan: [{ Plan: { 'Node Type': 'Seq Scan' } }],
+      })
+    }
+    return new Response(null, { status: 404 })
+  })
+  Vi.stubGlobal('fetch', Fetch)
+
+  Mount()
+  const User = UserEvent.setup()
+  await Screen.findByText('First migration')
+
+  // Details view analyze
+  await User.click(Screen.getByRole('button', { name: 'View' }))
+  await User.click(Screen.getByRole('button', { name: 'Analyze Plan (EXPLAIN)' }))
+  Expect(await Screen.findByText('Execution Plan Analysis (EXPLAIN ANALYZE)')).toBeTruthy()
+  Expect(Screen.getByText('Seq Scan')).toBeTruthy()
+  Expect(Screen.getByText('users_pkey')).toBeTruthy()
+  Expect(Screen.getByText('14.50')).toBeTruthy()
+
+  // Close details
+  await User.click(Screen.getByRole('button', { name: 'Close' }))
+
+  // Open editor and analyze
+  await User.click(Screen.getByRole('button', { name: '+ Create Migration' }))
+  await User.type(Screen.getByLabelText(/SQL Query/), 'SELECT 1;')
+  await User.click(Screen.getByRole('button', { name: 'Analyze Plan (EXPLAIN)' }))
+  Expect(await Screen.findByText('1.234 ms')).toBeTruthy()
+})
+

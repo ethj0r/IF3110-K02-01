@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, and schema comparison with editable migration generation are available.
+Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, schema comparison with editable migration generation, and query execution plan analysis are available.
 
 ## Requirements
 
@@ -156,6 +156,12 @@ Target database migrations represent ordered, linear schema and data modificatio
 Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
 
 See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
+
+## Query Execution Plan Analysis
+
+Use **Analyze Plan (EXPLAIN)** in the migration editor or migration details to inspect a data query before execution. The report shows scan types, indexes, join strategies, estimated cost, execution/planning times, row counts, and the raw JSON plan. This action requires database view access, a session, and CSRF protection.
+
+The backend runs `EXPLAIN ANALYZE` inside a target transaction that is rolled back afterwards. PostgreSQL DDL such as `CREATE TABLE` or generated `ALTER TABLE` statements has no query execution plan; use this feature with supported data queries such as `SELECT`, `INSERT`, `UPDATE`, or `DELETE`. Schema comparison still imports candidates into the same editable migration editor and requires View + Edit on the current database.
 
 ## Schema Comparison and Migration Generation
 

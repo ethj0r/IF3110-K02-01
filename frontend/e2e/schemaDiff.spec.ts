@@ -154,6 +154,14 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     await Page.getByRole('button', { name: 'Use SQL in migration editor', exact: true }).click()
     const Input = Page.getByLabel('SQL Query (Transactional):', { exact: true })
     await Expect(Input).toHaveValue(SQL)
+    if (Scenario === 'basic') {
+      await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
+      await Expect(Page.getByRole('alert')).toContainText('Plan Analysis Failed:')
+      await Expect(Input).toHaveValue(SQL)
+      await Input.fill(`SELECT * FROM ${Table} WHERE id = 1`)
+      await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
+      await Expect(Page.getByText('Execution Plan Analysis (EXPLAIN ANALYZE)', { exact: true })).toBeVisible()
+    }
     const BeforeSave = await EditorAPI<Migration[]>(`/api/databases/${Databases[0].id}/migrations`)
     Expect(BeforeSave).toHaveLength(1)
     await Input.fill(`${SQL}\nINSERT INTO ${Table} (id, value) VALUES (2, 'reviewed');`)

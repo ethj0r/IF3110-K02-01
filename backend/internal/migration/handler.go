@@ -23,6 +23,7 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Use(Routes.Auth.RequireSession)
 			R.Get(Prefix, Routes.List)
 			R.Post(Prefix, Routes.Create)
+			R.Post(Prefix+"/analyze", Routes.Analyze)
 			R.Get(Prefix+"/{migrationID}", Routes.Show)
 			R.Put(Prefix+"/{migrationID}", Routes.Update)
 			R.Delete(Prefix+"/{migrationID}", Routes.Delete)
@@ -143,6 +144,26 @@ func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	DBID := Chi.URLParam(R, "dbID")
 	ID := Chi.URLParam(R, "migrationID")
 	Result, Err := Routes.Service.Execute(R.Context(), User, DBID, ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Analyze(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	var Input struct {
+		SQLText string `json:"sql_text"`
+	}
+	Decoder := Json.NewDecoder(Http.MaxBytesReader(W, R.Body, 65536))
+	Decoder.DisallowUnknownFields()
+	if Err := Decoder.Decode(&Input); Err != nil {
+		Httpx.Error(W, 400, "invalid_request", "Invalid analyze request parameters")
+		return
+	}
+	Result, Err := Routes.Service.AnalyzePlan(R.Context(), User, DBID, Input.SQLText)
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return

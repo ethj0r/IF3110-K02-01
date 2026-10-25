@@ -216,3 +216,59 @@ func (Server *Service) execute(Ctx Context.Context, Repo MigrationRepository, Us
 
 	return Repo.RecordExecution(RecordCtx, DatabaseID, ID, UserID, true, nil)
 }
+
+func (Server *Service) AnalyzePlan(Ctx Context.Context, User Auth.Principal, DatabaseID string, SQL string) (QueryPlanAnalysis, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	defer Cancel()
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	SQL = Strings.TrimSpace(SQL)
+	if DatabaseID == "" {
+		return QueryPlanAnalysis{}, ErrNotFound
+	}
+	if SQL == "" {
+		return QueryPlanAnalysis{}, ErrInvalidInput
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return QueryPlanAnalysis{}, Err
+	}
+	if Server.Resolver == nil {
+		return QueryPlanAnalysis{}, ErrUnavailable
+	}
+	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, DatabaseID)
+	if Err != nil {
+		return QueryPlanAnalysis{}, Err
+	}
+	TargetConn, Err := Server.getDriver().Open(DSN)
+	if Err != nil {
+		return QueryPlanAnalysis{}, ErrUnavailable
+	}
+	defer TargetConn.Close()
+
+	TargetTx, Err := TargetConn.Begin(Ctx)
+	if Err != nil {
+		return QueryPlanAnalysis{}, ErrUnavailable
+	}
+	defer func() {
+		Cleanup, CleanupCancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer CleanupCancel()
+		_ = TargetTx.Rollback(Cleanup)
+	}()
+
+	CleanSQL := Strings.TrimRight(SQL, "; \t\r\n")
+	Rows, Err := TargetTx.Query(Ctx, "EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON) "+CleanSQL)
+	if Err != nil {
+		return QueryPlanAnalysis{}, Driver.ErrExecution
+	}
+	defer Rows.Close()
+
+	var RawJSON string
+	if !Rows.Next() {
+		return QueryPlanAnalysis{}, Driver.ErrExecution
+	}
+	if Err := Rows.Scan(&RawJSON); Err != nil {
+		return QueryPlanAnalysis{}, Driver.ErrExecution
+	}
+	Rows.Close()
+
+	return ParseQueryPlanJSON([]byte(RawJSON))
+}
