@@ -121,6 +121,7 @@ Success (`200`, `Cache-Control: no-store`):
   "reference_database_id": "reference-connection-uuid",
   "schema": "public",
   "current_schema_hash": "catalog-hash",
+  "requires_recomparison": false,
   "statements": [
     {
       "sql": "ALTER TABLE \"public\".\"items\" ADD COLUMN \"enabled\" boolean;",
@@ -131,9 +132,9 @@ Success (`200`, `Cache-Control: no-store`):
 }
 ```
 
-`statements` contains ordered, complete DDL statements and generator hazards. `sql_text` joins those statements for the editable migration draft. Equal schemas return `statements: []` and `sql_text: ""`. This endpoint never creates a draft, executes DDL, or copies data. Both catalog snapshots use read-only repeatable-read transactions; no shadow database or plan rehearsal is used. Index operations are generated without `CONCURRENTLY` for the existing transactional executor. The returned hash identifies the captured current schema; execution does not enforce it, so compare again after intervening changes.
+`statements` contains ordered, complete DDL statements and generator hazards. `sql_text` is the editable migration candidate. Normally it joins all statements. If existing enum values must be added alongside other changes, `requires_recomparison` is `true`: the full `statements` list still describes the differences, but `sql_text` contains only enum additions. Commit this candidate, compare again, then generate the remaining migration. No transaction control is inserted into the script. Equal schemas return `statements: []` and `sql_text: ""`. This endpoint never creates a draft, executes DDL, or copies data. Both catalog snapshots use read-only repeatable-read transactions; no shadow database or plan rehearsal is used. Index operations are generated without `CONCURRENTLY` for the existing transactional executor. The returned hash identifies the captured current schema; execution does not enforce it, so compare again after intervening changes.
 
-Errors use the standard sanitized JSON envelope: `400 invalid_request` (including missing reference schema), `401 unauthenticated`, `403 forbidden` or CSRF rejection, `404 not_found`, `413 schema_diff_too_large`, `415 unsupported_media_type`, `422 schema_diff_unsupported`, or `502 schema_diff_unavailable`. Generated SQL must fit 48,000 raw bytes and 60,000 bytes when JSON encoded, leaving space in the 64 KiB draft request. Comparison shares a 20-second deadline, with a 15-second database statement timeout. Unsupported library changes must be authored manually; object renames may produce destructive drop/create candidates.
+Errors use the standard sanitized JSON envelope: `400 invalid_request` (including missing reference schema), `401 unauthenticated`, `403 forbidden` or CSRF rejection, `404 not_found`, `413 schema_diff_too_large`, `415 unsupported_media_type`, `422 schema_diff_unsupported`, or `502 schema_diff_unavailable`. Generated SQL must fit 48,000 raw bytes and 60,000 bytes when JSON encoded, leaving space in the 64 KiB draft request. Comparison shares a 20-second deadline, with a 15-second database statement timeout. Unsupported library changes must be authored manually; object renames may produce destructive drop/create candidates. Snapshots containing non-extension user-defined domains, standalone composites, ranges/multiranges, or base types return `422` rather than a false empty diff. Removing or reordering existing enum labels also returns `422` instead of an invalid or false empty candidate.
 
 ## Administration
 

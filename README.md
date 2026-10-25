@@ -167,7 +167,49 @@ See [`docs/api.md`](docs/api.md) for detailed request, response, and error speci
 
 The comparison direction is **current → reference**. Generation reads catalog snapshots in read-only transactions, does not compare/copy row data, and does not save or execute a migration. It uses [pg-schema-diff v1.0.9](https://github.com/stripe/pg-schema-diff/tree/v1.0.9) for dependency ordering and PostgreSQL DDL generation. Index operations use ordinary transactional SQL to match the migration executor. No shadow database is created and the candidate is not rehearsed against live data before review.
 
-Object renames are treated as removal and creation; review destructive statements carefully. Unsupported generator changes return an error so the migration can be written manually. Role creation and general non-enum type migrations are outside the generator's supported scope. Cross-schema dependencies must already be available on the current database. Comparison has a 20-second deadline and a generated SQL limit of 48,000 bytes, with a separate JSON size limit to fit migration drafts. Changes made to either database after comparison require a fresh comparison.
+When an existing enum gains values alongside other changes, the generated candidate contains only the enum additions. The UI marks this preparation step: commit it, compare again, then review and execute the remaining migration. This follows [PostgreSQL's enum transaction rules](https://www.postgresql.org/docs/17/sql-altertype.html#SQL-ALTERTYPE-NOTES): new values must be committed before they are used in defaults or expressions. The full statement list still shows the remaining differences.
+
+Object renames are treated as removal and creation; review destructive statements carefully. Unsupported generator changes return an error so the migration can be written manually. Schema snapshots containing user-defined domains, standalone composite types, range/multirange types, or base types outside an extension return `422` instead of reporting a misleading match. Removing or reordering existing enum labels also returns `422`; these changes need an explicitly authored migration. Adding labels before, between, or after existing values is supported. Role creation is outside the generator's scope. Cross-schema dependencies must already be available on the current database. Comparison has a 20-second deadline and a generated SQL limit of 48,000 bytes, with a separate JSON size limit to fit migration drafts. Changes made to either database after comparison require a fresh comparison.
+
+### Demonstration Walkthrough
+
+Start the databases with `make db-up` and `make db-test-up`, then run the API and frontend. Register separate connections for the local target (`TARGET_DATABASE_URL`) and the local test database (`TEST_DATABASE_URL`). Keep the test database running during the demonstration; its storage is temporary. Use a group with View + Edit on both connections while preparing the two schemas. After preparation, the reference connection only needs View Only; reducing its grant requires signing in again.
+
+Use an unused namespace reserved for this demonstration, such as `schema_diff_demo`. Run each preparation script as a normal migration against its own connection.
+
+Current database:
+
+```sql
+CREATE SCHEMA schema_diff_demo;
+CREATE TABLE schema_diff_demo.items (id integer PRIMARY KEY, title text);
+INSERT INTO schema_diff_demo.items VALUES (1, 'Existing data');
+```
+
+Reference database:
+
+```sql
+CREATE SCHEMA schema_diff_demo;
+CREATE TABLE schema_diff_demo.items (
+    id integer PRIMARY KEY,
+    title text,
+    enabled boolean NOT NULL DEFAULT true
+);
+CREATE INDEX items_title ON schema_diff_demo.items (title);
+```
+
+Open the current database, choose **Compare schemas**, select the reference connection and `schema_diff_demo`, and compare. Show the proposed column and index changes with the reported index lock hazard. Open the current viewer to confirm generation has not changed it, then compare again and import the SQL into the migration editor. Append the following statement to demonstrate review and editing:
+
+```sql
+INSERT INTO schema_diff_demo.items (id, title) VALUES (2, 'Reviewed SQL');
+```
+
+Save Draft, execute, and show the committed history entry and both rows in the viewer. Compare again: no schema differences should remain. Row contents are not copied from the reference. To repeat the demonstration, run `DROP SCHEMA schema_diff_demo CASCADE` as a new migration on each connection, then run the preparation scripts again. Only use this reset for the namespace reserved for this demonstration.
+
+### Tested Scenarios
+
+Backend tests exercise table dependencies, column types/defaults/nullability, constraints, index replacement, enum creation and staged additions, serial sequences, views/materialized views, functions/triggers, RLS policies, literal Unicode/quoted identifiers, data-only and empty comparisons, unsupported types, target failures, read-only credentials/snapshots, cancellation, and concurrent comparisons. Generated SQL is applied through the same atomic script executor used by migrations, followed by a fresh comparison. A data-conflict test verifies complete rollback and a reviewed backfill before successful execution.
+
+Browser tests cover both ordinary and staged enum migrations, editable imports without automatic save/execution, connection failure/recovery, removal of stale results, and reference grant revocation, alongside the existing authentication, administration, viewer, and migration workflow. Candidate generation does not rehearse live row data: incompatible existing data can still reject execution and roll back. Review hazards and prepare any required data backfill before a real migration.
 
 ## Authentication
 
