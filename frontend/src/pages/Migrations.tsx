@@ -4,6 +4,7 @@ import { Link, useNavigate, useParams } from 'react-router-dom'
 import { AccessQueryKeys, ListAccessibleDatabases } from '../api/access'
 import { RequestError } from '../components/Feedback'
 import {
+  AnalyzeQueryPlan,
   ApiError,
   CreateMigration,
   DeleteMigrationDraft,
@@ -11,6 +12,7 @@ import {
   ListMigrations,
   UpdateMigrationDraft,
   type Migration,
+  type QueryPlanAnalysis,
 } from '../api/client'
 
 export function MigrationsPage() {
@@ -95,6 +97,14 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
     },
   })
 
+  const DetailsAnalyze = useMutation({
+    mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText),
+  })
+
+  const EditorAnalyze = useMutation({
+    mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText),
+  })
+
   const Busy = SaveMutation.isPending || ExecuteMutation.isPending || DeleteMutation.isPending
 
   function openCreateEditor() {
@@ -103,6 +113,7 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
     setEditorSQL('')
     setIsEditorOpen(true)
     setExecutionError(null)
+    EditorAnalyze.reset()
   }
 
   function openEditEditor(Item: Migration) {
@@ -111,6 +122,7 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
     setEditorSQL(Item.sql_text)
     setIsEditorOpen(true)
     setExecutionError(null)
+    EditorAnalyze.reset()
   }
 
   function handleExecute(Item: Migration) {
@@ -238,7 +250,13 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
                         <td style={{ padding: '0.5rem' }}>{Item.executed_by_username ?? Item.executed_by ?? '—'}</td>
                         <td style={{ padding: '0.5rem' }}>
                           <div className="row-actions migration-row-actions">
-                            <button onClick={() => setSelectedMigrationID(Item.id)} style={{ fontSize: '0.85rem' }}>
+                            <button
+                              onClick={() => {
+                                setSelectedMigrationID(Item.id)
+                                DetailsAnalyze.reset()
+                              }}
+                              style={{ fontSize: '0.85rem' }}
+                            >
                               View
                             </button>
                             {CanEdit && Item.status === 'draft' && (
@@ -301,7 +319,18 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
           )}
 
           <div>
-            <strong>SQL Script:</strong>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+              <strong>SQL Script:</strong>
+              <button
+                type="button"
+                className="secondary"
+                disabled={DetailsAnalyze.isPending}
+                onClick={() => DetailsAnalyze.mutate(SelectedMigration.sql_text)}
+                style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}
+              >
+                {DetailsAnalyze.isPending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}
+              </button>
+            </div>
             <pre
               style={{
                 background: '#1e1e1e',
@@ -316,6 +345,26 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
               {SelectedMigration.sql_text}
             </pre>
           </div>
+
+          {DetailsAnalyze.isPending && (
+            <p role="status" style={{ fontSize: '0.85rem', color: 'var(--muted)', marginTop: '0.75rem' }}>
+              Running EXPLAIN (ANALYZE) in rollback transaction…
+            </p>
+          )}
+
+          {DetailsAnalyze.isError && (
+            <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginTop: '0.75rem', fontSize: '0.85rem' }}>
+              <strong>Plan Analysis Failed:</strong>{' '}
+              {DetailsAnalyze.error instanceof ApiError ? DetailsAnalyze.error.message : 'Unable to analyze query plan.'}
+              <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
+                <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
+              </div>
+            </div>
+          )}
+
+          {DetailsAnalyze.data && (
+            <PlanAnalysisReport Analysis={DetailsAnalyze.data} onDismiss={() => DetailsAnalyze.reset()} />
+          )}
         </section>
       )}
 
@@ -344,12 +393,27 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
             </div>
 
             <div style={{ marginBottom: '1rem' }}>
-              <label htmlFor="migration-sql"><strong>SQL Query (Transactional):</strong></label>
-              <br />
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+                <label htmlFor="migration-sql"><strong>SQL Query (Transactional):</strong></label>
+                <button
+                  type="button"
+                  className="secondary"
+                  disabled={EditorAnalyze.isPending || !EditorSQL.trim()}
+                  onClick={() => EditorAnalyze.mutate(EditorSQL)}
+                  style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}
+                >
+                  {EditorAnalyze.isPending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}
+                </button>
+              </div>
               <textarea
                 id="migration-sql"
                 value={EditorSQL}
-                onChange={E => setEditorSQL(E.target.value)}
+                onChange={E => {
+                  setEditorSQL(E.target.value)
+                  if (EditorAnalyze.data || EditorAnalyze.error) {
+                    EditorAnalyze.reset()
+                  }
+                }}
                 placeholder="-- Write valid PostgreSQL DDL/DML statements here...&#10;CREATE TABLE sample (id SERIAL PRIMARY KEY, name TEXT);"
                 required
                 rows={12}
@@ -366,6 +430,26 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
                 }}
               />
             </div>
+
+            {EditorAnalyze.isPending && (
+              <p role="status" style={{ fontSize: '0.85rem', color: 'var(--muted)', marginBottom: '1rem' }}>
+                Running EXPLAIN (ANALYZE) in rollback transaction…
+              </p>
+            )}
+
+            {EditorAnalyze.isError && (
+              <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem', fontSize: '0.85rem' }}>
+                <strong>Plan Analysis Failed:</strong>{' '}
+                {EditorAnalyze.error instanceof ApiError ? EditorAnalyze.error.message : 'Unable to analyze query plan.'}
+                <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
+                  <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
+                </div>
+              </div>
+            )}
+
+            {EditorAnalyze.data && (
+              <PlanAnalysisReport Analysis={EditorAnalyze.data} onDismiss={() => EditorAnalyze.reset()} />
+            )}
 
             {SaveMutation.isError && (
               <p role="alert" style={{ color: '#c5221f' }}>
@@ -385,6 +469,77 @@ function DatabaseMigrations({ ActiveDatabase }: { ActiveDatabase: string }) {
         </section>
       )}
     </main>
+  )
+}
+
+function PlanAnalysisReport({ Analysis, onDismiss }: { Analysis: QueryPlanAnalysis; onDismiss?: () => void }) {
+  return (
+    <div
+      style={{
+        background: '#f7f8f5',
+        border: '1px solid var(--line)',
+        borderRadius: '4px',
+        padding: '1rem',
+        marginTop: '0.75rem',
+        marginBottom: '1rem',
+        fontSize: '0.85rem',
+      }}
+    >
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
+        <strong>Execution Plan Analysis (EXPLAIN ANALYZE)</strong>
+        {onDismiss && (
+          <button
+            type="button"
+            className="ghost"
+            style={{ fontSize: '0.8rem', minHeight: 'auto', padding: '2px 6px' }}
+            onClick={onDismiss}
+          >
+            Dismiss
+          </button>
+        )}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
+        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
+          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Estimated Cost</div>
+          <div style={{ fontWeight: 600 }}>{Analysis.estimated_cost.toFixed(2)}</div>
+        </div>
+        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
+          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Execution Time</div>
+          <div style={{ fontWeight: 600 }}>{Analysis.actual_execution_time.toFixed(3)} ms</div>
+        </div>
+        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
+          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Planning Time</div>
+          <div style={{ fontWeight: 600 }}>{Analysis.planning_time.toFixed(3)} ms</div>
+        </div>
+        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
+          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Rows Processed</div>
+          <div style={{ fontWeight: 600 }}>{Analysis.rows_processed}</div>
+        </div>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', marginBottom: '0.5rem' }}>
+        <div><strong>Scan Types:</strong> {Analysis.scan_types.length ? Analysis.scan_types.join(', ') : 'None'}</div>
+        <div><strong>Indexes Used:</strong> {Analysis.indexes_used.length ? Analysis.indexes_used.join(', ') : 'None'}</div>
+        <div><strong>Join Strategies:</strong> {Analysis.join_strategies.length ? Analysis.join_strategies.join(', ') : 'None'}</div>
+      </div>
+      <details>
+        <summary style={{ cursor: 'pointer', color: 'var(--accent)', fontWeight: 500 }}>View Raw Plan JSON</summary>
+        <pre
+          style={{
+            background: '#1e1e1e',
+            color: '#d4d4d4',
+            padding: '0.75rem',
+            borderRadius: '4px',
+            overflowX: 'auto',
+            maxHeight: '200px',
+            marginTop: '0.4rem',
+            fontSize: '0.8rem',
+            fontFamily: 'monospace',
+          }}
+        >
+          {JSON.stringify(Analysis.raw_plan, null, 2)}
+        </pre>
+      </details>
+    </div>
   )
 }
 

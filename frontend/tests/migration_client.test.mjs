@@ -1,6 +1,7 @@
 import Test from 'node:test'
 import Assert from 'node:assert/strict'
 import {
+  AnalyzeQueryPlan,
   CreateMigration,
   DeleteMigrationDraft,
   ExecuteMigration,
@@ -65,5 +66,11 @@ Test('migration client calls correct REST endpoints and attaches CSRF token', as
   await DeleteMigrationDraft('db-test', 'm-1')
   Assert.equal(Calls[6].Path, '/api/databases/db-test/migrations/m-1')
   Assert.equal(Calls[6].Options.method, 'DELETE')
+
+  // Analyze
+  await AnalyzeQueryPlan('db-test', 'SELECT 1;')
+  Assert.equal(Calls[7].Path, '/api/databases/db-test/migrations/analyze')
+  Assert.equal(Calls[7].Options.method, 'POST')
+  Assert.deepEqual(JSON.parse(Calls[7].Options.body), { sql_text: 'SELECT 1;' })
 })
 

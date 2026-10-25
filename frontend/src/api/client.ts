@@ -27,6 +27,17 @@ export interface MigrationInput {
   sql_text: string
 }
 
+export interface QueryPlanAnalysis {
+  scan_types: string[]
+  indexes_used: string[]
+  join_strategies: string[]
+  estimated_cost: number
+  actual_execution_time: number
+  rows_processed: number
+  planning_time: number
+  raw_plan: unknown
+}
+
 export interface AuthResponse {
   user: User
   csrf_token: string
@@ -127,6 +138,13 @@ export async function DeleteMigrationDraft(DatabaseID: string, MigrationID: stri
 export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<Migration> {
   return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
     method: 'POST',
+  })
+}
+
+export async function AnalyzeQueryPlan(DatabaseID: string, SQLText: string): Promise<QueryPlanAnalysis> {
+  return ApiRequest<QueryPlanAnalysis>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/analyze`, {
+    method: 'POST',
+    body: JSON.stringify({ sql_text: SQLText }),
   })
 }
 
