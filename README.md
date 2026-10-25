@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, and transactional target migrations are available.
+Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, and schema comparison with editable migration generation are available.
 
 ## Requirements
 
@@ -71,7 +71,7 @@ make test-integration
 make db-down
 ```
 
-`db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup.
+`db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup. Schema comparison tests also create two temporary databases on this dedicated test instance and drop them afterwards; its test role needs `CREATEDB`.
 
 The test database user must also be able to create and drop temporary roles for SELECT-only target inspection tests. The Compose test user has these privileges.
 
@@ -93,9 +93,9 @@ Install Chromium once, start the API and frontend in separate terminals, and run
 make test-e2e
 ```
 
-The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and a local PostgreSQL target. It creates temporary users, groups, a connection, and a uniquely named schema, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
+The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
 
-Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, and logout. Traces and video are disabled; a screenshot of the viewer is saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
+Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, logout, and schema comparison through editable generated SQL and execution. Traces and video are disabled; screenshots of the viewer and schema comparison are saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
 
 ## Production Build
 
@@ -156,6 +156,18 @@ Target database migrations represent ordered, linear schema and data modificatio
 Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
 
 See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
+
+## Schema Comparison and Migration Generation
+
+1. Register the current PostgreSQL database and a reference database containing the desired schema. The namespace must have the same name in both databases, such as `public`; it may be absent from the current database.
+2. Grant the user **View + Edit** on the current database and at least **View Only** on the reference database. Platform administrators also need these group grants.
+3. Open the current database and choose **Compare schemas**. Select the reference database and schema, then compare.
+4. Review the ordered SQL statements and their reported hazards. Choose **Use SQL in migration editor** to review or change the generated SQL and title.
+5. Save the draft and execute it explicitly using the existing migration workflow. Run comparison again after execution to check the result.
+
+The comparison direction is **current → reference**. Generation reads catalog snapshots in read-only transactions, does not compare/copy row data, and does not save or execute a migration. It uses [pg-schema-diff v1.0.9](https://github.com/stripe/pg-schema-diff/tree/v1.0.9) for dependency ordering and PostgreSQL DDL generation. Index operations use ordinary transactional SQL to match the migration executor. No shadow database is created and the candidate is not rehearsed against live data before review.
+
+Object renames are treated as removal and creation; review destructive statements carefully. Unsupported generator changes return an error so the migration can be written manually. Role creation and general non-enum type migrations are outside the generator's supported scope. Cross-schema dependencies must already be available on the current database. Comparison has a 20-second deadline and a generated SQL limit of 48,000 bytes, with a separate JSON size limit to fit migration drafts. Changes made to either database after comparison require a fresh comparison.
 
 ## Authentication
 
