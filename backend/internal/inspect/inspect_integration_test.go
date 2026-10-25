@@ -213,8 +213,8 @@ func TestBrowseRejectsBadInput(T *Testing.T) {
 	if App.Request("GET", "/api/databases/00000000-0000-0000-0000-000000000000/schemas", App.Admin).Code != 404 {
 		T.Fatal("unknown database did not return 404")
 	}
-	if App.Request("GET", "/api/databases/"+ID+"/tables?schema=bad-name", App.Admin).Code != 400 {
-		T.Fatal("malicious schema name was accepted")
+	if App.Request("GET", "/api/databases/"+ID+"/tables?schema=bad%00name", App.Admin).Code != 400 {
+		T.Fatal("NUL in schema name was accepted")
 	}
 	Ctx := Context.Background()
 	Dead, Err := App.Service.Connections.(*Connection.Service).Create(Ctx, Connection.ConnectionInput{Name: "dead", Host: "127.0.0.1", Port: 1, DBName: "target", Username: "target", Password: "x"}, nil)

@@ -6,12 +6,12 @@ import (
 )
 
 func TestValidIdentifier(T *Testing.T) {
-	for _, Name := range []string{"public", "users", "_tmp", "Table1", "a" + Strings.Repeat("b", 62)} {
+	for _, Name := range []string{"public", "users", "_tmp", "Table1", "a" + Strings.Repeat("b", 62), "1abc", "has space", "has-dash", "schema.table", "táble", "表", `a"b`, "a/b", "a%20b", `x"; DROP TABLE users;--`, Strings.Repeat("表", 21)} {
 		if !ValidIdentifier(Name) {
 			T.Fatalf("valid identifier rejected: %q", Name)
 		}
 	}
-	for _, Name := range []string{"", "1abc", "has space", "has-dash", "schema.table", Strings.Repeat("a", 64), "táble"} {
+	for _, Name := range []string{"", Strings.Repeat("a", 64), Strings.Repeat("表", 22), "bad\x00name", string([]byte{0xff})} {
 		if ValidIdentifier(Name) {
 			T.Fatalf("invalid identifier accepted: %q", Name)
 		}

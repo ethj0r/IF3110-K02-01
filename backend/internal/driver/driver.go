@@ -2,7 +2,8 @@ package Driver
 
 import (
 	Errors "errors"
-	Regexp "regexp"
+	Strings "strings"
+	Utf8 "unicode/utf8"
 )
 
 var (
@@ -13,10 +14,8 @@ var (
 	ErrExecution    = Errors.New("target SQL execution failed")
 )
 
-var identifierPattern = Regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,62}$`)
-
 func ValidIdentifier(Name string) bool {
-	return identifierPattern.MatchString(Name)
+	return Name != "" && len(Name) <= 63 && Utf8.ValidString(Name) && !Strings.ContainsRune(Name, 0)
 }
 
 func CheckIdentifier(Name string) error {

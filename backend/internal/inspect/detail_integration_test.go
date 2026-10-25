@@ -49,8 +49,8 @@ func TestDetailEndpoints(T *Testing.T) {
 	if Missing.Code != 200 || !Strings.Contains(Missing.Body.String(), `"columns":[]`) {
 		T.Fatalf("missing table detail must be empty: %d %s", Missing.Code, Missing.Body.String())
 	}
-	if App.Request("GET", "/api/databases/"+ID+"/tables/bad-name/columns?schema="+App.Schema, App.Member).Code != 400 {
-		T.Fatal("malicious table name was accepted")
+	if App.Request("GET", "/api/databases/"+ID+"/tables/bad%00name/columns?schema="+App.Schema, App.Member).Code != 400 {
+		T.Fatal("NUL in table name was accepted")
 	}
 }
 
@@ -107,7 +107,7 @@ func TestTableRowsPagination(T *Testing.T) {
 	if App.Request("GET", "/api/databases/"+ID+"/tables/missing/rows?schema="+App.Schema, App.Member).Code != 404 {
 		T.Fatal("missing table rows did not return 404")
 	}
-	if App.Request("GET", "/api/databases/"+ID+"/tables/bad-name/rows?schema="+App.Schema, App.Member).Code != 400 {
-		T.Fatal("malicious table name rows were accepted")
+	if App.Request("GET", "/api/databases/"+ID+"/tables/bad%00name/rows?schema="+App.Schema, App.Member).Code != 400 {
+		T.Fatal("NUL in table name rows was accepted")
 	}
 }
