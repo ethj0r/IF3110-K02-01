@@ -6,7 +6,7 @@ A PostgreSQL database management and migration platform built with Go and React.
 
 The repository includes a Go server, configuration loading, PostgreSQL pooling, JSON response helpers, health checks, a goose migration runner, isolated integration tests, a React starter, an embedded frontend build, Docker Compose, Make targets, and CI.
 
-Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, and transactional target migrations are available.
+Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, schema comparison with editable migration generation, and query execution plan analysis are available.
 
 ## Requirements
 
@@ -71,7 +71,7 @@ make test-integration
 make db-down
 ```
 
-`db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup.
+`db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup. Schema comparison tests also create two temporary databases on this dedicated test instance and drop them afterwards; its test role needs `CREATEDB`.
 
 The test database user must also be able to create and drop temporary roles for SELECT-only target inspection tests. The Compose test user has these privileges.
 
@@ -93,9 +93,9 @@ Install Chromium once, start the API and frontend in separate terminals, and run
 make test-e2e
 ```
 
-The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and a local PostgreSQL target. It creates temporary users, groups, a connection, and a uniquely named schema, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
+The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
 
-Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, and logout. Traces and video are disabled; a screenshot of the viewer is saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
+Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, logout, and schema comparison through editable generated SQL and execution. Traces and video are disabled; screenshots of the viewer and schema comparison are saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
 
 ## Production Build
 
@@ -156,6 +156,66 @@ Target database migrations represent ordered, linear schema and data modificatio
 Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
 
 See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
+
+## Query Execution Plan Analysis
+
+Use **Analyze Plan (EXPLAIN)** in the migration editor or migration details to inspect a data query before execution. The report shows scan types, indexes, join strategies, estimated cost, execution/planning times, row counts, and the raw JSON plan. This action requires database view access, a session, and CSRF protection.
+
+The backend runs `EXPLAIN ANALYZE` inside a target transaction that is rolled back afterwards. PostgreSQL DDL such as `CREATE TABLE` or generated `ALTER TABLE` statements has no query execution plan; use this feature with supported data queries such as `SELECT`, `INSERT`, `UPDATE`, or `DELETE`. Schema comparison still imports candidates into the same editable migration editor and requires View + Edit on the current database.
+
+## Schema Comparison and Migration Generation
+
+1. Register the current PostgreSQL database and a reference database containing the desired schema. The namespace must have the same name in both databases, such as `public`; it may be absent from the current database.
+2. Grant the user **View + Edit** on the current database and at least **View Only** on the reference database. Platform administrators also need these group grants.
+3. Open the current database and choose **Compare schemas**. Select the reference database and schema, then compare.
+4. Review the ordered SQL statements and their reported hazards. Choose **Use SQL in migration editor** to review or change the generated SQL and title.
+5. Save the draft and execute it explicitly using the existing migration workflow. Run comparison again after execution to check the result.
+
+The comparison direction is **current → reference**. Generation reads catalog snapshots in read-only transactions, does not compare/copy row data, and does not save or execute a migration. It uses [pg-schema-diff v1.0.9](https://github.com/stripe/pg-schema-diff/tree/v1.0.9) for dependency ordering and PostgreSQL DDL generation. Index operations use ordinary transactional SQL to match the migration executor. No shadow database is created and the candidate is not rehearsed against live data before review.
+
+When an existing enum gains values alongside other changes, the generated candidate contains only the enum additions. The UI marks this preparation step: commit it, compare again, then review and execute the remaining migration. This follows [PostgreSQL's enum transaction rules](https://www.postgresql.org/docs/17/sql-altertype.html#SQL-ALTERTYPE-NOTES): new values must be committed before they are used in defaults or expressions. The full statement list still shows the remaining differences.
+
+Object renames are treated as removal and creation; review destructive statements carefully. Unsupported generator changes return an error so the migration can be written manually. Schema snapshots containing user-defined domains, standalone composite types, range/multirange types, or base types outside an extension return `422` instead of reporting a misleading match. Removing or reordering existing enum labels also returns `422`; these changes need an explicitly authored migration. Adding labels before, between, or after existing values is supported. Role creation is outside the generator's scope. Cross-schema dependencies must already be available on the current database. Comparison has a 20-second deadline and a generated SQL limit of 48,000 bytes, with a separate JSON size limit to fit migration drafts. Changes made to either database after comparison require a fresh comparison.
+
+### Demonstration Walkthrough
+
+Start the databases with `make db-up` and `make db-test-up`, then run the API and frontend. Register separate connections for the local target (`TARGET_DATABASE_URL`) and the local test database (`TEST_DATABASE_URL`). Keep the test database running during the demonstration; its storage is temporary. Use a group with View + Edit on both connections while preparing the two schemas. After preparation, the reference connection only needs View Only; reducing its grant requires signing in again.
+
+Use an unused namespace reserved for this demonstration, such as `schema_diff_demo`. Run each preparation script as a normal migration against its own connection.
+
+Current database:
+
+```sql
+CREATE SCHEMA schema_diff_demo;
+CREATE TABLE schema_diff_demo.items (id integer PRIMARY KEY, title text);
+INSERT INTO schema_diff_demo.items VALUES (1, 'Existing data');
+```
+
+Reference database:
+
+```sql
+CREATE SCHEMA schema_diff_demo;
+CREATE TABLE schema_diff_demo.items (
+    id integer PRIMARY KEY,
+    title text,
+    enabled boolean NOT NULL DEFAULT true
+);
+CREATE INDEX items_title ON schema_diff_demo.items (title);
+```
+
+Open the current database, choose **Compare schemas**, select the reference connection and `schema_diff_demo`, and compare. Show the proposed column and index changes with the reported index lock hazard. Open the current viewer to confirm generation has not changed it, then compare again and import the SQL into the migration editor. Append the following statement to demonstrate review and editing:
+
+```sql
+INSERT INTO schema_diff_demo.items (id, title) VALUES (2, 'Reviewed SQL');
+```
+
+Save Draft, execute, and show the committed history entry and both rows in the viewer. Compare again: no schema differences should remain. Row contents are not copied from the reference. To repeat the demonstration, run `DROP SCHEMA schema_diff_demo CASCADE` as a new migration on each connection, then run the preparation scripts again. Only use this reset for the namespace reserved for this demonstration.
+
+### Tested Scenarios
+
+Backend tests exercise table dependencies, column types/defaults/nullability, constraints, index replacement, enum creation and staged additions, serial sequences, views/materialized views, functions/triggers, RLS policies, literal Unicode/quoted identifiers, data-only and empty comparisons, unsupported types, target failures, read-only credentials/snapshots, cancellation, and concurrent comparisons. Generated SQL is applied through the same atomic script executor used by migrations, followed by a fresh comparison. A data-conflict test verifies complete rollback and a reviewed backfill before successful execution.
+
+Browser tests cover both ordinary and staged enum migrations, editable imports without automatic save/execution, connection failure/recovery, removal of stale results, and reference grant revocation, alongside the existing authentication, administration, viewer, and migration workflow. Candidate generation does not rehearse live row data: incompatible existing data can still reject execution and roll back. Review hazards and prepare any required data backfill before a real migration.
 
 ## Authentication
 

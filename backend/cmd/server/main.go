@@ -12,6 +12,7 @@ import (
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Inspect "github.com/ethj0r/IF3110-K02-01/backend/internal/inspect"
 	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
+	Schemadiff "github.com/ethj0r/IF3110-K02-01/backend/internal/schemadiff"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
 	Slog "log/slog"
@@ -85,6 +86,7 @@ func Run() error {
 		Driver: Driver.PostgresDriver{},
 	}
 	MigrationRoutes := &Migration.Handler{Auth: AuthRoutes, Service: MigrationService}
+	SchemaDiffRoutes := &Schemadiff.Handler{Auth: AuthRoutes, Service: &Schemadiff.Service{Policy: AccessRepo, Connections: ConnectionService, Generator: Schemadiff.PostgresGenerator{}}}
 	Server := &Http.Server{
 		Addr: Cfg.HTTPAddr,
 		Handler: Httpx.NewRouter(
@@ -96,6 +98,7 @@ func Run() error {
 			AccessRoutes.Register,
 			AdminRoutes.Register,
 			MigrationRoutes.Register,
+			SchemaDiffRoutes.Register,
 		),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,

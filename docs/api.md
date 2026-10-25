@@ -102,6 +102,41 @@ remains mandatory. Successful execution invalidates cached viewer metadata/data.
 4. **Uncertain Outcomes:** `pending` is persisted before SQL runs. A lost commit response, process interruption, or failed result write leaves it pending, blocks retry, and blocks later versions. An operator must verify target effects and reconcile the platform record to `committed` or `rolled_back` before proceeding; never blindly reset it to draft. This also applies to legacy pending records. Target and platform commits are separate transactions.
 5. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording have a separate five-second cleanup window.
 
+## Schema Comparison
+
+`POST /databases/{dbId}/schema-diff` compares the current database with a registered reference database. Requires a session, trusted Origin, CSRF token, View + Edit on `{dbId}`, and at least View Only on `reference_database_id`. Both permissions are checked before resolving either connection. Platform administrators do not bypass grants.
+
+Request (`application/json`, maximum 2 KiB, unknown fields rejected):
+
+```json
+{"reference_database_id":"reference-connection-uuid","schema":"public"}
+```
+
+`schema` defaults to `public` when omitted or empty. Its literal UTF-8 name is limited to 63 bytes without NUL; `pg_*` and `information_schema` are rejected. The reference schema must exist. The same namespace is compared in both databases; an absent current schema generates creation statements.
+
+Success (`200`, `Cache-Control: no-store`):
+
+```json
+{
+  "current_database_id": "current-connection-uuid",
+  "reference_database_id": "reference-connection-uuid",
+  "schema": "public",
+  "current_schema_hash": "catalog-hash",
+  "requires_recomparison": false,
+  "statements": [
+    {
+      "sql": "ALTER TABLE \"public\".\"items\" ADD COLUMN \"enabled\" boolean;",
+      "hazards": [{"type":"ACQUIRES_ACCESS_EXCLUSIVE_LOCK","message":"Reported generator hazard"}]
+    }
+  ],
+  "sql_text": "ALTER TABLE \"public\".\"items\" ADD COLUMN \"enabled\" boolean;"
+}
+```
+
+`statements` contains ordered, complete DDL statements and generator hazards. `sql_text` is the editable migration candidate. Normally it joins all statements. If existing enum values must be added alongside other changes, `requires_recomparison` is `true`: the full `statements` list still describes the differences, but `sql_text` contains only enum additions. Commit this candidate, compare again, then generate the remaining migration. No transaction control is inserted into the script. Equal schemas return `statements: []` and `sql_text: ""`. This endpoint never creates a draft, executes DDL, or copies data. Both catalog snapshots use read-only repeatable-read transactions; no shadow database or plan rehearsal is used. Index operations are generated without `CONCURRENTLY` for the existing transactional executor. The returned hash identifies the captured current schema; execution does not enforce it, so compare again after intervening changes.
+
+Errors use the standard sanitized JSON envelope: `400 invalid_request` (including missing reference schema), `401 unauthenticated`, `403 forbidden` or CSRF rejection, `404 not_found`, `413 schema_diff_too_large`, `415 unsupported_media_type`, `422 schema_diff_unsupported`, or `502 schema_diff_unavailable`. Generated SQL must fit 48,000 raw bytes and 60,000 bytes when JSON encoded, leaving space in the 64 KiB draft request. Comparison shares a 20-second deadline, with a 15-second database statement timeout. Unsupported library changes must be authored manually; object renames may produce destructive drop/create candidates. Snapshots containing non-extension user-defined domains, standalone composites, ranges/multiranges, or base types return `422` rather than a false empty diff. Removing or reordering existing enum labels also returns `422` instead of an invalid or false empty candidate.
+
 ## Administration
 
 Every route below requires a platform administrator. Unsafe methods also require
