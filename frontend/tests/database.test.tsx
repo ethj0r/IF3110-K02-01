@@ -4,8 +4,35 @@ import UserEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
 import { App } from '../src/App'
+import { ListColumns, ListConstraints, ListIndexes, ListRows } from '../src/api/databases'
 
 const Clients: QueryClient[] = []
+
+Test('inspection URLs preserve literal identifiers without dot-segment navigation', async () => {
+  const Fetch = Vi.fn<(Path: string) => Promise<Response>>(async () => Response.json({ columns: [], constraints: [], indexes: [], rows: [], page: 1, page_size: 25, total: 0 }))
+  Vi.stubGlobal('fetch', Fetch)
+  const Schema = '計画 schema'
+  for (const Table of ['order items', '表', 'a/b', 'a%20b', 'a"b', '.', '..']) {
+    Fetch.mockClear()
+    await ListColumns('db-1', Schema, Table)
+    await ListConstraints('db-1', Schema, Table)
+    await ListIndexes('db-1', Schema, Table)
+    await ListRows('db-1', Schema, Table, 2, 25)
+    for (const Call of Fetch.mock.calls) {
+      const Address = new URL(Call[0], 'http://127.0.0.1:5173')
+      Expect(Address.searchParams.get('schema')).toBe(Schema)
+      Expect(Address.pathname.startsWith('/api/databases/db-1/')).toBe(true)
+      if (Table === '.' || Table === '..') {
+        Expect(Address.searchParams.get('table')).toBe(Table)
+        Expect(Address.pathname).toContain('/table/')
+      } else {
+        Expect(decodeURIComponent(Address.pathname.split('/')[5])).toBe(Table)
+      }
+    }
+    const RowsURL = new URL(Fetch.mock.calls[3][0], 'http://127.0.0.1:5173')
+    Expect(RowsURL.searchParams.get('page')).toBe('2')
+  }
+})
 
 AfterEach(() => {
   Cleanup()

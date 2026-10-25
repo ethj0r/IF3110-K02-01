@@ -65,7 +65,7 @@ ORDER BY S.schema_name`)
 	return Result, nil
 }
 
-func checkTableRef(Schema, Table string) error {
+func CheckTableRef(Schema, Table string) error {
 	if Schema == "" {
 		Schema = "public"
 	}
@@ -114,7 +114,7 @@ func (Server *Service) Columns(Ctx Context.Context, DBID, Schema, Table string) 
 	if Schema == "" {
 		Schema = "public"
 	}
-	if Err := checkTableRef(Schema, Table); Err != nil {
+	if Err := CheckTableRef(Schema, Table); Err != nil {
 		return nil, Err
 	}
 	Target, Err := Server.openTarget(Ctx, DBID)
@@ -150,7 +150,7 @@ func (Server *Service) Constraints(Ctx Context.Context, DBID, Schema, Table stri
 	if Schema == "" {
 		Schema = "public"
 	}
-	if Err := checkTableRef(Schema, Table); Err != nil {
+	if Err := CheckTableRef(Schema, Table); Err != nil {
 		return nil, Err
 	}
 	Target, Err := Server.openTarget(Ctx, DBID)
@@ -193,7 +193,7 @@ func (Server *Service) Indexes(Ctx Context.Context, DBID, Schema, Table string) 
 	if Schema == "" {
 		Schema = "public"
 	}
-	if Err := checkTableRef(Schema, Table); Err != nil {
+	if Err := CheckTableRef(Schema, Table); Err != nil {
 		return nil, Err
 	}
 	Target, Err := Server.openTarget(Ctx, DBID)
@@ -275,7 +275,7 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 	if Schema == "" {
 		Schema = "public"
 	}
-	if Err := checkTableRef(Schema, Table); Err != nil {
+	if Err := CheckTableRef(Schema, Table); Err != nil {
 		return TablePage{}, Err
 	}
 	if Page < 1 || PageSize < 1 || PageSize > 100 || Page-1 > Math.MaxInt/PageSize {
@@ -335,7 +335,6 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 	}
 	Result := TablePage{Columns: Fields, Rows: [][]*string{}, Page: Page, PageSize: PageSize, Total: Total}
 	for Data.Next() {
-		// PostgreSQL text preserves numeric precision and supports every target type.
 		Values := make([]*string, len(Fields))
 		for Index, Raw := range Data.RawValues() {
 			if Raw != nil {

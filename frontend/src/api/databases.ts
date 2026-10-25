@@ -54,25 +54,32 @@ export function ListTables(id: string, schema: string) {
 
 export function ListColumns(id: string, schema: string, table: string) {
   return ApiRequest<{ columns: TableColumn[] }>(
-    `/api/databases/${encodeURIComponent(id)}/tables/${encodeURIComponent(table)}/columns?schema=${encodeURIComponent(schema)}`,
+    TableEndpoint(id, schema, table, 'columns'),
   )
 }
 
 export function ListConstraints(id: string, schema: string, table: string) {
   return ApiRequest<{ constraints: TableConstraint[] }>(
-    `/api/databases/${encodeURIComponent(id)}/tables/${encodeURIComponent(table)}/constraints?schema=${encodeURIComponent(schema)}`,
+    TableEndpoint(id, schema, table, 'constraints'),
   )
 }
 
 export function ListIndexes(id: string, schema: string, table: string) {
   return ApiRequest<{ indexes: TableIndex[] }>(
-    `/api/databases/${encodeURIComponent(id)}/tables/${encodeURIComponent(table)}/indexes?schema=${encodeURIComponent(schema)}`,
+    TableEndpoint(id, schema, table, 'indexes'),
   )
 }
 
 export function ListRows(id: string, schema: string, table: string, page: number, pageSize: number) {
-  const Params = new URLSearchParams({ schema, page: String(page), page_size: String(pageSize) })
   return ApiRequest<TablePage>(
-    `/api/databases/${encodeURIComponent(id)}/tables/${encodeURIComponent(table)}/rows?${Params.toString()}`,
+    TableEndpoint(id, schema, table, 'rows', { page: String(page), page_size: String(pageSize) }),
   )
+}
+
+function TableEndpoint(DatabaseID: string, Schema: string, Table: string, Endpoint: string, Extra: Record<string, string> = {}) {
+  const Params = new URLSearchParams({ schema: Schema, ...Extra })
+  const DotName = Table === '.' || Table === '..'
+  if (DotName) Params.set('table', Table)
+  const Path = DotName ? 'table' : `tables/${encodeURIComponent(Table)}`
+  return `/api/databases/${encodeURIComponent(DatabaseID)}/${Path}/${Endpoint}?${Params.toString()}`
 }

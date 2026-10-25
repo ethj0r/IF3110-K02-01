@@ -8,6 +8,7 @@ import (
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Chi "github.com/go-chi/chi/v5"
 	Http "net/http"
+	Url "net/url"
 	Strconv "strconv"
 	Time "time"
 )
@@ -36,6 +37,10 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Get("/databases/{id}/tables/{table}/constraints", Routes.ListConstraints)
 		R.Get("/databases/{id}/tables/{table}/indexes", Routes.ListIndexes)
 		R.Get("/databases/{id}/tables/{table}/rows", Routes.ListRows)
+		R.Get("/databases/{id}/table/columns", Routes.ListColumns)
+		R.Get("/databases/{id}/table/constraints", Routes.ListConstraints)
+		R.Get("/databases/{id}/table/indexes", Routes.ListIndexes)
+		R.Get("/databases/{id}/table/rows", Routes.ListRows)
 	})
 }
 
@@ -71,7 +76,18 @@ func (Routes *Handler) ListTables(W Http.ResponseWriter, R *Http.Request) {
 }
 
 func tableRef(R *Http.Request) (string, string) {
-	return Chi.URLParam(R, "id"), Chi.URLParam(R, "table")
+	Table := Chi.URLParam(R, "table")
+	if Table == "" {
+		return Chi.URLParam(R, "id"), R.URL.Query().Get("table")
+	}
+	if R.URL.RawPath != "" {
+		Decoded, Err := Url.PathUnescape(Table)
+		if Err != nil {
+			return Chi.URLParam(R, "id"), ""
+		}
+		Table = Decoded
+	}
+	return Chi.URLParam(R, "id"), Table
 }
 
 func (Routes *Handler) ListColumns(W Http.ResponseWriter, R *Http.Request) {
