@@ -210,3 +210,43 @@ func TestSeedDefaultIsIdempotent(T *Testing.T) {
 		T.Fatalf("seed created unexpected connections: %+v", Listed)
 	}
 }
+
+func TestSeedTargetsIsIdempotentByName(T *Testing.T) {
+	Server := NewHandlerFixture(T).Service
+	Ctx := Context.Background()
+	URL := Os.Getenv("TEST_DATABASE_URL")
+	if URL == "" {
+		T.Fatal("TEST_DATABASE_URL is required")
+	}
+	if Err := SeedTargets(Ctx, Server,
+		SeedTarget{Name: "local-a", URL: URL},
+		SeedTarget{Name: "local-b", URL: URL},
+	); Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := SeedTargets(Ctx, Server,
+		SeedTarget{Name: "local-a", URL: URL},
+		SeedTarget{Name: "local-c", URL: URL},
+	); Err != nil {
+		T.Fatal(Err)
+	}
+	Listed, Err := Server.List(Ctx)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if len(Listed) != 3 {
+		T.Fatalf("expected three seeded connections, got %+v", Listed)
+	}
+	Names := map[string]bool{}
+	for _, Item := range Listed {
+		Names[Item.Name] = true
+	}
+	for _, Name := range []string{"local-a", "local-b", "local-c"} {
+		if !Names[Name] {
+			T.Fatalf("missing seeded connection %q in %+v", Name, Listed)
+		}
+	}
+	if Err := SeedTargets(Ctx, Server, SeedTarget{Name: "bad", URL: "not-a-url"}); Err == nil {
+		T.Fatal("invalid seed target URL was accepted")
+	}
+}

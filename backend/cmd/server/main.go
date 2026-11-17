@@ -64,12 +64,18 @@ func Run() error {
 		return Err
 	}
 	ConnectionService := &Connection.Service{Cipher: ConnCipher, Repo: &Connection.Repository{Pool: Pool}}
-	SeedCtx, SeedCancel := Context.WithTimeout(Ctx, 5*Time.Second)
-	SeedErr := Connection.SeedDefault(SeedCtx, ConnectionService, Os.Getenv("TARGET_DATABASE_URL"))
-	SeedCancel()
-	if SeedErr != nil {
-		Slog.Warn("default target connection was not seeded", "error", SeedErr)
+	SeedCtx, SeedCancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	if Connection.SeedTargetsEnabled(Os.Getenv("APP_ENV"), Os.Getenv("SEED_TARGET_DATABASES")) {
+		SeedErr := Connection.SeedTargets(SeedCtx, ConnectionService,
+			Connection.SeedTarget{Name: "local-target", URL: Os.Getenv("TARGET_DATABASE_URL")},
+			Connection.SeedTarget{URL: Os.Getenv("TARGET_DATABASE_URL_2")},
+			Connection.SeedTarget{URL: Os.Getenv("TARGET_DATABASE_URL_3")},
+		)
+		if SeedErr != nil {
+			Slog.Warn("target connections were not seeded", "error", SeedErr)
+		}
 	}
+	SeedCancel()
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
 	AccessRepo := &Access.Repository{Pool: Pool}
 	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: Driver.PostgresDriver{}}

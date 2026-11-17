@@ -1,7 +1,7 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web test-e2e lint typecheck check build bootstrap migrate-up migrate-status seed-admin clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web test-e2e lint typecheck check build bootstrap migrate-up migrate-status seed-admin seed-dev seed-sample seed-large seed-data clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
@@ -15,6 +15,10 @@ help:
 	@echo "bootstrap       Apply platform migrations and create the initial admin"
 	@echo "migrate-up/migrate-status Run embedded platform migrations"
 	@echo "seed-admin      Bootstrap the initial admin from environment credentials"
+	@echo "seed-dev        Seed local targets, create the developers group, and grant access"
+	@echo "seed-sample     Seed demo.movies and demo.books sample data"
+	@echo "seed-large      Seed batch_demo.movies and time an unbatched full-table UPDATE"
+	@echo "seed-data       Run seed-sample and seed-large"
 
 setup:
 	@umask 077; test -f .env || cp .env.example .env
@@ -29,10 +33,13 @@ setup:
 	fi
 	@if ! grep -q '^BOOTSTRAP_ADMIN_USERNAME=' .env; then printf '\nBOOTSTRAP_ADMIN_USERNAME=\n' >> .env; fi
 	@if ! grep -q '^BOOTSTRAP_ADMIN_PASSWORD=' .env; then printf 'BOOTSTRAP_ADMIN_PASSWORD=\n' >> .env; fi
+	@if ! grep -q '^TARGET_DATABASE_URL_2=' .env; then printf '\nTARGET_DATABASE_URL_2=postgres://target_b:target_b_dev@127.0.0.1:55435/target_b?sslmode=disable\n' >> .env; fi
+	@if ! grep -q '^TARGET_DATABASE_URL_3=' .env; then printf 'TARGET_DATABASE_URL_3=postgres://target_large:target_large_dev@127.0.0.1:55436/target_large?sslmode=disable\n' >> .env; fi
+	@if ! grep -q '^SEED_LARGE_ROWS=' .env; then printf 'SEED_LARGE_ROWS=2000000\n' >> .env; fi
 	npm --prefix frontend ci --no-audit --no-fund
 
 db-up:
-	docker compose up -d --wait platform-db target-db
+	docker compose up -d --wait platform-db target-db target-db-b target-db-large
 
 db-down:
 	docker compose --profile test down
@@ -91,6 +98,17 @@ migrate-status:
 
 seed-admin:
 	cd backend && go run ./cmd/seed-admin
+
+seed-dev:
+	cd backend && go run ./cmd/seed-dev
+
+seed-sample:
+	cd backend && go run ./cmd/seed-sample
+
+seed-large:
+	cd backend && go run ./cmd/seed-large
+
+seed-data: seed-sample seed-large
 
 clean:
 	rm -rf bin
