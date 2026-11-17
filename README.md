@@ -26,9 +26,11 @@ make setup
 make db-up
 # Set BOOTSTRAP_ADMIN_USERNAME and BOOTSTRAP_ADMIN_PASSWORD in .env first.
 make bootstrap
+make seed-dev
+make seed-data
 ```
 
-`make setup` copies `.env.example` to `.env` if the file does not exist, generates a local session encryption key when absent, adds placeholder bootstrap administrator variables when missing, restricts `.env` permissions, and installs dependencies using the lockfiles. `make bootstrap` applies platform migrations and creates the initial administrator. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
+`make setup` copies `.env.example` to `.env` if the file does not exist, generates a local session encryption key when absent, adds placeholder bootstrap administrator variables and local target URLs when missing, restricts `.env` permissions, and installs dependencies using the lockfiles. `make bootstrap` applies platform migrations and creates the initial administrator. `make seed-dev` registers the local target connections, creates the `developers` group, adds the bootstrap administrator, and grants View + Edit on `local-*` connections. `make seed-data` runs `seed-sample` and `seed-large`: the former adds a curated movie list to `target-db` and a book list to `target-db-b`, while the latter fills `batch_demo.movies` on `target-db-large` with enough rows to time an unbatched `UPDATE` for batch testing. Make loads `.env`; direct binary or `go run` commands require exported environment variables. Use simple Make-compatible assignments as shown in the example file.
 
 ### Run the Application
 
@@ -61,9 +63,13 @@ API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must n
 | --- | --- | --- | --- |
 | `platform-db` | 55432 | `platform` | Platform metadata |
 | `target-db` | 55433 | `target` | Target database inspection and migrations |
+| `target-db-b` | 55435 | `target_b` | Second target for parallel-database jobs and comparisons |
+| `target-db-large` | 55436 | `target_large` | Large dataset for batch migration testing |
 | `test-db` | 55434 | `platform_test` | Disposable integration tests |
 
 Database ports bind to loopback only. Credentials in Compose and `.env.example` are for local development. Do not use them in production or commit `.env`.
+
+`make db-up` starts the platform and all three target databases. On startup in a non-production environment, each configured target URL is registered once as `local-<dbname>` (`TARGET_DATABASE_URL`, `TARGET_DATABASE_URL_2`, `TARGET_DATABASE_URL_3`). Seeding is idempotent by connection name and never overwrites an existing connection. Set `SEED_TARGET_DATABASES=true` to enable it in production; set it to any other value with `APP_ENV=production` to disable startup seeding. Connections are added through `POST /api/connections` or the administration page when you need a target outside these local services.
 
 ```sh
 make db-test-up
@@ -74,6 +80,26 @@ make db-down
 `db-down` preserves development database volumes. The test database uses temporary storage. Integration tests require `TEST_DATABASE_URL` pointing to a dedicated test database; they never fall back to `DATABASE_URL`. Each test receives an isolated schema that is removed during cleanup. Schema comparison tests also create two temporary databases on this dedicated test instance and drop them afterwards; its test role needs `CREATEDB`.
 
 The test database user must also be able to create and drop temporary roles for SELECT-only target inspection tests. The Compose test user has these privileges.
+
+### Adding a Target Database
+
+A target database must already exist and be reachable from the API; the platform stores only connection metadata and an encrypted password. For a local stack, run `make db-up` and `make seed-dev`. For an external or additional database:
+
+1. Start PostgreSQL somewhere the API can reach (for example `docker run -p 55437:5432 -e POSTGRES_USER=app -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=app postgres:17-alpine`).
+2. Sign in as a platform administrator and open `/admin/connections`, choose **New connection**, fill in the host, port, database, username, and password, then use **Test**.
+3. Create or select a group in `/admin/groups`, add the user as a member, and grant View Only or View + Edit for the connection in `/admin/access`.
+4. The connection appears in the workspace only after the user's group receives a grant and the user signs in again if their session was rotated.
+
+Target connections currently force `sslmode=disable`; a target that only accepts TLS needs connection configuration support before it can be registered.
+
+### Sample Data
+
+`make seed-sample` creates small, readable datasets for browsing and migration demos:
+
+- `demo.movies` in `target-db` (`TARGET_DATABASE_URL`): 12 films with title, release year, genre, rating, and views.
+- `demo.books` in `target-db-b` (`TARGET_DATABASE_URL_2`): 12 classics with title, author, publication year, genre, and rating.
+
+`make seed-large` creates `batch_demo.movies` in `target-db-large` (`TARGET_DATABASE_URL_3`): a generated movie catalog with `SEED_LARGE_ROWS` rows (default 2,000,000), then times one unbatched `UPDATE batch_demo.movies SET views = views + 1`. Re-running skips the insert unless `SEED_LARGE_FORCE=true`, which truncates and reseeds. All seeds are idempotent and use `ON CONFLICT (id) DO NOTHING` for the curated lists.
 
 ## Validation
 
@@ -128,7 +154,7 @@ The server does not apply migrations automatically. Run `migrate-up` before star
 
 Connections use `SESSION_KEY` to encrypt target passwords. Keep it stable: replacing it invalidates sessions and makes saved target passwords unreadable until re-entered. Passwords and ciphertext are never returned by connection metadata APIs.
 
-On server startup, a non-empty `TARGET_DATABASE_URL` seeds `local-target` only when the connection table is empty. Seeding grants no access automatically. Restarting with an existing connection does not overwrite it; manage it through the administration page.
+On server startup, configured target URLs seed connections named `local-<dbname>` in non-production environments. Seeding is idempotent by connection name, does not overwrite an existing connection, and grants no access automatically. Use `make seed-dev` to create the `developers` group and grant access to the `local-*` connections. Manage additional connections through the administration page.
 
 Rows default to 25 per page, with a maximum of 100. Cells use PostgreSQL text representations to preserve numeric precision; SQL NULL remains distinct from empty text. Schema/table names are literal UTF-8 PostgreSQL identifiers, limited to 63 bytes without NUL. Spaces, Unicode, punctuation, embedded quotes, slash, and percent characters are supported. Values are bound as query parameters or quoted with `pgx.Identifier`; SQL-like text in a name remains a literal name. The frontend URL-encodes names and the API preserves their exact spelling.
 
