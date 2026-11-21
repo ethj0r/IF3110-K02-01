@@ -24,6 +24,7 @@ import (
 )
 
 func main() {
+	Slog.SetDefault(Slog.New(Slog.NewJSONHandler(Os.Stdout, &Slog.HandlerOptions{Level: Slog.LevelInfo})))
 	if Err := Run(); Err != nil {
 		Slog.Error("server stopped", "error", Err)
 		Os.Exit(1)

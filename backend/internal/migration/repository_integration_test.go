@@ -46,24 +46,42 @@ func setupFixture(T *Testing.T, Pool *Pgxpool.Pool) (string, string) {
 	return DBID, UserID
 }
 
-func TestRepositoryLifecycleAndLinearVersions(T *Testing.T) {
+func recordSucceeded(T *Testing.T, Repo *Repository, Ctx Context.Context, DBID, UserID, MigrationID, SQL string) Execution {
+	T.Helper()
+	Exec, Err := Repo.CreateExecution(Ctx, DBID, MigrationID, ExecutionRequest{Kind: KindApply, Direction: DirectionUp, SQLText: SQL, RequestedBy: &UserID})
+	if Err != nil {
+		T.Fatalf("create execution: %v", Err)
+	}
+	Attempt, Err := Repo.CreateAttempt(Ctx, Exec.ID, &UserID, SQL)
+	if Err != nil {
+		T.Fatalf("create attempt: %v", Err)
+	}
+	if Err := Repo.FinishAttempt(Ctx, Attempt.ID, AttemptSucceeded, nil); Err != nil {
+		T.Fatalf("finish attempt: %v", Err)
+	}
+	if Err := Repo.FinishExecution(Ctx, Exec.ID, ExecutionSucceeded, nil); Err != nil {
+		T.Fatalf("finish execution: %v", Err)
+	}
+	if _, Err := Repo.RefreshStatus(Ctx, DBID, MigrationID); Err != nil {
+		T.Fatalf("refresh status: %v", Err)
+	}
+	return Exec
+}
+
+func TestRepositoryLifecycleAndExecutions(T *Testing.T) {
 	Pool := NewMigrationDatabase(T)
 	Repo := &Repository{Pool: Pool}
 	Ctx := Context.Background()
-
 	DBID, UserID := setupFixture(T, Pool)
 
-	// Create first migration
-	M1, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Create table A", SQLText: "CREATE TABLE a (id INT);"}, &UserID)
+	M1, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Create table A", SQLText: "CREATE TABLE a (id INT);", DownSQL: "DROP TABLE a;"}, &UserID)
 	if Err != nil {
 		T.Fatalf("failed to create m1: %v", Err)
 	}
-	if M1.Version != 1 || M1.Status != StatusDraft || M1.Title != "Create table A" {
+	if M1.Version != 1 || M1.Status != StatusDraft || M1.Revision != 1 || M1.DownSQL == nil {
 		T.Fatalf("unexpected m1: %+v", M1)
 	}
-
-	// Create second migration
-	M2, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Create table B", SQLText: "CREATE TABLE b (id INT);"}, &UserID)
+	M2, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Create table B", SQLText: "CREATE TABLE b (id INT);", DownSQL: "DROP TABLE b;"}, &UserID)
 	if Err != nil {
 		T.Fatalf("failed to create m2: %v", Err)
 	}
@@ -71,70 +89,77 @@ func TestRepositoryLifecycleAndLinearVersions(T *Testing.T) {
 		T.Fatalf("unexpected m2: %+v", M2)
 	}
 
-	// Get by ID
-	Fetched1, Err := Repo.Get(Ctx, DBID, M1.ID)
-	if Err != nil || Fetched1.ID != M1.ID {
-		T.Fatalf("failed to fetch m1: %v", Err)
-	}
-
-	// Get by Version
-	FetchedV2, Err := Repo.GetByVersion(Ctx, DBID, 2)
-	if Err != nil || FetchedV2.ID != M2.ID {
-		T.Fatalf("failed to fetch m2 by version: %v", Err)
-	}
-
-	// List linear
-	List, Err := Repo.List(Ctx, DBID)
-	if Err != nil || len(List) != 2 {
-		T.Fatalf("expected 2 migrations in list, got %v (len %d)", Err, len(List))
-	}
-	if List[0].Version != 1 || List[1].Version != 2 {
-		T.Fatalf("migrations list not in linear version order: %+v", List)
-	}
-
-	// Update draft
-	Updated1, Err := Repo.UpdateDraft(Ctx, DBID, M1.ID, MigrationInput{Title: "Create table A updated", SQLText: "CREATE TABLE a (id BIGINT);"})
-	if Err != nil || Updated1.Title != "Create table A updated" {
+	Updated1, Err := Repo.UpdateDraft(Ctx, DBID, M1.ID, MigrationInput{Title: "Create table A updated", SQLText: "CREATE TABLE a (id BIGINT);", DownSQL: "DROP TABLE a;"})
+	if Err != nil || Updated1.Title != "Create table A updated" || Updated1.Revision != 2 {
 		T.Fatalf("failed to update draft m1: %v", Err)
 	}
 
-	// Record execution: commit M1
-	Committed1, Err := Repo.RecordExecution(Ctx, DBID, M1.ID, &UserID, true, nil)
-	if Err != nil || Committed1.Status != StatusCommitted || Committed1.ExecutedAt == nil {
-		T.Fatalf("failed to commit execution m1: %v", Err)
+	recordSucceeded(T, Repo, Ctx, DBID, UserID, M1.ID, Updated1.SQLText)
+
+	Applied, Err := Repo.Get(Ctx, DBID, M1.ID)
+	if Err != nil || Applied.Status != StatusApplied || Applied.ExecutedAt == nil || Applied.LockedAt == nil {
+		T.Fatalf("failed to refresh applied status: %+v %v", Applied, Err)
 	}
-	if Committed1.ExecutedByUsername == nil || *Committed1.ExecutedByUsername != "test_migrator" {
+	if Applied.ExecutedByUsername == nil || *Applied.ExecutedByUsername != "test_migrator" {
 		T.Fatal("execution response is missing the actor username")
 	}
-
-	// Updating or deleting committed migration must fail
-	if _, Err := Repo.UpdateDraft(Ctx, DBID, M1.ID, MigrationInput{Title: "Hacked", SQLText: "DROP TABLE a;"}); !Errors.Is(Err, ErrAlreadyExecuted) {
-		T.Fatalf("expected ErrAlreadyExecuted when updating committed migration, got %v", Err)
+	if _, Err := Repo.UpdateDraft(Ctx, DBID, M1.ID, MigrationInput{Title: "Hacked", SQLText: "DROP TABLE a;", DownSQL: "SELECT 1;"}); !Errors.Is(Err, ErrLocked) {
+		T.Fatalf("expected ErrLocked when updating executed migration, got %v", Err)
 	}
-	if Err := Repo.DeleteDraft(Ctx, DBID, M1.ID); !Errors.Is(Err, ErrAlreadyExecuted) {
-		T.Fatalf("expected ErrAlreadyExecuted when deleting committed migration, got %v", Err)
+	if Err := Repo.DeleteDraft(Ctx, DBID, M1.ID); !Errors.Is(Err, ErrLocked) {
+		T.Fatalf("expected ErrLocked when deleting executed migration, got %v", Err)
 	}
 
-	// Record execution: rollback M2 with error message
-	ErrMsg := "syntax error at or near INVALID"
-	RolledBack2, Err := Repo.RecordExecution(Ctx, DBID, M2.ID, &UserID, false, &ErrMsg)
-	if Err != nil || RolledBack2.Status != StatusRolledBack || RolledBack2.ErrorMessage == nil || *RolledBack2.ErrorMessage != Driver.ErrExecution.Error() {
-		T.Fatalf("failed to record rolled back execution m2: %v", Err)
-	}
-	var SavedError string
-	if Err := Pool.QueryRow(Ctx, "SELECT error_message FROM migrations WHERE id = $1", M2.ID).Scan(&SavedError); Err != nil || SavedError != Driver.ErrExecution.Error() {
-		T.Fatal("raw PostgreSQL error was persisted")
-	}
-	if _, Err := Pool.Exec(Ctx, "UPDATE migrations SET error_message = 'legacy-private-marker' WHERE id = $1", M2.ID); Err != nil {
+	FailedExec, Err := Repo.CreateExecution(Ctx, DBID, M2.ID, ExecutionRequest{Kind: KindApply, Direction: DirectionUp, SQLText: M2.SQLText, RequestedBy: &UserID})
+	if Err != nil {
 		T.Fatal(Err)
 	}
-	Legacy, Err := Repo.Get(Ctx, DBID, M2.ID)
-	if Err != nil || Legacy.ErrorMessage == nil || *Legacy.ErrorMessage != Driver.ErrExecution.Error() {
-		T.Fatal("legacy PostgreSQL error was exposed")
+	Message := Driver.ErrExecution.Error()
+	Attempt, Err := Repo.CreateAttempt(Ctx, FailedExec.ID, &UserID, M2.SQLText)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := Repo.FinishAttempt(Ctx, Attempt.ID, AttemptFailed, &Message); Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := Repo.FinishExecution(Ctx, FailedExec.ID, ExecutionFailed, &Message); Err != nil {
+		T.Fatal(Err)
+	}
+	Failed, Err := Repo.RefreshStatus(Ctx, DBID, M2.ID)
+	if Err != nil || Failed.Status != StatusFailed || Failed.ErrorMessage == nil || *Failed.ErrorMessage != Driver.ErrExecution.Error() {
+		T.Fatalf("failed to record failed execution m2: %+v %v", Failed, Err)
 	}
 
-	// Create and delete M3 draft
-	M3, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Temporary draft", SQLText: "SELECT 1;"}, &UserID)
+	History, Err := Repo.ListHistory(Ctx, DBID, false)
+	if Err != nil || len(History) != 2 {
+		T.Fatalf("expected two executions, got %v (len %d)", Err, len(History))
+	}
+	if len(History[0].Attempts) != 1 || History[0].Attempts[0].Status != AttemptSucceeded {
+		T.Fatalf("attempt history missing: %+v", History[0])
+	}
+
+	Rollback, Err := Repo.CreateExecution(Ctx, DBID, M1.ID, ExecutionRequest{Kind: KindRollback, Direction: DirectionDown, SQLText: *M1.DownSQL, RollbackOf: &History[0].ID, RequestedBy: &UserID})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	RollbackAttempt, _ := Repo.CreateAttempt(Ctx, Rollback.ID, &UserID, *M1.DownSQL)
+	_ = Repo.FinishAttempt(Ctx, RollbackAttempt.ID, AttemptSucceeded, nil)
+	_ = Repo.FinishExecution(Ctx, Rollback.ID, ExecutionSucceeded, nil)
+	if _, Err := Repo.RefreshStatus(Ctx, DBID, M1.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Full, _ := Repo.ListHistory(Ctx, DBID, false)
+	Hidden, _ := Repo.ListHistory(Ctx, DBID, true)
+	if len(Full) != 3 || len(Hidden) != 1 {
+		T.Fatalf("unexpected history lengths full=%d hidden=%d", len(Full), len(Hidden))
+	}
+	for _, Item := range Hidden {
+		if Item.ID == History[0].ID || Item.ID == Rollback.ID {
+			T.Fatalf("hide rollback kept a cancelled execution: %+v", Item)
+		}
+	}
+
+	M3, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Temporary draft", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"}, &UserID)
 	if Err != nil || M3.Version != 3 {
 		T.Fatalf("failed to create m3: %v", Err)
 	}
@@ -150,7 +175,6 @@ func TestConcurrentMigrationCreationLinearity(T *Testing.T) {
 	Pool := NewMigrationDatabase(T)
 	Repo := &Repository{Pool: Pool}
 	Ctx := Context.Background()
-
 	DBID, UserID := setupFixture(T, Pool)
 
 	const Concurrency = 10
@@ -165,7 +189,7 @@ func TestConcurrentMigrationCreationLinearity(T *Testing.T) {
 			defer WG.Done()
 			Title := Fmt.Sprintf("Concurrent migration #%d", Index)
 			SQL := Fmt.Sprintf("CREATE TABLE concurrent_%d (id INT);", Index)
-			Item, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: Title, SQLText: SQL}, &UserID)
+			Item, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: Title, SQLText: SQL, DownSQL: "DROP TABLE IF EXISTS concurrent_" + Fmt.Sprint(Index) + ";"}, &UserID)
 			Results[Index] = Item
 			ErrorsList[Index] = Err
 		}()
@@ -194,9 +218,8 @@ func TestConcurrentMigrationCreationLinearity(T *Testing.T) {
 		T.Fatalf("expected %d migrations in list, got %v (len %d)", Concurrency, Err, len(List))
 	}
 	for i := 0; i < Concurrency; i++ {
-		ExpectedVersion := int64(i + 1)
-		if List[i].Version != ExpectedVersion {
-			T.Fatalf("index %d expected version %d, got %d", i, ExpectedVersion, List[i].Version)
+		if List[i].Version != int64(i+1) {
+			T.Fatalf("index %d expected version %d, got %d", i, i+1, List[i].Version)
 		}
 	}
 }

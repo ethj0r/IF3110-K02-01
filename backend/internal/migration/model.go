@@ -18,7 +18,7 @@ const (
 )
 
 func (S Status) IsTerminal() bool {
-	return S == StatusCommitted || S == StatusApplied || S == StatusRolledBack || S == StatusFailed
+	return S.IsSuccess() || S == StatusRolledBack || S == StatusFailed
 }
 
 func (S Status) IsSuccess() bool {
@@ -26,30 +26,93 @@ func (S Status) IsSuccess() bool {
 }
 
 func (S Status) IsFailure() bool {
-	return S == StatusRolledBack || S == StatusFailed
+	return S == StatusFailed
 }
 
 func (S Status) IsDraft() bool {
 	return S == StatusDraft
 }
 
+func (S Status) IsApplied() bool {
+	return S.IsSuccess()
+}
+
+func (S Status) IsRolledBack() bool {
+	return S == StatusRolledBack
+}
+
+type ExecutionKind string
+
+const (
+	KindApply    ExecutionKind = "apply"
+	KindRollback ExecutionKind = "rollback"
+	KindForward  ExecutionKind = "forward"
+	KindRetry    ExecutionKind = "retry"
+)
+
+type Direction string
+
+const (
+	DirectionUp   Direction = "up"
+	DirectionDown Direction = "down"
+)
+
+type ExecutionStatus string
+
+const (
+	ExecutionQueued            ExecutionStatus = "queued"
+	ExecutionRunning           ExecutionStatus = "running"
+	ExecutionSucceeded         ExecutionStatus = "succeeded"
+	ExecutionFailed            ExecutionStatus = "failed"
+	ExecutionPartial           ExecutionStatus = "partial"
+	ExecutionPartiallyReverted ExecutionStatus = "partially_reverted"
+)
+
+func (S ExecutionStatus) IsFinished() bool {
+	return S == ExecutionSucceeded || S == ExecutionFailed || S == ExecutionPartial || S == ExecutionPartiallyReverted
+}
+
+func (S ExecutionStatus) IsFailure() bool {
+	return S == ExecutionFailed || S == ExecutionPartial || S == ExecutionPartiallyReverted
+}
+
+type AttemptStatus string
+
+const (
+	AttemptRunning   AttemptStatus = "running"
+	AttemptSucceeded AttemptStatus = "succeeded"
+	AttemptFailed    AttemptStatus = "failed"
+)
+
 var (
-	ErrInvalidInput    = Errors.New("invalid migration input")
-	ErrNotFound        = Errors.New("migration not found")
-	ErrConflict        = Errors.New("migration version already exists")
-	ErrAlreadyExecuted = Errors.New("migration has already been executed")
-	ErrPending         = Errors.New("migration execution outcome requires verification")
-	ErrOutOfOrder      = Errors.New("migration must execute in version order")
-	ErrUnavailable     = Errors.New("migration store is unavailable")
-	ErrForbidden       = Errors.New("permission denied for database migration")
+	ErrInvalidInput     = Errors.New("invalid migration input")
+	ErrNotFound         = Errors.New("migration not found")
+	ErrConflict         = Errors.New("migration version already exists")
+	ErrAlreadyExecuted  = Errors.New("migration has already been executed")
+	ErrPending          = Errors.New("migration execution outcome requires verification")
+	ErrOutOfOrder       = Errors.New("migration must execute in version order")
+	ErrUnavailable      = Errors.New("migration store is unavailable")
+	ErrForbidden        = Errors.New("permission denied for database migration")
+	ErrIrreversible     = Errors.New("migration is irreversible")
+	ErrNotApplied       = Errors.New("migration is not currently applied")
+	ErrNotRolledBack    = Errors.New("migration is not currently rolled back")
+	ErrRollbackOrder    = Errors.New("only the last active migration can be rolled back")
+	ErrForwardOrder     = Errors.New("migration must be forwarded in linear order")
+	ErrLocked           = Errors.New("migration definition is locked")
+	ErrNoFailedAttempt  = Errors.New("migration has no failed execution to retry")
+	ErrExecutionMissing = Errors.New("migration execution not found")
 )
 
 type Migration struct {
 	ID                 string     `json:"id"`
 	DatabaseID         string     `json:"database_id"`
 	Version            int64      `json:"version"`
+	Revision           int64      `json:"revision"`
 	Title              string     `json:"title"`
 	SQLText            string     `json:"sql_text"`
+	DownSQL            *string    `json:"down_sql,omitempty"`
+	Irreversible       bool       `json:"irreversible"`
+	IrreversibleReason *string    `json:"irreversible_reason,omitempty"`
 	Status             Status     `json:"status"`
 	ErrorMessage       *string    `json:"error_message,omitempty"`
 	CreatedBy          *string    `json:"created_by,omitempty"`
@@ -58,11 +121,19 @@ type Migration struct {
 	CreatedAt          Time.Time  `json:"created_at"`
 	UpdatedAt          Time.Time  `json:"updated_at"`
 	ExecutedAt         *Time.Time `json:"executed_at,omitempty"`
+	LockedAt           *Time.Time `json:"locked_at,omitempty"`
+	CanApply           bool       `json:"can_apply"`
+	CanRollback        bool       `json:"can_rollback"`
+	CanForward         bool       `json:"can_forward"`
+	CanRetry           bool       `json:"can_retry"`
 }
 
 type MigrationInput struct {
-	Title   string `json:"title"`
-	SQLText string `json:"sql_text"`
+	Title              string `json:"title"`
+	SQLText            string `json:"sql_text"`
+	DownSQL            string `json:"down_sql"`
+	Irreversible       bool   `json:"irreversible"`
+	IrreversibleReason string `json:"irreversible_reason"`
 }
 
 func (Input MigrationInput) Validate() error {
@@ -70,8 +141,16 @@ func (Input MigrationInput) Validate() error {
 	if len(Title) < 1 || len(Title) > 128 {
 		return ErrInvalidInput
 	}
-	SQLText := Strings.TrimSpace(Input.SQLText)
-	if len(SQLText) < 1 {
+	if len(Strings.TrimSpace(Input.SQLText)) < 1 {
+		return ErrInvalidInput
+	}
+	if Input.Irreversible {
+		if len(Strings.TrimSpace(Input.DownSQL)) > 0 || len(Strings.TrimSpace(Input.IrreversibleReason)) < 1 || len(Input.IrreversibleReason) > 500 {
+			return ErrInvalidInput
+		}
+		return nil
+	}
+	if len(Strings.TrimSpace(Input.DownSQL)) < 1 {
 		return ErrInvalidInput
 	}
 	return nil
@@ -79,7 +158,50 @@ func (Input MigrationInput) Validate() error {
 
 func (Input MigrationInput) Normalized() MigrationInput {
 	return MigrationInput{
-		Title:   Strings.TrimSpace(Input.Title),
-		SQLText: Strings.TrimSpace(Input.SQLText),
+		Title:              Strings.TrimSpace(Input.Title),
+		SQLText:            Strings.TrimSpace(Input.SQLText),
+		DownSQL:            Strings.TrimSpace(Input.DownSQL),
+		Irreversible:       Input.Irreversible,
+		IrreversibleReason: Strings.TrimSpace(Input.IrreversibleReason),
 	}
+}
+
+type Execution struct {
+	ID                    string          `json:"id"`
+	MigrationID           string          `json:"migration_id"`
+	DatabaseID            string          `json:"database_id"`
+	Version               int64           `json:"version"`
+	Revision              int64           `json:"revision"`
+	Title                 string          `json:"title"`
+	Kind                  ExecutionKind   `json:"kind"`
+	Direction             Direction       `json:"direction"`
+	Status                ExecutionStatus `json:"status"`
+	SQLText               string          `json:"sql_text"`
+	UpSQL                 string          `json:"up_sql"`
+	DownSQL               *string         `json:"down_sql,omitempty"`
+	RollbackOfExecutionID *string         `json:"rollback_of_execution_id,omitempty"`
+	RetryOfExecutionID    *string         `json:"retry_of_execution_id,omitempty"`
+	RequestedBy           *string         `json:"requested_by,omitempty"`
+	RequestedByUsername   *string         `json:"requested_by_username,omitempty"`
+	CreatedAt             Time.Time       `json:"created_at"`
+	StartedAt             *Time.Time      `json:"started_at,omitempty"`
+	FinishedAt            *Time.Time      `json:"finished_at,omitempty"`
+	ErrorMessage          *string         `json:"error_message,omitempty"`
+	Attempts              []Attempt       `json:"attempts"`
+}
+
+type Attempt struct {
+	ID             string        `json:"id"`
+	ExecutionID    string        `json:"execution_id"`
+	AttemptNo      int           `json:"attempt_no"`
+	Version        int64         `json:"version"`
+	Revision       int64         `json:"revision"`
+	ActorID        *string       `json:"actor_id,omitempty"`
+	ActorUsername  *string       `json:"actor_username,omitempty"`
+	SQLText        string        `json:"sql_text"`
+	Status         AttemptStatus `json:"status"`
+	ErrorMessage   *string       `json:"error_message,omitempty"`
+	StartedAt      Time.Time     `json:"started_at"`
+	FinishedAt     *Time.Time    `json:"finished_at,omitempty"`
+	DurationMillis *int64        `json:"duration_ms,omitempty"`
 }

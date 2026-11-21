@@ -92,6 +92,7 @@ func TestServiceRealDatabaseExecution(T *Testing.T) {
 		Title: "Create real table",
 		SQLText: `CREATE TABLE test_real_table (id SERIAL PRIMARY KEY, val TEXT);
 INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay text$value$);`,
+		DownSQL: "DROP TABLE test_real_table;",
 	}
 	Created, Err := Service.Create(Ctx, Editor, DBID, ValidInput)
 	if Err != nil {
@@ -102,8 +103,8 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	if Err != nil {
 		T.Fatalf("failed to execute real migration: %v", Err)
 	}
-	if Executed.Status != StatusCommitted || Executed.ExecutedAt == nil {
-		T.Fatalf("expected committed status, got %+v", Executed)
+	if Executed.Status != ExecutionSucceeded || Executed.FinishedAt == nil || len(Executed.Attempts) != 1 {
+		T.Fatalf("expected committed execution, got %+v", Executed)
 	}
 
 	// Verify table exists on target DB
@@ -120,6 +121,7 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	BrokenInput := MigrationInput{
 		Title:   "Broken SQL migration",
 		SQLText: "CREATE TABLE test_broken_table (id INT); SELECT 1/0;",
+		DownSQL: "DROP TABLE test_broken_table;",
 	}
 	CreatedBroken, Err := Service.Create(Ctx, Editor, DBID, BrokenInput)
 	if Err != nil {
@@ -130,8 +132,8 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	if !Errors.Is(Err, Driver.ErrExecution) {
 		T.Fatalf("expected ErrExecution, got %v", Err)
 	}
-	if ExecutedBroken.Status != StatusRolledBack || ExecutedBroken.ErrorMessage == nil {
-		T.Fatalf("expected rolled_back status with error recorded, got %+v", ExecutedBroken)
+	if ExecutedBroken.Status != ExecutionFailed || ExecutedBroken.ErrorMessage == nil {
+		T.Fatalf("expected failed execution with error recorded, got %+v", ExecutedBroken)
 	}
 
 	// Verify table was rolled back and does NOT exist in target database
@@ -144,12 +146,12 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 		"CREATE TABLE escaped (id int); DO $body$ BEGIN COMMIT; END $body$;",
 		"CREATE TABLE escaped (id int); DO $$ BEGIN RAISE EXCEPTION 'private-marker'; END $$;",
 	} {
-		Item, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{Title: "Atomic script", SQLText: Script})
+		Item, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{Title: "Atomic script", SQLText: Script, DownSQL: "SELECT 1;"})
 		if Err != nil {
 			T.Fatal(Err)
 		}
 		Result, Err := Service.Execute(Ctx, Editor, DBID, Item.ID)
-		if !Errors.Is(Err, Driver.ErrExecution) || Result.Status != StatusRolledBack || Result.ErrorMessage == nil || *Result.ErrorMessage != Driver.ErrExecution.Error() {
+		if !Errors.Is(Err, Driver.ErrExecution) || Result.Status != ExecutionFailed || Result.ErrorMessage == nil || *Result.ErrorMessage != Driver.ErrExecution.Error() {
 			T.Fatalf("script failure must be sanitized and rolled back: %+v %v", Result, Err)
 		}
 		if Err := TargetPool.QueryRow(Ctx, "SELECT to_regclass('escaped') IS NOT NULL").Scan(&Exists); Err != nil || Exists {
@@ -181,11 +183,11 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 	if _, Err := Target.Exec(Ctx, "CREATE TABLE effects (id int)"); Err != nil {
 		T.Fatal(Err)
 	}
-	First, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "First", SQLText: "INSERT INTO effects VALUES (1)"})
+	First, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "First", SQLText: "INSERT INTO effects VALUES (1)", DownSQL: "DELETE FROM effects WHERE id = 1"})
 	if Err != nil {
 		T.Fatal(Err)
 	}
-	Second, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "Second", SQLText: "INSERT INTO effects VALUES (2)"})
+	Second, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "Second", SQLText: "INSERT INTO effects VALUES (2)", DownSQL: "DELETE FROM effects WHERE id = 2"})
 	if Err != nil {
 		T.Fatal(Err)
 	}
@@ -206,7 +208,7 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 	Results := make(chan error, 3)
 	go func() { _, Err := Server.Execute(Ctx, User, Strings.ToUpper(DBID), First.ID); Results <- Err }()
 	go func() {
-		_, Err := Server.UpdateDraft(Ctx, User, Strings.ReplaceAll(DBID, "-", ""), First.ID, MigrationInput{Title: "Changed", SQLText: "DELETE FROM effects"})
+		_, Err := Server.UpdateDraft(Ctx, User, Strings.ReplaceAll(DBID, "-", ""), First.ID, MigrationInput{Title: "Changed", SQLText: "DELETE FROM effects", DownSQL: "SELECT 1"})
 		Results <- Err
 	}()
 	go func() { Results <- Server.DeleteDraft(Ctx, User, DBID, First.ID) }()
@@ -215,12 +217,12 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 		T.Fatal(Err)
 	}
 	for Index := 0; Index < 3; Index++ {
-		if Err := <-Results; !Errors.Is(Err, ErrAlreadyExecuted) {
+		if Err := <-Results; !Errors.Is(Err, ErrAlreadyExecuted) && !Errors.Is(Err, ErrLocked) {
 			T.Fatalf("concurrent mutation was accepted: %v", Err)
 		}
 	}
 	Stored, Err := Repo.Get(Ctx, DBID, First.ID)
-	if Err != nil || Stored.SQLText != First.SQLText || Stored.Status != StatusCommitted {
+	if Err != nil || Stored.SQLText != First.SQLText || Stored.Status != StatusApplied {
 		T.Fatalf("history does not match execution: %+v %v", Stored, Err)
 	}
 	var Count int

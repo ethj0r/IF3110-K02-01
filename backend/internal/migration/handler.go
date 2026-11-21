@@ -9,6 +9,7 @@ import (
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Http "net/http"
+	Strconv "strconv"
 )
 
 type Handler struct {
@@ -24,10 +25,15 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Get(Prefix, Routes.List)
 			R.Post(Prefix, Routes.Create)
 			R.Post(Prefix+"/analyze", Routes.Analyze)
+			R.Get(Prefix+"/history", Routes.History)
 			R.Get(Prefix+"/{migrationID}", Routes.Show)
 			R.Put(Prefix+"/{migrationID}", Routes.Update)
 			R.Delete(Prefix+"/{migrationID}", Routes.Delete)
 			R.Post(Prefix+"/{migrationID}/execute", Routes.Execute)
+			R.Post(Prefix+"/{migrationID}/apply", Routes.Apply)
+			R.Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
+			R.Post(Prefix+"/{migrationID}/forward", Routes.Forward)
+			R.Post(Prefix+"/{migrationID}/retry", Routes.Retry)
 		})
 	}
 	registerRoutes("/databases/{dbID}/migrations")
@@ -65,6 +71,22 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 409, "execution_pending", "Verify the previous execution outcome before retrying")
 	case Errors.Is(Err, ErrConflict):
 		Httpx.Error(W, 409, "conflict", "Migration version conflict")
+	case Errors.Is(Err, ErrLocked):
+		Httpx.Error(W, 409, "migration_locked", "Executed migration definitions are immutable")
+	case Errors.Is(Err, ErrIrreversible):
+		Httpx.Error(W, 409, "irreversible", "Irreversible migrations cannot be rolled back")
+	case Errors.Is(Err, ErrNotApplied):
+		Httpx.Error(W, 409, "not_applied", "Migration is not currently applied")
+	case Errors.Is(Err, ErrNotRolledBack):
+		Httpx.Error(W, 409, "not_rolled_back", "Migration is not currently rolled back")
+	case Errors.Is(Err, ErrRollbackOrder):
+		Httpx.Error(W, 409, "rollback_order", "Only the last active migration can be rolled back")
+	case Errors.Is(Err, ErrForwardOrder):
+		Httpx.Error(W, 409, "forward_order", "Migration must be forwarded in linear order")
+	case Errors.Is(Err, ErrNoFailedAttempt):
+		Httpx.Error(W, 409, "no_failed_attempt", "Migration has no failed execution to retry")
+	case Errors.Is(Err, ErrExecutionMissing):
+		Httpx.Error(W, 404, "execution_not_found", "Migration execution not found")
 	case Errors.Is(Err, Driver.ErrExecution):
 		Httpx.Error(W, 422, "execution_failed", "Target database migration execution failed")
 	case Errors.Is(Err, Driver.ErrUnavailable), Errors.Is(Err, ErrUnavailable):
@@ -144,6 +166,74 @@ func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	DBID := Chi.URLParam(R, "dbID")
 	ID := Chi.URLParam(R, "migrationID")
 	Result, Err := Routes.Service.Execute(R.Context(), User, DBID, ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) History(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	HideRollback := false
+	if Raw := R.URL.Query().Get("hide_rollback"); Raw != "" {
+		Parsed, Err := Strconv.ParseBool(Raw)
+		if Err != nil {
+			Httpx.Error(W, 400, "invalid_request", "hide_rollback must be a boolean")
+			return
+		}
+		HideRollback = Parsed
+	}
+	Result, Err := Routes.Service.History(R.Context(), User, DBID, HideRollback)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Apply(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	ID := Chi.URLParam(R, "migrationID")
+	Result, Err := Routes.Service.Apply(R.Context(), User, DBID, ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Rollback(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	ID := Chi.URLParam(R, "migrationID")
+	Result, Err := Routes.Service.Rollback(R.Context(), User, DBID, ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Forward(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	ID := Chi.URLParam(R, "migrationID")
+	Result, Err := Routes.Service.Forward(R.Context(), User, DBID, ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Retry(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	DBID := Chi.URLParam(R, "dbID")
+	ID := Chi.URLParam(R, "migrationID")
+	Result, Err := Routes.Service.Retry(R.Context(), User, DBID, ID)
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return

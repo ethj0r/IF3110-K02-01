@@ -8,14 +8,21 @@ import { RequestError } from '../components/Feedback'
 import {
   AnalyzeQueryPlan,
   ApiError,
+  ApplyMigration,
   CreateMigration,
   DeleteMigrationDraft,
-  ExecuteMigration,
+  ForwardMigration,
+  ListMigrationHistory,
   ListMigrations,
+  RetryMigration,
+  RollbackMigration,
   UpdateMigrationDraft,
   type Migration,
+  type MigrationExecution,
   type QueryPlanAnalysis,
 } from '../api/client'
+
+type Action = 'apply' | 'rollback' | 'forward' | 'retry'
 
 export function MigrationsPage() {
   const { dbId = '' } = useParams<{ dbId?: string }>()
@@ -28,93 +35,107 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const NavigateTo = useNavigate()
   const Databases = useQuery({ queryKey: AccessQueryKeys.databases, queryFn: ListAccessibleDatabases })
   const Database = Databases.data?.find(Item => Item.id === ActiveDatabase)
+  const QueryCache = useQueryClient()
   const [SelectedMigrationID, setSelectedMigrationID] = useState<string | null>(null)
+  const [SelectedExecutionID, setSelectedExecutionID] = useState<string | null>(null)
   const [IsEditorOpen, setIsEditorOpen] = useState(Boolean(InitialDraft))
   const [EditingMigration, setEditingMigration] = useState<Migration | null>(null)
   const [EditorTitle, setEditorTitle] = useState(InitialDraft?.Title ?? '')
   const [EditorSQL, setEditorSQL] = useState(InitialDraft?.SQLText ?? '')
+  const [EditorDownSQL, setEditorDownSQL] = useState('')
+  const [EditorIrreversible, setEditorIrreversible] = useState(false)
+  const [EditorReason, setEditorReason] = useState('')
+  const [HideRollback, setHideRollback] = useState(false)
   const [ExecutionError, setExecutionError] = useState<string | null>(null)
   const [SuccessMessage, setSuccessMessage] = useState<string | null>(null)
-
-  const QueryCache = useQueryClient()
 
   const MigrationsQuery = useQuery({
     queryKey: ['migrations', ActiveDatabase],
     queryFn: ({ signal }) => ListMigrations(ActiveDatabase, signal),
     enabled: Boolean(Database),
   })
-  const History = MigrationsQuery.data ?? []
-  const SelectedMigration = History.find(Item => Item.id === SelectedMigrationID)
+  const HistoryQuery = useQuery({
+    queryKey: ['migrations', ActiveDatabase, 'history', HideRollback],
+    queryFn: ({ signal }) => ListMigrationHistory(ActiveDatabase, HideRollback, signal),
+    enabled: Boolean(Database),
+  })
+  const Definitions = MigrationsQuery.data ?? []
+  const History = HistoryQuery.data ?? []
+  const SelectedMigration = Definitions.find(Item => Item.id === SelectedMigrationID)
+  const SelectedExecution = History.find(Item => Item.id === SelectedExecutionID)
   const CanEdit = Database?.level === 'view_edit' && !MigrationsQuery.isError
-  const Pending = History.some(Item => Item.status === 'pending')
-  const LastAttempt = Math.max(0, ...History.filter(Item => Item.status !== 'draft').map(Item => Item.version))
-  const CanExecute = (Item: Migration) => !Pending && Item.version >= LastAttempt &&
-    !History.some(Earlier => Earlier.version < Item.version && Earlier.status === 'draft')
+  const HasPending = Definitions.some(Item => Item.status === 'pending')
+
+  function Refresh() {
+    void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+    void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
+  }
 
   const SaveMutation = useMutation({
     mutationFn: async () => {
-      if (EditingMigration) {
-        return UpdateMigrationDraft(ActiveDatabase, EditingMigration.id, {
-          title: EditorTitle,
-          sql_text: EditorSQL,
-        })
-      }
-      return CreateMigration(ActiveDatabase, {
+      const Input = {
         title: EditorTitle,
         sql_text: EditorSQL,
-      })
+        down_sql: EditorIrreversible ? '' : EditorDownSQL,
+        irreversible: EditorIrreversible,
+        irreversible_reason: EditorIrreversible ? EditorReason : '',
+      }
+      if (EditingMigration) return UpdateMigrationDraft(ActiveDatabase, EditingMigration.id, Input)
+      return CreateMigration(ActiveDatabase, Input)
     },
     onSuccess: () => {
       setIsEditorOpen(false)
       setEditingMigration(null)
-      setEditorTitle('')
-      setEditorSQL('')
+      resetEditor()
       setSuccessMessage('Migration draft saved successfully.')
-      void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+      Refresh()
     },
   })
 
-  const ExecuteMutation = useMutation({
-    mutationFn: (MigrationID: string) => ExecuteMigration(ActiveDatabase, MigrationID),
+  const ActionMutation = useMutation({
+    mutationFn: ({ ID, Action }: { ID: string; Action: Action }) => {
+      switch (Action) {
+        case 'rollback': return RollbackMigration(ActiveDatabase, ID)
+        case 'forward': return ForwardMigration(ActiveDatabase, ID)
+        case 'retry': return RetryMigration(ActiveDatabase, ID)
+        default: return ApplyMigration(ActiveDatabase, ID)
+      }
+    },
     onSuccess: Executed => {
       setExecutionError(null)
-      setSuccessMessage(`Migration v${Executed.version} committed successfully!`)
-      void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
-      void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
+      setSuccessMessage(`${ActionLabel(Executed.kind)} v${Executed.version} finished with status ${Executed.status}.`)
+      Refresh()
     },
     onError: Error => {
-      if (Error instanceof ApiError) {
-        setExecutionError(Error.message)
-      } else {
-        setExecutionError('Unable to confirm execution. Reload history before retrying.')
-      }
-      void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+      setExecutionError(Error instanceof ApiError ? Error.message : 'Unable to complete the migration action.')
+      Refresh()
     },
   })
 
   const DeleteMutation = useMutation({
-    mutationFn: (MigrationID: string) => DeleteMigrationDraft(ActiveDatabase, MigrationID),
+    mutationFn: (ID: string) => DeleteMigrationDraft(ActiveDatabase, ID),
     onSuccess: () => {
       setSuccessMessage('Draft migration deleted.')
       setSelectedMigrationID(null)
-      void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+      Refresh()
     },
   })
 
-  const DetailsAnalyze = useMutation({
-    mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText),
-  })
+  const DetailsAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
+  const EditorAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
+  const Busy = SaveMutation.isPending || ActionMutation.isPending || DeleteMutation.isPending
 
-  const EditorAnalyze = useMutation({
-    mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText),
-  })
-
-  const Busy = SaveMutation.isPending || ExecuteMutation.isPending || DeleteMutation.isPending
+  function resetEditor() {
+    setEditorTitle('')
+    setEditorSQL('')
+    setEditorDownSQL('')
+    setEditorIrreversible(false)
+    setEditorReason('')
+  }
 
   function openCreateEditor() {
     setEditingMigration(null)
-    setEditorTitle('')
-    setEditorSQL('')
+    resetEditor()
     setIsEditorOpen(true)
     setExecutionError(null)
     EditorAnalyze.reset()
@@ -124,23 +145,24 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     setEditingMigration(Item)
     setEditorTitle(Item.title)
     setEditorSQL(Item.sql_text)
+    setEditorDownSQL(Item.down_sql ?? '')
+    setEditorIrreversible(Item.irreversible)
+    setEditorReason(Item.irreversible_reason ?? '')
     setIsEditorOpen(true)
     setExecutionError(null)
     EditorAnalyze.reset()
   }
 
-  function handleExecute(Item: Migration) {
-    if (window.confirm(`Are you sure you want to execute migration v${Item.version} ("${Item.title}") in transaction?`)) {
-      setSuccessMessage(null)
-      setExecutionError(null)
-      ExecuteMutation.mutate(Item.id)
-    }
+  function handleAction(Item: Migration, Action: Action) {
+    const Label = ActionLabel(Action)
+    if (!window.confirm(`${Label} migration v${Item.version} ("${Item.title}")?`)) return
+    setSuccessMessage(null)
+    setExecutionError(null)
+    ActionMutation.mutate({ ID: Item.id, Action })
   }
 
   function handleDelete(Item: Migration) {
-    if (window.confirm(`Delete draft migration v${Item.version}?`)) {
-      DeleteMutation.mutate(Item.id)
-    }
+    if (window.confirm(`Delete draft migration v${Item.version}?`)) DeleteMutation.mutate(Item.id)
   }
 
   return (
@@ -154,7 +176,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       </header>
 
       <h1>Database Migrations</h1>
-      <p>Manage, inspect, and execute strictly linear transactional database migrations.</p>
+      <p>Manage immutable up/down migrations, inspect every execution attempt, and roll back or forward the active migration.</p>
 
       <section style={{ marginBottom: '2rem' }}>
         <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
@@ -181,22 +203,20 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           {SuccessMessage}
         </div>
       )}
-
       {ExecutionError && (
         <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem 1rem', borderRadius: '4px', marginBottom: '1rem' }}>
-          <strong>Execution Error:</strong> {ExecutionError}
+          <strong>Migration Action Failed:</strong> {ExecutionError}
         </div>
       )}
 
       {Database && (
         <section>
           <div className="migration-toolbar">
-            <h2>Migration History (Linear)</h2>
+            <h2>Migration Definitions</h2>
             {CanEdit && <button disabled={Busy} onClick={openCreateEditor}>+ Create Migration</button>}
           </div>
-          {Pending && <p role="status">Execution is pending. If it remains pending after a failure, ask an administrator to verify the target outcome before retrying.</p>}
-
-          {MigrationsQuery.isPending && <p role="status">Loading migration history…</p>}
+          {HasPending && <p role="status">An execution is pending. Verify the target outcome before retrying.</p>}
+          {MigrationsQuery.isPending && <p role="status">Loading migrations…</p>}
           {MigrationsQuery.isError && (
             <p role="alert" style={{ color: '#c5221f' }}>
               {MigrationsQuery.error instanceof ApiError ? MigrationsQuery.error.message : 'Failed to load migrations.'}
@@ -204,101 +224,108 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           )}
 
           {MigrationsQuery.data && (
-            <>
-              {MigrationsQuery.data.length === 0 ? (
-                <p>No migrations recorded for this database yet.</p>
-              ) : (
-                <div className="table-wrap"><table className="data-table migration-table" style={{ marginBottom: '1.5rem' }}>
-                  <thead>
-                    <tr style={{ borderBottom: '2px solid #ccc' }}>
-                      <th style={{ padding: '0.5rem' }}>Version</th>
-                      <th style={{ padding: '0.5rem' }}>Title</th>
-                      <th style={{ padding: '0.5rem' }}>Status</th>
-                      <th style={{ padding: '0.5rem' }}>Executed At</th>
-                      <th style={{ padding: '0.5rem' }}>Executed By</th>
-                      <th style={{ padding: '0.5rem' }}>Actions</th>
+            MigrationsQuery.data.length === 0 ? <p>No migrations recorded for this database yet.</p> : (
+              <div className="table-wrap"><table className="data-table migration-table" style={{ marginBottom: '1.5rem' }}>
+                <thead>
+                  <tr>
+                    <th>Version</th>
+                    <th>Title</th>
+                    <th>Status</th>
+                    <th>Revision</th>
+                    <th>Updated</th>
+                    <th>Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {MigrationsQuery.data.map(Item => (
+                    <tr key={Item.id}>
+                      <td style={{ fontWeight: 'bold' }}>v{Item.version}</td>
+                      <td>
+                        {Item.title}
+                        {Item.irreversible && <span className="badge" style={{ marginLeft: '0.4rem' }}>irreversible</span>}
+                      </td>
+                      <td><StatusBadge Status={Item.status} /></td>
+                      <td>{Item.revision}</td>
+                      <td style={{ fontSize: '0.9rem', color: '#555' }}>{new Date(Item.updated_at).toLocaleString()}</td>
+                      <td>
+                        <div className="row-actions migration-row-actions">
+                          <button onClick={() => { setSelectedMigrationID(Item.id); DetailsAnalyze.reset() }} style={{ fontSize: '0.85rem' }}>View</button>
+                          {CanEdit && Item.status === 'draft' && (
+                            <>
+                              <button disabled={Busy} onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>Edit</button>
+                              <button disabled={Busy || !Item.can_apply} onClick={() => handleAction(Item, 'apply')} style={{ fontSize: '0.85rem', fontWeight: 'bold', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Apply</button>
+                              <button disabled={Busy} onClick={() => handleDelete(Item)} style={{ fontSize: '0.85rem', color: '#c5221f' }}>Delete</button>
+                            </>
+                          )}
+                          {CanEdit && Item.can_rollback && (
+                            <button disabled={Busy} onClick={() => handleAction(Item, 'rollback')} style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Rollback</button>
+                          )}
+                          {CanEdit && Item.can_forward && (
+                            <button disabled={Busy} onClick={() => handleAction(Item, 'forward')} style={{ fontSize: '0.85rem', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Forward</button>
+                          )}
+                          {CanEdit && Item.can_retry && (
+                            <button disabled={Busy} onClick={() => handleAction(Item, 'retry')} style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Retry</button>
+                          )}
+                        </div>
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {MigrationsQuery.data.map(Item => (
-                      <tr key={Item.id} style={{ borderBottom: '1px solid #eee' }}>
-                        <td style={{ padding: '0.5rem', fontWeight: 'bold' }}>v{Item.version}</td>
-                        <td style={{ padding: '0.5rem' }}>{Item.title}</td>
-                        <td style={{ padding: '0.5rem' }}>
-                          <span
-                            className="migration-status"
-                            style={{
-                              padding: '0.2rem 0.5rem',
-                              borderRadius: '4px',
-                              fontSize: '0.85rem',
-                              fontWeight: '600',
-                              background:
-                                Item.status === 'committed' || Item.status === 'applied'
-                                  ? '#e6f4ea'
-                                  : Item.status === 'rolled_back' || Item.status === 'failed'
-                                    ? '#fce8e6'
-                                    : '#fef7e0',
-                              color:
-                                Item.status === 'committed' || Item.status === 'applied'
-                                  ? '#137333'
-                                  : Item.status === 'rolled_back' || Item.status === 'failed'
-                                    ? '#c5221f'
-                                    : '#b06000',
-                            }}
-                          >
-                            {Item.status}
-                          </span>
-                        </td>
-                        <td style={{ padding: '0.5rem', fontSize: '0.9rem', color: '#555' }}>
-                          {Item.executed_at ? new Date(Item.executed_at).toLocaleString() : '—'}
-                        </td>
-                        <td style={{ padding: '0.5rem' }}>{Item.executed_by_username ?? Item.executed_by ?? '—'}</td>
-                        <td style={{ padding: '0.5rem' }}>
-                          <div className="row-actions migration-row-actions">
-                            <button
-                              onClick={() => {
-                                setSelectedMigrationID(Item.id)
-                                DetailsAnalyze.reset()
-                              }}
-                              style={{ fontSize: '0.85rem' }}
-                            >
-                              View
-                            </button>
-                            {CanEdit && Item.status === 'draft' && (
-                              <>
-                                <button disabled={Busy} onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>
-                                  Edit
-                                </button>
-                                <button
-                                  onClick={() => handleExecute(Item)}
-                                  disabled={Busy || !CanExecute(Item)}
-                                  style={{ fontSize: '0.85rem', fontWeight: 'bold', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
-                                >
-                                  Execute
-                                </button>
-                                <button disabled={Busy} onClick={() => handleDelete(Item)} style={{ fontSize: '0.85rem', color: '#c5221f' }}>
-                                  Delete
-                                </button>
-                              </>
-                            )}
-                            {CanEdit && (Item.status === 'rolled_back' || Item.status === 'failed') && (
-                              <button
-                                onClick={() => handleExecute(Item)}
-                                disabled={Busy || !CanExecute(Item)}
-                                style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem', cursor: 'pointer' }}
-                              >
-                                Retry
-                              </button>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table></div>
-              )}
-            </>
+                  ))}
+                </tbody>
+              </table></div>
+            )
           )}
+        </section>
+      )}
+
+      {Database && (
+        <section style={{ marginTop: '1.5rem' }}>
+          <div className="migration-toolbar">
+            <h2>Execution History</h2>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', fontSize: '0.9rem' }}>
+              <input type="checkbox" checked={HideRollback} onChange={Event => setHideRollback(Event.target.checked)} />
+              Hide rollback
+            </label>
+          </div>
+          <p className="muted">Rollback pairs are hidden by execution ID. Failed attempts remain visible.</p>
+          {HistoryQuery.isPending && <p role="status">Loading execution history…</p>}
+          {HistoryQuery.isError && <p role="alert">Failed to load execution history.</p>}
+          {HistoryQuery.data && (
+            HistoryQuery.data.length === 0 ? <p>No execution attempts recorded.</p> : (
+              <div className="table-wrap"><table className="data-table migration-table">
+                <thead>
+                  <tr>
+                    <th>Execution</th>
+                    <th>Version</th>
+                    <th>Action</th>
+                    <th>Status</th>
+                    <th>Attempts</th>
+                    <th>Requested By</th>
+                    <th>Started</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {HistoryQuery.data.map(Item => (
+                    <tr key={Item.id}>
+                      <td><code title={Item.id}>{Item.id.slice(0, 8)}</code></td>
+                      <td>v{Item.version} · {Item.title}</td>
+                      <td>{ActionLabel(Item.kind)}{Item.direction === 'down' ? ' (down)' : ''}</td>
+                      <td><ExecutionBadge Status={Item.status} /></td>
+                      <td>{Item.attempts.length}</td>
+                      <td>{Item.requested_by_username ?? Item.requested_by ?? '—'}</td>
+                      <td style={{ fontSize: '0.9rem', color: '#555' }}>{new Date(Item.started_at ?? Item.created_at).toLocaleString()}</td>
+                      <td>
+                        <button className="ghost small" onClick={() => setSelectedExecutionID(Item.id === SelectedExecutionID ? null : Item.id)}>
+                          {Item.id === SelectedExecutionID ? 'Close' : 'Inspect'}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table></div>
+            )
+          )}
+          {SelectedExecution && <ExecutionDetails Execution={SelectedExecution} />}
         </section>
       )}
 
@@ -310,163 +337,50 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           </div>
           <p>
             <strong>Status:</strong> {SelectedMigration.status} &nbsp;|&nbsp;
-            <strong>Created:</strong> {new Date(SelectedMigration.created_at).toLocaleString()} &nbsp;|&nbsp;
-            <strong>Executed:</strong> {SelectedMigration.executed_at ? new Date(SelectedMigration.executed_at).toLocaleString() : 'Not executed'}
-            {' '}| <strong>Executed by:</strong> {SelectedMigration.executed_by_username ?? SelectedMigration.executed_by ?? '—'}
+            <strong>Revision:</strong> {SelectedMigration.revision} &nbsp;|&nbsp;
+            <strong>Updated:</strong> {new Date(SelectedMigration.updated_at).toLocaleString()}
+            {SelectedMigration.executed_at && <> &nbsp;|&nbsp; <strong>Last applied:</strong> {new Date(SelectedMigration.executed_at).toLocaleString()}</>}
           </p>
-
           {SelectedMigration.error_message && (
             <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem' }}>
-              <strong>Execution Rollback Reason:</strong>
-              <pre style={{ margin: '0.5rem 0 0 0', whiteSpace: 'pre-wrap' }}>{SelectedMigration.error_message}</pre>
+              <strong>Last Error:</strong><pre style={{ margin: '0.5rem 0 0 0', whiteSpace: 'pre-wrap' }}>{SelectedMigration.error_message}</pre>
             </div>
           )}
-
-          <div>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
-              <strong>SQL Script:</strong>
-              <button
-                type="button"
-                className="secondary"
-                disabled={DetailsAnalyze.isPending}
-                onClick={() => DetailsAnalyze.mutate(SelectedMigration.sql_text)}
-                style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}
-              >
-                {DetailsAnalyze.isPending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}
-              </button>
-            </div>
-            <pre
-              style={{
-                background: '#1e1e1e',
-                color: '#d4d4d4',
-                padding: '1rem',
-                borderRadius: '4px',
-                overflowX: 'auto',
-                fontSize: '0.9rem',
-                fontFamily: 'monospace',
-              }}
-            >
-              {SelectedMigration.sql_text}
-            </pre>
-          </div>
-
-          {DetailsAnalyze.isPending && (
-            <p role="status" style={{ fontSize: '0.85rem', color: 'var(--muted)', marginTop: '0.75rem' }}>
-              Running EXPLAIN (ANALYZE) in rollback transaction…
-            </p>
-          )}
-
-          {DetailsAnalyze.isError && (
-            <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginTop: '0.75rem', fontSize: '0.85rem' }}>
-              <strong>Plan Analysis Failed:</strong>{' '}
-              {DetailsAnalyze.error instanceof ApiError ? DetailsAnalyze.error.message : 'Unable to analyze query plan.'}
-              <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
-                <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
-              </div>
-            </div>
-          )}
-
-          {DetailsAnalyze.data && (
-            <PlanAnalysisReport Analysis={DetailsAnalyze.data} onDismiss={() => DetailsAnalyze.reset()} />
-          )}
+          <SQLBlock Label="Up SQL" SQL={SelectedMigration.sql_text} OnAnalyze={() => DetailsAnalyze.mutate(SelectedMigration.sql_text)} Pending={DetailsAnalyze.isPending} />
+          <SQLBlock Label={SelectedMigration.irreversible ? 'Down SQL (irreversible)' : 'Down SQL'} SQL={SelectedMigration.down_sql ?? '—'} />
+          {SelectedMigration.irreversible && <p className="muted">Reason: {SelectedMigration.irreversible_reason}</p>}
+          {DetailsAnalyze.isError && <p role="alert" style={{ color: '#c5221f' }}>Plan analysis failed: {DetailsAnalyze.error instanceof ApiError ? DetailsAnalyze.error.message : 'Unable to analyze query plan.'}</p>}
+          {DetailsAnalyze.data && <PlanAnalysisReport Analysis={DetailsAnalyze.data} onDismiss={() => DetailsAnalyze.reset()} />}
         </section>
       )}
 
       {IsEditorOpen && CanEdit && (
         <section style={{ background: '#fff', padding: '1.5rem', border: '2px solid #333', borderRadius: '6px', marginTop: '1.5rem' }}>
           <h3>{EditingMigration ? `Edit Migration v${EditingMigration.version}` : 'Create New Migration'}</h3>
-          <form
-            onSubmit={Event => {
-              Event.preventDefault()
-              SaveMutation.mutate()
-            }}
-          >
+          <form onSubmit={Event => { Event.preventDefault(); SaveMutation.mutate() }}>
             <div style={{ marginBottom: '1rem' }}>
               <label htmlFor="migration-title"><strong>Title:</strong></label>
-              <br />
-              <input
-                id="migration-title"
-                value={EditorTitle}
-                onChange={E => setEditorTitle(E.target.value)}
-                placeholder="e.g. Create users table"
-                required
-                maxLength={128}
-                style={{ width: '100%', padding: '0.5rem', marginTop: '0.3rem', boxSizing: 'border-box' }}
-              />
+              <input id="migration-title" value={EditorTitle} onChange={E => setEditorTitle(E.target.value)} placeholder="e.g. Create users table" required maxLength={128} style={{ width: '100%', padding: '0.5rem', marginTop: '0.3rem', boxSizing: 'border-box' }} />
             </div>
-
-            <div style={{ marginBottom: '1rem' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
-                <label htmlFor="migration-sql"><strong>SQL Query (Transactional):</strong></label>
-                <button
-                  type="button"
-                  className="secondary"
-                  disabled={EditorAnalyze.isPending || !EditorSQL.trim()}
-                  onClick={() => EditorAnalyze.mutate(EditorSQL)}
-                  style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}
-                >
-                  {EditorAnalyze.isPending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}
-                </button>
+            <SQLInput Label="Up SQL" Value={EditorSQL} OnChange={Value => { setEditorSQL(Value); if (EditorAnalyze.data || EditorAnalyze.error) EditorAnalyze.reset() }} OnAnalyze={() => EditorAnalyze.mutate(EditorSQL)} Pending={EditorAnalyze.isPending} />
+            <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', margin: '0.75rem 0' }}>
+              <input type="checkbox" checked={EditorIrreversible} onChange={E => setEditorIrreversible(E.target.checked)} />
+              Irreversible migration (no down SQL)
+            </label>
+            {EditorIrreversible ? (
+              <div style={{ marginBottom: '1rem' }}>
+                <label htmlFor="migration-reason"><strong>Irreversible reason:</strong></label>
+                <input id="migration-reason" value={EditorReason} onChange={E => setEditorReason(E.target.value)} required maxLength={500} style={{ width: '100%', padding: '0.5rem', marginTop: '0.3rem', boxSizing: 'border-box' }} />
               </div>
-              <textarea
-                id="migration-sql"
-                value={EditorSQL}
-                onChange={E => {
-                  setEditorSQL(E.target.value)
-                  if (EditorAnalyze.data || EditorAnalyze.error) {
-                    EditorAnalyze.reset()
-                  }
-                }}
-                placeholder="-- Write valid PostgreSQL DDL/DML statements here...&#10;CREATE TABLE sample (id SERIAL PRIMARY KEY, name TEXT);"
-                required
-                rows={12}
-                style={{
-                  width: '100%',
-                  fontFamily: 'monospace',
-                  fontSize: '0.9rem',
-                  padding: '0.75rem',
-                  marginTop: '0.3rem',
-                  boxSizing: 'border-box',
-                  background: '#2d3748',
-                  color: '#f7fafc',
-                  borderRadius: '4px',
-                }}
-              />
-            </div>
-
-            {EditorAnalyze.isPending && (
-              <p role="status" style={{ fontSize: '0.85rem', color: 'var(--muted)', marginBottom: '1rem' }}>
-                Running EXPLAIN (ANALYZE) in rollback transaction…
-              </p>
+            ) : (
+              <SQLInput Label="Down SQL" Value={EditorDownSQL} OnChange={setEditorDownSQL} />
             )}
-
-            {EditorAnalyze.isError && (
-              <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem', borderRadius: '4px', marginBottom: '1rem', fontSize: '0.85rem' }}>
-                <strong>Plan Analysis Failed:</strong>{' '}
-                {EditorAnalyze.error instanceof ApiError ? EditorAnalyze.error.message : 'Unable to analyze query plan.'}
-                <div style={{ marginTop: '0.35rem', fontSize: '0.8rem', color: '#555' }}>
-                  <em>Catatan:</em> PostgreSQL <code>EXPLAIN</code> hanya mendukung query pemrosesan data (<code>SELECT</code>, <code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>). Pernyataan DDL seperti <code>CREATE TABLE</code> tidak memiliki query execution plan.
-                </div>
-              </div>
-            )}
-
-            {EditorAnalyze.data && (
-              <PlanAnalysisReport Analysis={EditorAnalyze.data} onDismiss={() => EditorAnalyze.reset()} />
-            )}
-
-            {SaveMutation.isError && (
-              <p role="alert" style={{ color: '#c5221f' }}>
-                {SaveMutation.error instanceof ApiError ? SaveMutation.error.message : 'Failed to save migration.'}
-              </p>
-            )}
-
+            {EditorAnalyze.isError && <p role="alert" style={{ color: '#c5221f' }}>Plan analysis failed: {EditorAnalyze.error instanceof ApiError ? EditorAnalyze.error.message : 'Unable to analyze query plan.'}</p>}
+            {EditorAnalyze.data && <PlanAnalysisReport Analysis={EditorAnalyze.data} onDismiss={() => EditorAnalyze.reset()} />}
+            {SaveMutation.isError && <p role="alert" style={{ color: '#c5221f' }}>{SaveMutation.error instanceof ApiError ? SaveMutation.error.message : 'Failed to save migration.'}</p>}
             <div className="page-actions">
-              <button type="submit" disabled={SaveMutation.isPending}>
-                {SaveMutation.isPending ? 'Saving…' : 'Save Draft'}
-              </button>
-              <button type="button" onClick={() => setIsEditorOpen(false)} disabled={SaveMutation.isPending}>
-                Cancel
-              </button>
+              <button type="submit" disabled={SaveMutation.isPending}>{SaveMutation.isPending ? 'Saving…' : 'Save Draft'}</button>
+              <button type="button" onClick={() => setIsEditorOpen(false)} disabled={SaveMutation.isPending}>Cancel</button>
             </div>
           </form>
         </section>
@@ -475,49 +389,96 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   )
 }
 
+function ActionLabel(Action: string): string {
+  switch (Action) {
+    case 'rollback': return 'Rollback'
+    case 'forward': return 'Forward'
+    case 'retry': return 'Retry'
+    default: return 'Apply'
+  }
+}
+
+function StatusBadge({ Status }: { Status: string }) {
+  const Good = Status === 'applied' || Status === 'committed'
+  const Bad = Status === 'failed'
+  return <span style={{ padding: '0.2rem 0.5rem', borderRadius: '4px', fontSize: '0.85rem', fontWeight: 600, background: Good ? '#e6f4ea' : Bad ? '#fce8e6' : '#fef7e0', color: Good ? '#137333' : Bad ? '#c5221f' : '#b06000' }}>{Status}</span>
+}
+
+function ExecutionBadge({ Status }: { Status: string }) {
+  const Good = Status === 'succeeded'
+  const Bad = Status === 'failed' || Status === 'partial' || Status === 'partially_reverted'
+  return <span style={{ padding: '0.2rem 0.5rem', borderRadius: '4px', fontSize: '0.85rem', fontWeight: 600, background: Good ? '#e6f4ea' : Bad ? '#fce8e6' : '#fef7e0', color: Good ? '#137333' : Bad ? '#c5221f' : '#b06000' }}>{Status}</span>
+}
+
+function SQLBlock({ Label, SQL, OnAnalyze, Pending }: { Label: string; SQL: string; OnAnalyze?: () => void; Pending?: boolean }) {
+  return (
+    <div style={{ marginBottom: '1rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.4rem' }}>
+        <strong>{Label}:</strong>
+        {OnAnalyze && <button type="button" className="secondary" disabled={Pending} onClick={OnAnalyze} style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}>{Pending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}</button>}
+      </div>
+      <pre style={{ background: '#1e1e1e', color: '#d4d4d4', padding: '1rem', borderRadius: '4px', overflowX: 'auto', fontSize: '0.9rem', fontFamily: 'monospace' }}>{SQL}</pre>
+    </div>
+  )
+}
+
+function SQLInput({ Label, Value, OnChange, OnAnalyze, Pending }: { Label: string; Value: string; OnChange: (Value: string) => void; OnAnalyze?: () => void; Pending?: boolean }) {
+  const ID = `migration-${Label.toLowerCase().replaceAll(' ', '-')}`
+  return (
+    <div style={{ marginBottom: '1rem' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.3rem' }}>
+        <label htmlFor={ID}><strong>{Label}:</strong></label>
+        {OnAnalyze && <button type="button" className="secondary" disabled={Pending || !Value.trim()} onClick={OnAnalyze} style={{ fontSize: '0.8rem', minHeight: '28px', padding: '0 8px' }}>{Pending ? 'Analyzing…' : 'Analyze Plan (EXPLAIN)'}</button>}
+      </div>
+      <textarea id={ID} value={Value} onChange={E => OnChange(E.target.value)} required rows={10} style={{ width: '100%', fontFamily: 'monospace', fontSize: '0.9rem', padding: '0.75rem', boxSizing: 'border-box', background: '#2d3748', color: '#f7fafc', borderRadius: '4px' }} />
+    </div>
+  )
+}
+
+function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
+  return (
+    <div style={{ background: '#fff', padding: '1rem', border: '1px solid #ccc', borderRadius: '6px', marginTop: '1rem' }}>
+      <h3>Execution {Execution.id}</h3>
+      <p style={{ fontSize: '0.9rem' }}>
+        <strong>Action:</strong> {ActionLabel(Execution.kind)} ({Execution.direction}) &nbsp;|&nbsp;
+        <strong>Status:</strong> {Execution.status} &nbsp;|&nbsp;
+        <strong>Requested by:</strong> {Execution.requested_by_username ?? Execution.requested_by ?? '—'}
+        {Execution.rollback_of_execution_id && <> &nbsp;|&nbsp; <strong>Rollback of:</strong> <code>{Execution.rollback_of_execution_id}</code></>}
+        {Execution.retry_of_execution_id && <> &nbsp;|&nbsp; <strong>Retry of:</strong> <code>{Execution.retry_of_execution_id}</code></>}
+      </p>
+      <SQLBlock Label="Executed SQL Snapshot" SQL={Execution.sql_text} />
+      {Execution.error_message && <p role="alert" style={{ color: '#c5221f' }}>{Execution.error_message}</p>}
+      <div className="table-wrap"><table className="data-table">
+        <thead><tr><th>Attempt</th><th>Status</th><th>Actor</th><th>Started</th><th>Duration</th><th>Error</th></tr></thead>
+        <tbody>
+          {Execution.attempts.map(Attempt => (
+            <tr key={Attempt.id}>
+              <td>{Attempt.attempt_no}</td>
+              <td>{Attempt.status}</td>
+              <td>{Attempt.actor_username ?? Attempt.actor_id ?? '—'}</td>
+              <td>{new Date(Attempt.started_at).toLocaleString()}</td>
+              <td>{Attempt.duration_ms == null ? '—' : `${Attempt.duration_ms} ms`}</td>
+              <td>{Attempt.error_message ?? '—'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table></div>
+    </div>
+  )
+}
+
 function PlanAnalysisReport({ Analysis, onDismiss }: { Analysis: QueryPlanAnalysis; onDismiss?: () => void }) {
   return (
-    <div
-      style={{
-        background: '#f7f8f5',
-        border: '1px solid var(--line)',
-        borderRadius: '4px',
-        padding: '1rem',
-        marginTop: '0.75rem',
-        marginBottom: '1rem',
-        fontSize: '0.85rem',
-      }}
-    >
+    <div style={{ background: '#f7f8f5', border: '1px solid var(--line)', borderRadius: '4px', padding: '1rem', marginTop: '0.75rem', marginBottom: '1rem', fontSize: '0.85rem' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.75rem' }}>
         <strong>Execution Plan Analysis (EXPLAIN ANALYZE)</strong>
-        {onDismiss && (
-          <button
-            type="button"
-            className="ghost"
-            style={{ fontSize: '0.8rem', minHeight: 'auto', padding: '2px 6px' }}
-            onClick={onDismiss}
-          >
-            Dismiss
-          </button>
-        )}
+        {onDismiss && <button type="button" className="ghost" style={{ fontSize: '0.8rem', minHeight: 'auto', padding: '2px 6px' }} onClick={onDismiss}>Dismiss</button>}
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(130px, 1fr))', gap: '0.75rem', marginBottom: '0.75rem' }}>
-        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
-          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Estimated Cost</div>
-          <div style={{ fontWeight: 600 }}>{Analysis.estimated_cost.toFixed(2)}</div>
-        </div>
-        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
-          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Execution Time</div>
-          <div style={{ fontWeight: 600 }}>{Analysis.actual_execution_time.toFixed(3)} ms</div>
-        </div>
-        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
-          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Planning Time</div>
-          <div style={{ fontWeight: 600 }}>{Analysis.planning_time.toFixed(3)} ms</div>
-        </div>
-        <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
-          <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>Rows Processed</div>
-          <div style={{ fontWeight: 600 }}>{Analysis.rows_processed}</div>
-        </div>
+        <Metric Label="Estimated Cost" Value={Analysis.estimated_cost.toFixed(2)} />
+        <Metric Label="Execution Time" Value={`${Analysis.actual_execution_time.toFixed(3)} ms`} />
+        <Metric Label="Planning Time" Value={`${Analysis.planning_time.toFixed(3)} ms`} />
+        <Metric Label="Rows Processed" Value={String(Analysis.rows_processed)} />
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', gap: '0.25rem', marginBottom: '0.5rem' }}>
         <div><strong>Scan Types:</strong> {Analysis.scan_types.length ? Analysis.scan_types.join(', ') : 'None'}</div>
@@ -526,23 +487,17 @@ function PlanAnalysisReport({ Analysis, onDismiss }: { Analysis: QueryPlanAnalys
       </div>
       <details>
         <summary style={{ cursor: 'pointer', color: 'var(--accent)', fontWeight: 500 }}>View Raw Plan JSON</summary>
-        <pre
-          style={{
-            background: '#1e1e1e',
-            color: '#d4d4d4',
-            padding: '0.75rem',
-            borderRadius: '4px',
-            overflowX: 'auto',
-            maxHeight: '200px',
-            marginTop: '0.4rem',
-            fontSize: '0.8rem',
-            fontFamily: 'monospace',
-          }}
-        >
-          {JSON.stringify(Analysis.raw_plan, null, 2)}
-        </pre>
+        <pre style={{ background: '#1e1e1e', color: '#d4d4d4', padding: '0.75rem', borderRadius: '4px', overflowX: 'auto', maxHeight: '200px', marginTop: '0.4rem', fontSize: '0.8rem', fontFamily: 'monospace' }}>{JSON.stringify(Analysis.raw_plan, null, 2)}</pre>
       </details>
     </div>
   )
 }
 
+function Metric({ Label, Value }: { Label: string; Value: string }) {
+  return (
+    <div style={{ background: '#fff', padding: '0.5rem', borderRadius: '4px', border: '1px solid var(--line)' }}>
+      <div style={{ color: 'var(--muted)', fontSize: '0.75rem' }}>{Label}</div>
+      <div style={{ fontWeight: 600 }}>{Value}</div>
+    </div>
+  )
+}

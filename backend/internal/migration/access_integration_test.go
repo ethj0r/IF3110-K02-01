@@ -148,7 +148,7 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Base := "/api/databases/" + Database.ID
 	Schema := Target.Config().ConnConfig.RuntimeParams["search_path"]
 	Table := Pgx.Identifier{Schema, "order items"}.Sanitize()
-	Payload := MigrationInput{Title: "Create quoted table", SQLText: "CREATE TABLE " + Table + " (id integer PRIMARY KEY, value text); INSERT INTO " + Table + " VALUES (1, 'visible')"}
+	Payload := MigrationInput{Title: "Create quoted table", SQLText: "CREATE TABLE " + Table + " (id integer PRIMARY KEY, value text); INSERT INTO " + Table + " VALUES (1, 'visible')", DownSQL: "DROP TABLE " + Table + ";"}
 	Client.Request(T, "anonymous", "GET", Base+"/migrations", nil, 401)
 	for _, Actor := range []string{"admin", "blocked"} {
 		Client.Request(T, Actor, "GET", Base+"/schemas", nil, 403)
@@ -173,8 +173,8 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Client.Tokens["editor"] = ""
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 403)
 	Client.Tokens["editor"] = Token
-	Done := FlowDecode[Migration](T, Client.Request(T, "editor", "POST", Path+"/execute", nil, 200))
-	if Done.Status != StatusCommitted || Done.ExecutedAt == nil || Done.ExecutedBy == nil || *Done.ExecutedBy != Users["editor"].ID || Done.ExecutedByUsername == nil || *Done.ExecutedByUsername != "editor" {
+	Done := FlowDecode[Execution](T, Client.Request(T, "editor", "POST", Path+"/execute", nil, 200))
+	if Done.Status != ExecutionSucceeded || Done.FinishedAt == nil || Done.RequestedBy == nil || *Done.RequestedBy != Users["editor"].ID || Done.RequestedByUsername == nil || *Done.RequestedByUsername != "editor" {
 		T.Fatal("execution audit fields are missing")
 	}
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
@@ -184,19 +184,23 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 		T.Fatal("view-only user could not read committed data")
 	}
 	BrokenTable := Pgx.Identifier{Schema, "must rollback"}.Sanitize()
-	Broken := FlowDecode[Migration](T, Client.Request(T, "editor", "POST", Base+"/migrations", MigrationInput{Title: "Rollback", SQLText: "CREATE TABLE " + BrokenTable + " (id int); SELECT 1/0"}, 201))
+	Broken := FlowDecode[Migration](T, Client.Request(T, "editor", "POST", Base+"/migrations", MigrationInput{Title: "Rollback", SQLText: "CREATE TABLE " + BrokenTable + " (id int); SELECT 1/0", DownSQL: "DROP TABLE " + BrokenTable + ";"}, 201))
 	Client.Request(T, "editor", "POST", Base+"/migrations/"+Broken.ID+"/execute", nil, 422)
 	var Exists bool
 	if Err := Target.QueryRow(Context.Background(), "SELECT to_regclass($1) IS NOT NULL", BrokenTable).Scan(&Exists); Err != nil || Exists {
 		T.Fatal("failed migration left target changes")
 	}
 	History := FlowDecode[[]Migration](T, Client.Request(T, "viewer", "GET", Base+"/migrations", nil, 200))
-	if len(History) != 2 || History[0].Version != 1 || History[1].Version != 2 || History[1].Status != StatusRolledBack || History[1].ErrorMessage == nil {
-		T.Fatal("linear history did not preserve rollback")
+	if len(History) != 2 || History[0].Version != 1 || History[1].Version != 2 || History[1].Status != StatusFailed || History[1].ErrorMessage == nil {
+		T.Fatal("linear history did not preserve the failed attempt")
+	}
+	Executions := FlowDecode[[]Execution](T, Client.Request(T, "viewer", "GET", Base+"/migrations/history", nil, 200))
+	if len(Executions) != 2 || Executions[0].Status != ExecutionSucceeded || Executions[1].Status != ExecutionFailed {
+		T.Fatal("execution history did not preserve success and failure")
 	}
 	OldCookie := Client.Cookies["viewer"].Value
 	Client.Request(T, "admin", "PUT", "/api/admin/groups/"+Groups["editor"].ID+"/members/"+Users["viewer"].ID, nil, 204)
-	Draft := FlowDecode[Migration](T, Client.Request(T, "viewer", "POST", Base+"/migrations", MigrationInput{Title: "Promoted", SQLText: "SELECT 1"}, 201))
+	Draft := FlowDecode[Migration](T, Client.Request(T, "viewer", "POST", Base+"/migrations", MigrationInput{Title: "Promoted", SQLText: "SELECT 1", DownSQL: "SELECT 1"}, 201))
 	if Client.Cookies["viewer"].Value == OldCookie {
 		T.Fatal("real membership promotion did not rotate the session")
 	}
