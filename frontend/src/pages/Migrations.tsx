@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ReadGeneratedMigration } from '../api/schemaDiff'
 import type { GeneratedMigration } from '../api/schemaDiff'
@@ -12,6 +12,7 @@ import {
   CreateMigration,
   DeleteMigrationDraft,
   ForwardMigration,
+  GetMigrationJob,
   ListMigrationHistory,
   ListMigrations,
   RetryMigration,
@@ -48,6 +49,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const [HideRollback, setHideRollback] = useState(false)
   const [ExecutionError, setExecutionError] = useState<string | null>(null)
   const [SuccessMessage, setSuccessMessage] = useState<string | null>(null)
+  const [ActiveJobID, setActiveJobID] = useState<string | null>(null)
 
   const MigrationsQuery = useQuery({
     queryKey: ['migrations', ActiveDatabase],
@@ -101,16 +103,35 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         default: return ApplyMigration(ActiveDatabase, ID)
       }
     },
-    onSuccess: Executed => {
+    onSuccess: Job => {
       setExecutionError(null)
-      setSuccessMessage(`${ActionLabel(Executed.kind)} v${Executed.version} finished with status ${Executed.status}.`)
-      Refresh()
+      setSuccessMessage(null)
+      setActiveJobID(Job.id)
     },
     onError: Error => {
-      setExecutionError(Error instanceof ApiError ? Error.message : 'Unable to complete the migration action.')
-      Refresh()
+      setExecutionError(Error instanceof ApiError ? Error.message : 'Unable to queue the migration action.')
     },
   })
+
+  const JobQuery = useQuery({
+    queryKey: ['migration-job', ActiveDatabase, ActiveJobID],
+    queryFn: ({ signal }) => GetMigrationJob(ActiveDatabase, ActiveJobID!, signal),
+    enabled: Boolean(Database && ActiveJobID),
+    refetchInterval: Query => {
+      const Status = Query.state.data?.status
+      return Status === 'succeeded' || Status === 'failed' || Status === 'cancelled' ? false : 1000
+    },
+  })
+
+  const Job = JobQuery.data
+  const JobFinished = Boolean(Job && (Job.status === 'succeeded' || Job.status === 'failed' || Job.status === 'cancelled'))
+  const JobActive = Boolean(ActiveJobID) && !JobFinished
+
+  useEffect(() => {
+    if (!JobFinished) return
+    void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+    void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
+  }, [JobFinished, QueryCache, ActiveDatabase])
 
   const DeleteMutation = useMutation({
     mutationFn: (ID: string) => DeleteMigrationDraft(ActiveDatabase, ID),
@@ -123,7 +144,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
 
   const DetailsAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
   const EditorAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
-  const Busy = SaveMutation.isPending || ActionMutation.isPending || DeleteMutation.isPending
+  const Busy = SaveMutation.isPending || ActionMutation.isPending || DeleteMutation.isPending || JobActive
 
   function resetEditor() {
     setEditorTitle('')
@@ -206,6 +227,27 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       {ExecutionError && (
         <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem 1rem', borderRadius: '4px', marginBottom: '1rem' }}>
           <strong>Migration Action Failed:</strong> {ExecutionError}
+        </div>
+      )}
+      {ActiveJobID && Job && (
+        <div
+          role={Job.status === 'failed' ? 'alert' : 'status'}
+          style={{
+            background: Job.status === 'failed' ? '#fce8e6' : Job.status === 'succeeded' ? '#e6f4ea' : '#fef7e0',
+            color: Job.status === 'failed' ? '#c5221f' : Job.status === 'succeeded' ? '#137333' : '#b06000',
+            padding: '0.75rem 1rem', borderRadius: '4px', marginBottom: '1rem',
+          }}
+        >
+          <strong>{ActionLabel(Job.action)} job:</strong> {Job.status}
+          {' '}(attempt {Job.attempts}/{Job.max_attempts})
+          {Job.execution_id && <> · execution <code>{Job.execution_id.slice(0, 8)}</code></>}
+          {Job.last_error && <div style={{ marginTop: '0.35rem' }}>{Job.last_error}</div>}
+          {JobFinished && <button type="button" className="ghost small" style={{ marginLeft: '0.75rem' }} onClick={() => setActiveJobID(null)}>Dismiss</button>}
+        </div>
+      )}
+      {ActiveJobID && JobQuery.isError && (
+        <div role="alert" style={{ background: '#fce8e6', color: '#c5221f', padding: '0.75rem 1rem', borderRadius: '4px', marginBottom: '1rem' }}>
+          Unable to read migration job status.
         </div>
       )}
 

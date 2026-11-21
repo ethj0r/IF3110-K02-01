@@ -157,7 +157,10 @@ Test('creates and applies a draft migration', async () => {
         return Response.json(Created, { status: 201 })
       }
       if (Path === '/api/databases/db-1/migrations/mig-1/apply') {
-        return Response.json(ExecutionFixture())
+        return Response.json({ id: 'job-1', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Draft Migration', action: 'apply', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
+      }
+      if (Path === '/api/databases/db-1/jobs/job-1') {
+        return Response.json({ id: 'job-1', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Draft Migration', action: 'apply', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-1', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', finished_at: '2026-01-01T00:00:01Z' })
       }
       return new Response(null, { status: 404 })
     }),
@@ -179,7 +182,8 @@ Test('creates and applies a draft migration', async () => {
   Expect(await Screen.findByText('Migration draft saved successfully.')).toBeTruthy()
 
   await User.click(Screen.getAllByRole('button', { name: 'Apply' })[0])
-  Expect(await Screen.findByText(/finished with status succeeded/)).toBeTruthy()
+  Expect(await Screen.findByText(/Apply job:/)).toBeTruthy()
+  Expect(Screen.getByText(/succeeded/)).toBeTruthy()
   Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true)
 })
 
@@ -304,11 +308,17 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
     if (Path === '/api/databases/db-1/migrations') return Response.json(Definitions)
     if (Path.endsWith('/rollback') && Options?.method === 'POST') {
       Definitions = [MigrationFixture({ status: 'rolled_back', can_rollback: false, can_forward: true })]
-      return Response.json(ExecutionFixture({ id: 'exec-rollback', kind: 'rollback', direction: 'down', rollback_of_execution_id: 'exec-1' }))
+      return Response.json({ id: 'job-rollback', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'rollback', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
     }
     if (Path.endsWith('/forward') && Options?.method === 'POST') {
       Definitions = [MigrationFixture({ status: 'applied', can_rollback: true })]
-      return Response.json(ExecutionFixture({ id: 'exec-forward', kind: 'forward', direction: 'up' }))
+      return Response.json({ id: 'job-forward', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'forward', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
+    }
+    if (Path.endsWith('/jobs/job-rollback')) {
+      return Response.json({ id: 'job-rollback', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'rollback', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-rollback', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:01Z', finished_at: '2026-01-01T00:00:01Z' })
+    }
+    if (Path.endsWith('/jobs/job-forward')) {
+      return Response.json({ id: 'job-forward', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'forward', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-forward', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:01Z', finished_at: '2026-01-01T00:00:01Z' })
     }
     return new Response(null, { status: 404 })
   }))
@@ -316,9 +326,9 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   const User = UserEvent.setup()
   await Screen.findByText('Initial Schema')
   await User.click(Screen.getByRole('button', { name: 'Rollback' }))
-  Expect(await Screen.findByText(/Rollback v1 finished with status succeeded/)).toBeTruthy()
+  Expect(await Screen.findByText(/Rollback job:/)).toBeTruthy()
   await User.click(await Screen.findByRole('button', { name: 'Forward' }))
-  Expect(await Screen.findByText(/Forward v1 finished with status succeeded/)).toBeTruthy()
+  Expect(await Screen.findByText(/Forward job:/)).toBeTruthy()
   await User.click(Screen.getByRole('checkbox', { name: 'Hide rollback' }))
   await Screen.findByText('No execution attempts recorded.')
   Expect(Calls.some(Path => Path.includes('hide_rollback=true'))).toBe(true)

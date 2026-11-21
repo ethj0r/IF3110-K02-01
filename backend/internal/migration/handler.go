@@ -38,6 +38,12 @@ func (Routes *Handler) Register(Api Chi.Router) {
 	}
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
+	Api.Group(func(R Chi.Router) {
+		R.Use(Auth.NoStore)
+		R.Use(Routes.Auth.RequireSession)
+		R.Get("/databases/{dbID}/jobs/{jobID}", Routes.Job)
+		R.Get("/connections/{dbID}/jobs/{jobID}", Routes.Job)
+	})
 }
 
 func DecodeInput(W Http.ResponseWriter, R *Http.Request) (MigrationInput, bool) {
@@ -87,6 +93,12 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 409, "no_failed_attempt", "Migration has no failed execution to retry")
 	case Errors.Is(Err, ErrExecutionMissing):
 		Httpx.Error(W, 404, "execution_not_found", "Migration execution not found")
+	case Errors.Is(Err, ErrJobConflict):
+		Httpx.Error(W, 409, "job_conflict", "A migration job is already active for this database")
+	case Errors.Is(Err, ErrJobNotFound):
+		Httpx.Error(W, 404, "job_not_found", "Migration job not found")
+	case Errors.Is(Err, ErrJobUnavailable):
+		Httpx.Error(W, 502, "job_unavailable", "Migration job store is unavailable")
 	case Errors.Is(Err, Driver.ErrExecution):
 		Httpx.Error(W, 422, "execution_failed", "Target database migration execution failed")
 	case Errors.Is(Err, Driver.ErrUnavailable), Errors.Is(Err, ErrUnavailable):
@@ -163,14 +175,32 @@ func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
-	DBID := Chi.URLParam(R, "dbID")
-	ID := Chi.URLParam(R, "migrationID")
-	Result, Err := Routes.Service.Execute(R.Context(), User, DBID, ID)
+	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), R.Header.Get("traceparent"))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 202, Result)
+}
+
+func (Routes *Handler) Job(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.GetJob(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "jobID"))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
 	}
 	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) enqueue(W Http.ResponseWriter, R *Http.Request, Action JobAction) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, R.Header.Get("traceparent"))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 202, Result)
 }
 
 func (Routes *Handler) History(W Http.ResponseWriter, R *Http.Request) {

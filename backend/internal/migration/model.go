@@ -9,12 +9,14 @@ import (
 type Status string
 
 const (
-	StatusDraft      Status = "draft"
-	StatusPending    Status = "pending"
-	StatusCommitted  Status = "committed"
-	StatusApplied    Status = "applied"
-	StatusRolledBack Status = "rolled_back"
-	StatusFailed     Status = "failed"
+	StatusDraft             Status = "draft"
+	StatusPending           Status = "pending"
+	StatusCommitted         Status = "committed"
+	StatusApplied           Status = "applied"
+	StatusRolledBack        Status = "rolled_back"
+	StatusFailed            Status = "failed"
+	StatusPartial           Status = "partial"
+	StatusPartiallyReverted Status = "partially_reverted"
 )
 
 func (S Status) IsTerminal() bool {
@@ -39,6 +41,10 @@ func (S Status) IsApplied() bool {
 
 func (S Status) IsRolledBack() bool {
 	return S == StatusRolledBack
+}
+
+func (S Status) IsPartial() bool {
+	return S == StatusPartial || S == StatusPartiallyReverted
 }
 
 type ExecutionKind string
@@ -205,3 +211,56 @@ type Attempt struct {
 	FinishedAt     *Time.Time    `json:"finished_at,omitempty"`
 	DurationMillis *int64        `json:"duration_ms,omitempty"`
 }
+
+type JobAction string
+
+const (
+	JobApply    JobAction = "apply"
+	JobRollback JobAction = "rollback"
+	JobForward  JobAction = "forward"
+	JobRetry    JobAction = "retry"
+)
+
+type JobStatus string
+
+const (
+	JobQueued    JobStatus = "queued"
+	JobRunning   JobStatus = "running"
+	JobSucceeded JobStatus = "succeeded"
+	JobFailed    JobStatus = "failed"
+	JobCancelled JobStatus = "cancelled"
+)
+
+func (S JobStatus) IsTerminal() bool {
+	return S == JobSucceeded || S == JobFailed || S == JobCancelled
+}
+
+type Job struct {
+	ID                  string     `json:"id"`
+	DatabaseID          string     `json:"database_id"`
+	MigrationID         string     `json:"migration_id"`
+	Version             int64      `json:"version"`
+	Title               string     `json:"title"`
+	Action              JobAction  `json:"action"`
+	Status              JobStatus  `json:"status"`
+	Attempts            int        `json:"attempts"`
+	MaxAttempts         int        `json:"max_attempts"`
+	AvailableAt         Time.Time  `json:"available_at"`
+	LockedBy            *string    `json:"locked_by,omitempty"`
+	LockedAt            *Time.Time `json:"locked_at,omitempty"`
+	LeaseExpiresAt      *Time.Time `json:"lease_expires_at,omitempty"`
+	LastError           *string    `json:"last_error,omitempty"`
+	ExecutionID         *string    `json:"execution_id,omitempty"`
+	RequestedBy         *string    `json:"requested_by,omitempty"`
+	RequestedByUsername *string    `json:"requested_by_username,omitempty"`
+	TraceParent         *string    `json:"traceparent,omitempty"`
+	CreatedAt           Time.Time  `json:"created_at"`
+	UpdatedAt           Time.Time  `json:"updated_at"`
+	FinishedAt          *Time.Time `json:"finished_at,omitempty"`
+}
+
+var (
+	ErrJobConflict    = Errors.New("a migration job is already active for this database")
+	ErrJobNotFound    = Errors.New("migration job not found")
+	ErrJobUnavailable = Errors.New("migration job store is unavailable")
+)

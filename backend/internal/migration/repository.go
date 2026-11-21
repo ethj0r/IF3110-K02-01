@@ -38,6 +38,13 @@ func (Repo *Repository) query(Ctx Context.Context, SQL string, Args ...any) (Pgx
 	return Repo.Pool.Query(Ctx, SQL, Args...)
 }
 
+func (Repo *Repository) exec(Ctx Context.Context, SQL string, Args ...any) (Pgconn.CommandTag, error) {
+	if Repo.Conn != nil {
+		return Repo.Conn.Exec(Ctx, SQL, Args...)
+	}
+	return Repo.Pool.Exec(Ctx, SQL, Args...)
+}
+
 func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pgxpool.Conn, error) {
 	Conn, Err := Repo.Pool.Acquire(Ctx)
 	if Err != nil {
@@ -583,4 +590,135 @@ ORDER BY E.created_at ASC, E.id ASC`, DatabaseID, HideRollback)
 		}
 	}
 	return Result, nil
+}
+
+const JobColumns = `J.id::text, J.database_id::text, J.migration_id::text, M.version, M.title,
+J.action, J.status, J.attempts, J.max_attempts, J.available_at, J.locked_by, J.locked_at,
+J.lease_expires_at, J.last_error, J.execution_id::text, J.requested_by::text,
+(SELECT U.username FROM users U WHERE U.id = J.requested_by), J.traceparent, J.created_at, J.updated_at, J.finished_at`
+
+func scanJob(Row rowScanner) (Job, error) {
+	var Item Job
+	var ActionStr, StatusStr string
+	Err := Row.Scan(
+		&Item.ID,
+		&Item.DatabaseID,
+		&Item.MigrationID,
+		&Item.Version,
+		&Item.Title,
+		&ActionStr,
+		&StatusStr,
+		&Item.Attempts,
+		&Item.MaxAttempts,
+		&Item.AvailableAt,
+		&Item.LockedBy,
+		&Item.LockedAt,
+		&Item.LeaseExpiresAt,
+		&Item.LastError,
+		&Item.ExecutionID,
+		&Item.RequestedBy,
+		&Item.RequestedByUsername,
+		&Item.TraceParent,
+		&Item.CreatedAt,
+		&Item.UpdatedAt,
+		&Item.FinishedAt,
+	)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	}
+	if Err != nil {
+		return Job{}, ErrJobUnavailable
+	}
+	Item.Action = JobAction(ActionStr)
+	Item.Status = JobStatus(StatusStr)
+	return Item, nil
+}
+
+func (Repo *Repository) EnqueueJob(Ctx Context.Context, DatabaseID string, MigrationID string, Action JobAction, RequestedBy *string, TraceParent *string) (Job, error) {
+	var JobID string
+	Err := Repo.queryRow(Ctx, `INSERT INTO migration_jobs (database_id, migration_id, action, requested_by, traceparent)
+SELECT M.database_id, M.id, $3, $4, $5
+FROM migrations M
+WHERE M.database_id::text = $1 AND M.id::text = $2
+RETURNING id::text`, DatabaseID, MigrationID, string(Action), RequestedBy, TraceParent).Scan(&JobID)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return Job{}, ErrNotFound
+	}
+	if isConflict(Err) {
+		return Job{}, ErrJobConflict
+	}
+	if Err != nil {
+		return Job{}, ErrJobUnavailable
+	}
+	return Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+func (Repo *Repository) GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error) {
+	Row := Repo.queryRow(Ctx, "SELECT "+JobColumns+` FROM migration_jobs J
+JOIN migrations M ON M.id = J.migration_id
+WHERE J.database_id::text = $1 AND J.id::text = $2`, DatabaseID, JobID)
+	return scanJob(Row)
+}
+
+func (Repo *Repository) ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error) {
+	var JobID, DatabaseID string
+	Err := Repo.queryRow(Ctx, `WITH Candidate AS (
+SELECT J.id FROM migration_jobs J
+WHERE J.status = 'queued' AND J.available_at <= CURRENT_TIMESTAMP
+ORDER BY J.created_at ASC
+FOR UPDATE SKIP LOCKED
+LIMIT 1
+)
+UPDATE migration_jobs J
+SET status = 'running', locked_by = $1, locked_at = CURRENT_TIMESTAMP,
+    lease_expires_at = CURRENT_TIMESTAMP + $2::interval,
+    attempts = J.attempts + 1, updated_at = CURRENT_TIMESTAMP
+FROM Candidate C
+WHERE J.id = C.id
+RETURNING J.id::text, J.database_id::text`, WorkerID, Lease.String()).Scan(&JobID, &DatabaseID)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return Job{}, ErrJobNotFound
+	}
+	if Err != nil {
+		return Job{}, ErrJobUnavailable
+	}
+	return Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+func (Repo *Repository) FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error {
+	var ID string
+	Err := Repo.queryRow(Ctx, `UPDATE migration_jobs
+SET status = $2, execution_id = COALESCE($3, execution_id), last_error = $4,
+    finished_at = CURRENT_TIMESTAMP, locked_by = NULL, lease_expires_at = NULL,
+    updated_at = CURRENT_TIMESTAMP
+WHERE id::text = $1
+RETURNING id::text`, JobID, string(Status), ExecutionID, LastError).Scan(&ID)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return ErrJobNotFound
+	}
+	if Err != nil {
+		return ErrJobUnavailable
+	}
+	return nil
+}
+
+func (Repo *Repository) ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error) {
+	CommandTag, Err := Repo.exec(Ctx, `WITH Expired AS (
+SELECT id FROM migration_jobs
+WHERE status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at < CURRENT_TIMESTAMP
+ORDER BY lease_expires_at ASC
+LIMIT $1
+FOR UPDATE SKIP LOCKED
+)
+UPDATE migration_jobs J
+SET status = 'failed',
+    last_error = 'worker lease expired; verify the execution outcome before retrying',
+    finished_at = CURRENT_TIMESTAMP, locked_by = NULL, lease_expires_at = NULL,
+    updated_at = CURRENT_TIMESTAMP
+FROM Expired E
+WHERE J.id = E.id`, Limit)
+	if Err != nil {
+		return 0, ErrJobUnavailable
+	}
+	return int(CommandTag.RowsAffected()), nil
 }

@@ -21,6 +21,7 @@ import (
 	Url "net/url"
 	Os "os"
 	Testing "testing"
+	Time "time"
 )
 
 const FlowPassword = "isolated integration password"
@@ -81,6 +82,21 @@ func (Client *FlowClient) Login(T *Testing.T, Actor string) {
 	Client.Tokens[Actor] = Body.CSRFToken
 }
 
+func RunNextJob(T *Testing.T, Repo *Repository, Service *Service) Job {
+	T.Helper()
+	Claimed, Err := Repo.ClaimJob(Context.Background(), "access-test-worker", Time.Minute)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Worker := &Worker{Repo: Repo, Service: Service, ID: "access-test-worker", Lease: Time.Minute}
+	Worker.Process(Context.Background(), Claimed)
+	Finished, Err := Repo.GetJob(Context.Background(), Claimed.DatabaseID, Claimed.ID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	return Finished
+}
+
 func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Platform, Target := Testdb.PlatformDatabase(T), Testutil.Database(T)
 	Settings := Auth.DefaultOptions()
@@ -105,7 +121,8 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: Connections, Driver: Driver.PostgresDriver{}}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: Policy}
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: Policy, Service: &Inspect.Service{Connections: Connections, Driver: Driver.PostgresDriver{}}}
-	Service := &Service{Repo: &Repository{Pool: Platform}, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
+	Repo := &Repository{Pool: Platform}
+	Service := &Service{Repo: Repo, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
 		_, DSN, Err := Connections.DialDSN(Ctx, ID)
 		return DSN, Err
 	})}
@@ -173,9 +190,14 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Client.Tokens["editor"] = ""
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 403)
 	Client.Tokens["editor"] = Token
-	Done := FlowDecode[Execution](T, Client.Request(T, "editor", "POST", Path+"/execute", nil, 200))
-	if Done.Status != ExecutionSucceeded || Done.FinishedAt == nil || Done.RequestedBy == nil || *Done.RequestedBy != Users["editor"].ID || Done.RequestedByUsername == nil || *Done.RequestedByUsername != "editor" {
-		T.Fatal("execution audit fields are missing")
+	Queued := FlowDecode[Job](T, Client.Request(T, "editor", "POST", Path+"/execute", nil, 202))
+	RunNextJob(T, Repo, Service)
+	Done, Err := Repo.LatestExecution(Context.Background(), Database.ID, First.ID)
+	if Err != nil || Done.Status != ExecutionSucceeded || Done.FinishedAt == nil || Done.RequestedBy == nil || *Done.RequestedBy != Users["editor"].ID || Done.RequestedByUsername == nil || *Done.RequestedByUsername != "editor" {
+		T.Fatalf("execution audit fields are missing: %+v %v", Done, Err)
+	}
+	if Finished, Err := Repo.GetJob(Context.Background(), Database.ID, Queued.ID); Err != nil || Finished.Status != JobSucceeded {
+		T.Fatalf("queued job did not succeed: %+v %v", Finished, Err)
 	}
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
 	RowsPath := Base + "/tables/order%20items/rows?schema=" + Url.QueryEscape(Schema)
@@ -185,7 +207,8 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	}
 	BrokenTable := Pgx.Identifier{Schema, "must rollback"}.Sanitize()
 	Broken := FlowDecode[Migration](T, Client.Request(T, "editor", "POST", Base+"/migrations", MigrationInput{Title: "Rollback", SQLText: "CREATE TABLE " + BrokenTable + " (id int); SELECT 1/0", DownSQL: "DROP TABLE " + BrokenTable + ";"}, 201))
-	Client.Request(T, "editor", "POST", Base+"/migrations/"+Broken.ID+"/execute", nil, 422)
+	Client.Request(T, "editor", "POST", Base+"/migrations/"+Broken.ID+"/execute", nil, 202)
+	RunNextJob(T, Repo, Service)
 	var Exists bool
 	if Err := Target.QueryRow(Context.Background(), "SELECT to_regclass($1) IS NOT NULL", BrokenTable).Scan(&Exists); Err != nil || Exists {
 		T.Fatal("failed migration left target changes")

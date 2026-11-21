@@ -24,6 +24,8 @@ type MockRepo struct {
 	NextID         int
 	NextExecution  int
 	NextAttempt    int
+	NextJob        int
+	Jobs           map[string]Job
 	RefreshFailure error
 }
 
@@ -32,6 +34,7 @@ func NewMockRepo() *MockRepo {
 		Items:      map[string]Migration{},
 		Executions: map[string]Execution{},
 		Attempts:   map[string][]Attempt{},
+		Jobs:       map[string]Job{},
 	}
 }
 
@@ -143,6 +146,82 @@ func (M *MockRepo) DeleteDraft(_ Context.Context, DatabaseID string, ID string) 
 	}
 	delete(M.Items, ID)
 	return nil
+}
+
+func (M *MockRepo) EnqueueJob(_ Context.Context, DatabaseID string, MigrationID string, Action JobAction, RequestedBy *string, TraceParent *string) (Job, error) {
+	for _, Existing := range M.Jobs {
+		if Existing.DatabaseID == DatabaseID && (Existing.Status == JobQueued || Existing.Status == JobRunning) {
+			return Job{}, ErrJobConflict
+		}
+	}
+	Item, Ok := M.Items[MigrationID]
+	if !Ok || Item.DatabaseID != DatabaseID {
+		return Job{}, ErrNotFound
+	}
+	M.NextJob++
+	Now := Time.Now().UTC()
+	Job := Job{
+		ID:          Fmt.Sprintf("job-%d", M.NextJob),
+		DatabaseID:  DatabaseID,
+		MigrationID: MigrationID,
+		Version:     Item.Version,
+		Title:       Item.Title,
+		Action:      Action,
+		Status:      JobQueued,
+		MaxAttempts: 3,
+		AvailableAt: Now,
+		RequestedBy: RequestedBy,
+		TraceParent: TraceParent,
+		CreatedAt:   Now,
+		UpdatedAt:   Now,
+	}
+	M.Jobs[Job.ID] = Job
+	return Job, nil
+}
+
+func (M *MockRepo) GetJob(_ Context.Context, DatabaseID string, JobID string) (Job, error) {
+	Item, Ok := M.Jobs[JobID]
+	if !Ok || Item.DatabaseID != DatabaseID {
+		return Job{}, ErrJobNotFound
+	}
+	return Item, nil
+}
+
+func (M *MockRepo) ClaimJob(_ Context.Context, WorkerID string, _ Time.Duration) (Job, error) {
+	for ID, Item := range M.Jobs {
+		if Item.Status != JobQueued {
+			continue
+		}
+		Now := Time.Now().UTC()
+		Item.Status = JobRunning
+		Item.Attempts++
+		Item.LockedBy = &WorkerID
+		Item.LockedAt = &Now
+		Item.UpdatedAt = Now
+		M.Jobs[ID] = Item
+		return Item, nil
+	}
+	return Job{}, ErrJobNotFound
+}
+
+func (M *MockRepo) FinishJob(_ Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error {
+	Item, Ok := M.Jobs[JobID]
+	if !Ok {
+		return ErrJobNotFound
+	}
+	Now := Time.Now().UTC()
+	Item.Status = Status
+	Item.ExecutionID = ExecutionID
+	Item.LastError = LastError
+	Item.FinishedAt = &Now
+	Item.LockedBy = nil
+	Item.UpdatedAt = Now
+	M.Jobs[JobID] = Item
+	return nil
+}
+
+func (M *MockRepo) ExpireStaleJobs(_ Context.Context, _ int) (int, error) {
+	return 0, nil
 }
 
 func (M *MockRepo) CreateExecution(_ Context.Context, DatabaseID string, MigrationID string, Request ExecutionRequest) (Execution, error) {

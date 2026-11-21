@@ -68,6 +68,16 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     return Response.status() === 204 ? undefined as Value : await Response.json() as Value
   }
 
+  async function WaitJob(Database: RecordID, JobID: string) {
+    for (let Attempt = 0; Attempt < 60; Attempt++) {
+      const Job = await EditorAPI<{ id: string; status: string; last_error?: string }>(`/api/databases/${Database.id}/jobs/${JobID}`)
+      if (Job.status === 'succeeded') return
+      if (Job.status === 'failed' || Job.status === 'cancelled') throw new Error(`Migration job ${JobID} ended ${Job.status}: ${Job.last_error ?? ''}`)
+      await new Promise(Resolve => setTimeout(Resolve, 500))
+    }
+    throw new Error(`Migration job ${JobID} did not finish`)
+  }
+
   async function SaveDraft(Page: Page, Title: string, SQL: string, DownSQL = 'SELECT 1;') {
     await Page.getByRole('button', { name: '+ Create Migration', exact: true }).click()
     await Page.getByLabel('Title:', { exact: true }).fill(Title)
@@ -94,7 +104,8 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
       for (const Item of History.filter(Item => Item.status === 'draft')) await EditorAPI(`${Base}/${Item.id}`, 'DELETE')
       if (History.some(Item => Item.status === 'applied')) {
         const Cleanup = await EditorAPI<RecordID>(Base, 'POST', { title: 'Browser fixture cleanup', sql_text: `DROP SCHEMA IF EXISTS ${QuotedSchema} CASCADE`, down_sql: 'SELECT 1;' })
-        await EditorAPI(`${Base}/${Cleanup.id}/execute`, 'POST')
+        const Job = await EditorAPI<{ id: string }>(`${Base}/${Cleanup.id}/execute`, 'POST')
+        if (Database) await WaitJob(Database, Job.id)
       }
       await AdminAPI(`/api/connections/${Database.id}`, 'DELETE')
     }
