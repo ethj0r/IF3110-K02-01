@@ -70,37 +70,61 @@ modifiers such as `character varying(12)` and `numeric(12,2)`; constraint
 
 Base Route: `/databases/{dbId}/migrations` (alias: `/connections/{dbId}/migrations`)
 
-Responses include `executed_by` and `executed_by_username` when the executor
-account still exists, plus `executed_at`, SQL, version, and status. The UI uses
-the effective database grant to show mutation controls; backend authorization
-remains mandatory. Successful execution invalidates cached viewer metadata/data.
+Each migration definition contains immutable up SQL and either immutable down SQL
+or an `irreversible` flag with a reason. Definitions are editable only while they
+are drafts and have never been submitted for execution. The first execution locks
+the definition (`locked_at`); later edits must be new migrations.
 
 | Method | Path | Access | Request Body | Success Response | Description |
 | --- | --- | --- | --- | --- | --- |
-| `GET` | `/databases/{dbId}/migrations` | View Only, View + Edit | None | `200` `[...]` | Lists migrations in linear version order |
-| `POST` | `/databases/{dbId}/migrations` | View + Edit | `{"title":"...","sql_text":"..."}` | `201` `{...}` | Creates a draft migration with next sequential version |
-| `GET` | `/databases/{dbId}/migrations/{id}` | View Only, View + Edit | None | `200` `{...}` | Retrieves migration details and script |
-| `PUT` | `/databases/{dbId}/migrations/{id}` | View + Edit | `{"title":"...","sql_text":"..."}` | `200` `{...}` | Updates title or SQL of a draft migration |
-| `DELETE` | `/databases/{dbId}/migrations/{id}` | View + Edit | None | `204 No Content` | Deletes a draft migration |
-| `POST` | `/databases/{dbId}/migrations/{id}/execute` | View + Edit | None | `200` `{...}` | Executes migration inside a target transaction |
-| `POST` | `/databases/{dbId}/migrations/analyze` | View Only, View + Edit | `{"sql_text":"..."}` | `200` `{...}` | Runs EXPLAIN (ANALYZE) in a target rollback transaction to extract scan types, indexes, costs, and timings |
+| `GET` | `/databases/{dbId}/migrations` | View Only, View + Edit | None | `200` `[...]` | Lists definitions with derived status and action capabilities |
+| `POST` | `/databases/{dbId}/migrations` | View + Edit | `{"title":"...","sql_text":"...","down_sql":"...","irreversible":false,"irreversible_reason":""}` | `201` `{...}` | Creates a draft with the next sequential version |
+| `GET` | `/databases/{dbId}/migrations/{id}` | View Only, View + Edit | None | `200` `{...}` | Retrieves a definition |
+| `PUT` | `/databases/{dbId}/migrations/{id}` | View + Edit | Same as create | `200` `{...}` | Updates a draft and increments its revision |
+| `DELETE` | `/databases/{dbId}/migrations/{id}` | View + Edit | None | `204 No Content` | Deletes an unexecuted draft |
+| `GET` | `/databases/{dbId}/migrations/history?hide_rollback=false` | View Only, View + Edit | None | `200` `[...]` | Lists executions and attempts; optionally hides successful rollback pairs |
+| `POST` | `/databases/{dbId}/migrations/{id}/execute` | View + Edit | None | `200` `{...}` | Applies a draft, or retries its latest failed execution |
+| `POST` | `/databases/{dbId}/migrations/{id}/apply` | View + Edit | None | `200` `{...}` | Applies an unexecuted draft |
+| `POST` | `/databases/{dbId}/migrations/{id}/rollback` | View + Edit | None | `200` `{...}` | Runs the original down SQL for the last active migration |
+| `POST` | `/databases/{dbId}/migrations/{id}/forward` | View + Edit | None | `200` `{...}` | Re-applies up SQL for a rolled-back migration in linear order |
+| `POST` | `/databases/{dbId}/migrations/{id}/retry` | View + Edit | None | `200` `{...}` | Retries the latest failed execution using its SQL snapshot |
+| `POST` | `/databases/{dbId}/migrations/analyze` | View Only, View + Edit | `{"sql_text":"..."}` | `200` `{...}` | Runs EXPLAIN (ANALYZE) in a target rollback transaction |
+
+Successful actions return an execution object containing the execution ID,
+migration/version/revision, `kind` (`apply`, `rollback`, `forward`, `retry`),
+`direction` (`up`, `down`), `status`, the exact SQL snapshot, optional
+`rollback_of_execution_id` / `retry_of_execution_id`, actor fields, timestamps,
+and an `attempts` array. Definitions return derived `status`, `revision`,
+`down_sql`, `irreversible`, `locked_at`, and `can_apply` / `can_rollback` /
+`can_forward` / `can_retry` hints.
 
 ### Migration Statuses
 
 | Status | Terminal | Description |
 | --- | --- | --- |
-| `draft` | No | Migration created or edited, awaiting execution |
-| `pending` | No | Execution started; SQL is immutable and automatic retry is blocked |
-| `committed` / `applied` | Yes | Migration executed and committed successfully on target |
-| `rolled_back` / `failed` | Yes | SQL failed on target; transaction rolled back and error message recorded |
+| `draft` | No | Definition created or edited and never executed |
+| `pending` | No | Latest execution is queued/running or its outcome requires verification |
+| `applied` | Yes | Latest successful execution used up SQL |
+| `rolled_back` | Yes | Latest successful execution used down SQL |
+| `failed` | Yes | No successful execution exists and the latest attempt failed |
+
+Execution statuses are `queued`, `running`, `succeeded`, `failed`, `partial`, and
+`partially_reverted`. Attempt statuses are `running`, `succeeded`, and `failed`.
 
 ### Execution Model
 
-1. **Isolation & Atomicity:** SQL runs in an atomic PL/pgSQL `DO` block within the target transaction. Explicit transaction control, including nested `COMMIT`, is rejected by PostgreSQL.
-2. **Rollback & Persistence:** Confirmed rollback records a generic error. Raw PostgreSQL errors are neither persisted nor returned, including legacy history responses.
-3. **Linear Locking:** A session advisory lock covers creation, draft mutations, execution, and result recording per database. Earlier versions must have a terminal outcome before the next executes; only the latest attempted version may be retried after failure.
-4. **Uncertain Outcomes:** `pending` is persisted before SQL runs. A lost commit response, process interruption, or failed result write leaves it pending, blocks retry, and blocks later versions. An operator must verify target effects and reconcile the platform record to `committed` or `rolled_back` before proceeding; never blindly reset it to draft. This also applies to legacy pending records. Target and platform commits are separate transactions.
-5. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording have a separate five-second cleanup window.
+1. **Down SQL and irreversibility:** A reversible definition must provide non-empty `down_sql`. An irreversible definition must omit `down_sql` and provide a non-empty `irreversible_reason`.
+2. **Immutable definitions:** The first execution attempt sets `locked_at`. `PUT` and `DELETE` return `409 migration_locked` after that point, including after a failed attempt. SQL snapshots are stored on every execution and attempt.
+3. **Linear ordering:** A draft may be applied when every earlier version is applied or failed and no later version is locked. A failed attempt does not advance the active position. A pending/running execution blocks later actions.
+4. **Rollback:** Only the highest applied version may be rolled back, and only when its latest successful execution is an up execution and the definition is reversible. Rollback runs the original down SQL snapshot as a new execution and records `rollback_of_execution_id`.
+5. **Forward:** Forward is allowed only for a rolled-back migration that is the next version after the highest applied version. It runs the original up SQL as a new execution; it never automatically runs the next migration.
+6. **Retry:** Retry is allowed only for the latest failed execution on the database and repeats that execution's SQL snapshot and direction.
+7. **History integrity:** Executions and attempts are never overwritten or deleted. Failures remain visible. `hide_rollback=true` hides successful rollback executions together with the execution they cancelled, paired by execution ID. A failed rollback changes neither the hidden set nor the active position.
+8. **Atomicity:** SQL runs in an atomic PL/pgSQL `DO` block within the target transaction. Explicit transaction control, including nested `COMMIT`, is rejected by PostgreSQL.
+9. **Safe errors:** Confirmed SQL failures record a generic error in the platform. Raw PostgreSQL errors and credentials are not persisted or returned by the API.
+10. **Uncertain outcomes:** A lost commit response, rollback failure, or failed result write leaves the execution running/pending. Retry and later actions are blocked until the target outcome is verified and reconciled.
+11. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
+12. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
 
 ## Schema Comparison
 

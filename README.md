@@ -166,7 +166,15 @@ Deleting a connection also deletes its platform grants and migration history; it
 
 ## Target Database Migrations
 
-Target database migrations represent ordered, linear schema and data modifications executed on managed target PostgreSQL databases.
+Target database migrations are ordered, linear changes with immutable up/down SQL.
+A reversible migration requires down SQL; an irreversible migration requires a
+reason and cannot be rolled back. Definitions can be edited only before their first
+execution attempt; after that, corrections require a new migration.
+
+Every apply, rollback, forward, retry, success, and failure is stored as an
+execution with one or more attempts. The exact SQL snapshot is recorded on both the
+execution and the attempt, along with the version, revision, actor, timestamps,
+status, and error category. Application logs are separate and go to stdout/stderr.
 
 ### Endpoints
 
@@ -177,11 +185,25 @@ Target database migrations represent ordered, linear schema and data modificatio
 | `GET` | `/api/databases/{dbId}/migrations/{id}` | View Only / View + Edit |
 | `PUT` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
+| `GET` | `/api/databases/{dbId}/migrations/history?hide_rollback=false` | View Only / View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/apply` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/rollback` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/forward` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/retry` | View + Edit |
 
-Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
+Migration mutations and execution are serialized per target database using session
+advisory locks. Only the last active reversible migration can be rolled back.
+Forward is limited to the next version after the highest applied version and never
+runs subsequent migrations automatically. Retry repeats the latest failed execution
+snapshot. Hide rollback removes a successful rollback execution and the execution it
+cancelled, paired by execution ID; failed attempts remain visible.
 
-See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
+SQL runs atomically inside a target transaction. Confirmed failure records a generic
+error and preserves history. If commit or result recording is uncertain, the
+execution stays running/pending and blocks retry until the target outcome is
+verified. See [`docs/api.md`](docs/api.md) for the full execution model and error
+specifications.
 
 ## Query Execution Plan Analysis
 

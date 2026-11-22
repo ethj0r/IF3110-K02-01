@@ -45,10 +45,15 @@ func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Han
 		R.Get(Prefix, Routes.List)
 		R.Post(Prefix, Routes.Create)
 		R.Post(Prefix+"/analyze", Routes.Analyze)
+		R.Get(Prefix+"/history", Routes.History)
 		R.Get(Prefix+"/{migrationID}", Routes.Show)
 		R.Put(Prefix+"/{migrationID}", Routes.Update)
 		R.Delete(Prefix+"/{migrationID}", Routes.Delete)
 		R.Post(Prefix+"/{migrationID}/execute", Routes.Execute)
+		R.Post(Prefix+"/{migrationID}/apply", Routes.Apply)
+		R.Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
+		R.Post(Prefix+"/{migrationID}/forward", Routes.Forward)
+		R.Post(Prefix+"/{migrationID}/retry", Routes.Retry)
 	}
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
@@ -72,7 +77,7 @@ func TestHandlerLifecycleAndAccess(T *Testing.T) {
 	Router, _, CurrentPrincipal := newTestHandler(Policy, DriverMock)
 
 	// 1. Create Migration as Editor -> 201 Created
-	CreatePayload := `{"title":"Add users table","sql_text":"CREATE TABLE users (id SERIAL);"}`
+	CreatePayload := `{"title":"Add users table","sql_text":"CREATE TABLE users (id SERIAL);","down_sql":"DROP TABLE users;"}`
 	Req := Httptest.NewRequest("POST", "/databases/db-1/migrations", Bytes.NewBufferString(CreatePayload))
 	Req.Header.Set("Content-Type", "application/json")
 	Res := Httptest.NewRecorder()
@@ -103,7 +108,7 @@ func TestHandlerLifecycleAndAccess(T *Testing.T) {
 	}
 
 	// 4. Update Migration Draft -> 200 OK
-	UpdatePayload := `{"title":"Add users table updated","sql_text":"CREATE TABLE users (id BIGSERIAL);"}`
+	UpdatePayload := `{"title":"Add users table updated","sql_text":"CREATE TABLE users (id BIGSERIAL);","down_sql":"DROP TABLE users;"}`
 	Req = Httptest.NewRequest("PUT", "/databases/db-1/migrations/"+Created.ID, Bytes.NewBufferString(UpdatePayload))
 	Req.Header.Set("Content-Type", "application/json")
 	Res = Httptest.NewRecorder()
@@ -193,7 +198,7 @@ func TestHandlerExecutionFailureResponse(T *Testing.T) {
 	Router, _, _ := newTestHandler(Policy, DriverFail)
 
 	// Create migration
-	CreatePayload := `{"title":"Broken SQL","sql_text":"INVALID SQL;"}`
+	CreatePayload := `{"title":"Broken SQL","sql_text":"INVALID SQL;","down_sql":"SELECT 1;"}`
 	Req := Httptest.NewRequest("POST", "/databases/db-1/migrations", Bytes.NewBufferString(CreatePayload))
 	Req.Header.Set("Content-Type", "application/json")
 	Res := Httptest.NewRecorder()

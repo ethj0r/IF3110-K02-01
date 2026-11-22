@@ -7,32 +7,32 @@ import (
 )
 
 func TestStatusHelpers(T *Testing.T) {
-	if !StatusDraft.IsDraft() || StatusPending.IsDraft() {
+	if !StatusDraft.IsDraft() || StatusApplied.IsDraft() || StatusRolledBack.IsDraft() {
 		T.Fatal("only draft may be edited or deleted")
 	}
-	if StatusCommitted.IsDraft() || StatusRolledBack.IsDraft() {
-		T.Fatal("committed and rolled_back are not draft")
+	if !StatusApplied.IsSuccess() || !StatusCommitted.IsSuccess() {
+		T.Fatal("applied and legacy committed are success")
 	}
-
-	if !StatusCommitted.IsSuccess() || !StatusApplied.IsSuccess() {
-		T.Fatal("committed and applied must be success")
+	if StatusRolledBack.IsSuccess() || StatusFailed.IsSuccess() || StatusDraft.IsSuccess() {
+		T.Fatal("rolled back, failed, and draft are not success")
 	}
-	if StatusRolledBack.IsSuccess() || StatusDraft.IsSuccess() {
-		T.Fatal("rolled back and draft are not success")
+	if !StatusFailed.IsFailure() {
+		T.Fatal("failed must be a failure")
 	}
-
-	if !StatusRolledBack.IsFailure() || !StatusFailed.IsFailure() {
-		T.Fatal("rolled_back and failed must be failure")
+	if StatusRolledBack.IsFailure() || StatusApplied.IsFailure() {
+		T.Fatal("rolled back and applied are not execution failures")
 	}
-	if StatusCommitted.IsFailure() || StatusDraft.IsFailure() {
-		T.Fatal("committed and draft are not failure")
-	}
-
 	if !StatusCommitted.IsTerminal() || !StatusRolledBack.IsTerminal() || !StatusApplied.IsTerminal() || !StatusFailed.IsTerminal() {
-		T.Fatal("committed, rolled_back, applied, and failed must be terminal")
+		T.Fatal("applied, committed, rolled_back, and failed must be terminal")
 	}
 	if StatusDraft.IsTerminal() || StatusPending.IsTerminal() {
 		T.Fatal("draft and pending must not be terminal")
+	}
+	if !StatusApplied.IsApplied() || StatusRolledBack.IsApplied() {
+		T.Fatal("applied helper is incorrect")
+	}
+	if !StatusRolledBack.IsRolledBack() || StatusApplied.IsRolledBack() {
+		T.Fatal("rolled back helper is incorrect")
 	}
 }
 
@@ -40,25 +40,55 @@ func TestMigrationInputValidationAndNormalization(T *Testing.T) {
 	Valid := MigrationInput{
 		Title:   "  Add users table  ",
 		SQLText: "  CREATE TABLE users (id SERIAL);  ",
+		DownSQL: "  DROP TABLE users;  ",
 	}
 	if Err := Valid.Validate(); Err != nil {
 		T.Fatalf("expected valid input, got %v", Err)
 	}
-
 	Normalized := Valid.Normalized()
-	if Normalized.Title != "Add users table" || Normalized.SQLText != "CREATE TABLE users (id SERIAL);" {
+	if Normalized.Title != "Add users table" || Normalized.SQLText != "CREATE TABLE users (id SERIAL);" || Normalized.DownSQL != "DROP TABLE users;" {
 		T.Fatalf("unexpected normalized output: %+v", Normalized)
 	}
 
+	Irreversible := MigrationInput{
+		Title:              "Remove data",
+		SQLText:            "DELETE FROM users;",
+		Irreversible:       true,
+		IrreversibleReason: "Deleted rows cannot be restored",
+	}
+	if Err := Irreversible.Validate(); Err != nil {
+		T.Fatalf("valid irreversible migration rejected: %v", Err)
+	}
+	if Irreversible.Normalized().IrreversibleReason != "Deleted rows cannot be restored" {
+		T.Fatal("irreversible reason was not normalized")
+	}
+
 	for _, Invalid := range []MigrationInput{
-		{Title: "", SQLText: "SELECT 1;"},
-		{Title: "   ", SQLText: "SELECT 1;"},
-		{Title: Strings.Repeat("A", 129), SQLText: "SELECT 1;"},
-		{Title: "Valid Title", SQLText: ""},
-		{Title: "Valid Title", SQLText: "    "},
+		{Title: "", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"},
+		{Title: "   ", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"},
+		{Title: Strings.Repeat("A", 129), SQLText: "SELECT 1;", DownSQL: "SELECT 1;"},
+		{Title: "Valid Title", SQLText: "", DownSQL: "SELECT 1;"},
+		{Title: "Valid Title", SQLText: "    ", DownSQL: "SELECT 1;"},
+		{Title: "Valid Title", SQLText: "SELECT 1;"},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "   "},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", Irreversible: true},
+		{Title: "Valid Title", SQLText: "SELECT 1;", Irreversible: true},
+		{Title: "Valid Title", SQLText: "SELECT 1;", Irreversible: true, IrreversibleReason: Strings.Repeat("x", 501)},
 	} {
 		if Err := Invalid.Validate(); !Errors.Is(Err, ErrInvalidInput) {
 			T.Fatalf("expected ErrInvalidInput for %+v, got %v", Invalid, Err)
 		}
+	}
+}
+
+func TestExecutionStatusHelpers(T *Testing.T) {
+	if !ExecutionFailed.IsFailure() || !ExecutionPartial.IsFailure() || !ExecutionPartiallyReverted.IsFailure() {
+		T.Fatal("failure execution statuses must report failure")
+	}
+	if ExecutionSucceeded.IsFailure() || ExecutionRunning.IsFailure() {
+		T.Fatal("success/running must not report failure")
+	}
+	if !ExecutionSucceeded.IsFinished() || !ExecutionFailed.IsFinished() || ExecutionRunning.IsFinished() {
+		T.Fatal("finished helper is incorrect")
 	}
 }

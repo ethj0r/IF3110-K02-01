@@ -68,10 +68,11 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     return Response.status() === 204 ? undefined as Value : await Response.json() as Value
   }
 
-  async function SaveDraft(Page: Page, Title: string, SQL: string) {
+  async function SaveDraft(Page: Page, Title: string, SQL: string, DownSQL = 'SELECT 1;') {
     await Page.getByRole('button', { name: '+ Create Migration', exact: true }).click()
     await Page.getByLabel('Title:', { exact: true }).fill(Title)
-    await Page.getByLabel('SQL Query (Transactional):', { exact: true }).fill(SQL)
+    await Page.getByLabel('Up SQL:', { exact: true }).fill(SQL)
+    await Page.getByLabel('Down SQL:', { exact: true }).fill(DownSQL)
     await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Row = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: Title, exact: true }) })
     await Expect(Row).toBeVisible()
@@ -91,8 +92,8 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
       const History = CanCleanup ? await EditorAPI<HistoryItem[]>(Base) : []
       if (History.some(Item => Item.status === 'pending')) throw new Error(`Fixture ${Prefix} has an uncertain outcome; preserve it for reconciliation`)
       for (const Item of History.filter(Item => Item.status === 'draft')) await EditorAPI(`${Base}/${Item.id}`, 'DELETE')
-      if (History.some(Item => Item.status === 'committed')) {
-        const Cleanup = await EditorAPI<RecordID>(Base, 'POST', { title: 'Browser fixture cleanup', sql_text: `DROP SCHEMA IF EXISTS ${QuotedSchema} CASCADE` })
+      if (History.some(Item => Item.status === 'applied')) {
+        const Cleanup = await EditorAPI<RecordID>(Base, 'POST', { title: 'Browser fixture cleanup', sql_text: `DROP SCHEMA IF EXISTS ${QuotedSchema} CASCADE`, down_sql: 'SELECT 1;' })
         await EditorAPI(`${Base}/${Cleanup.id}/execute`, 'POST')
       }
       await AdminAPI(`/api/connections/${Database.id}`, 'DELETE')
@@ -158,13 +159,13 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     const Editor = await SignInRole('editor')
     await Editor.getByRole('link', { name: Prefix, exact: true }).click()
     await Editor.getByRole('link', { name: 'Migrations', exact: true }).click()
-    const First = await SaveDraft(Editor, 'Browser create draft', FirstSQL)
+    const First = await SaveDraft(Editor, 'Browser create draft', FirstSQL, `DROP SCHEMA IF EXISTS ${QuotedSchema} CASCADE`)
     await First.getByRole('button', { name: 'Edit', exact: true }).click()
     await Editor.getByLabel('Title:', { exact: true }).fill('Browser create committed')
     await Editor.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Committed = Editor.getByRole('row').filter({ has: Editor.getByRole('cell', { name: 'Browser create committed', exact: true }) })
-    await Committed.getByRole('button', { name: 'Execute', exact: true }).click()
-    await Expect(Committed.getByRole('cell', { name: 'committed', exact: true })).toBeVisible()
+    await Committed.getByRole('button', { name: 'Apply', exact: true }).click()
+    await Expect(Committed.getByRole('cell', { name: 'applied', exact: true })).toBeVisible()
     await Editor.getByRole('link', { name: 'Browse database', exact: true }).click()
     await Editor.getByRole('combobox', { name: 'Schema', exact: true }).selectOption(Schema)
     await Editor.getByRole('combobox', { name: 'Table', exact: true }).selectOption('order items 表')
@@ -181,7 +182,7 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     await Expect(Viewer.getByRole('cell', { name: 'browser value', exact: true })).toBeVisible()
     await Viewer.getByRole('link', { name: 'Migrations', exact: true }).click()
     await Expect(Viewer.getByRole('button', { name: '+ Create Migration', exact: true })).toHaveCount(0)
-    await Expect(Viewer.getByRole('button', { name: 'Execute', exact: true })).toHaveCount(0)
+    await Expect(Viewer.getByRole('button', { name: 'Apply', exact: true })).toHaveCount(0)
     await Viewer.getByRole('button', { name: 'View', exact: true }).click()
     await Expect(Viewer.getByText(FirstSQL, { exact: true })).toBeVisible()
     const Denied = await ReadOnlyAPI(Viewer.request, `${Base}/migrations`, 'POST', { title: 'Forbidden', sql_text: 'SELECT 1' })
@@ -197,15 +198,15 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
 
     await Editor.goto(`${PageBase}/migrations`)
     const Broken = await SaveDraft(Editor, 'Browser rollback', `CREATE TABLE ${QuotedSchema}."must rollback" (id int); SELECT 1/0`)
-    await Broken.getByRole('button', { name: 'Execute', exact: true }).click()
-    await Expect(Broken.getByRole('cell', { name: 'rolled_back', exact: true })).toBeVisible()
+    await Broken.getByRole('button', { name: 'Apply', exact: true }).click()
+    await Expect(Broken.getByRole('cell', { name: 'failed', exact: true })).toBeVisible()
     await Expect(Editor.getByRole('alert')).toContainText('Execution Error:')
     const StoredHistory = await EditorAPI<HistoryItem[]>(`${Base}/migrations`)
-    Expect(StoredHistory.map(Item => Item.status)).toEqual(['committed', 'rolled_back'])
+    Expect(StoredHistory.map(Item => Item.status)).toEqual(['applied', 'failed'])
     const Tables = await EditorAPI<{ tables: { name: string }[] }>(`${Base}/tables?schema=${encodeURIComponent(Schema)}`)
     Expect(Tables.tables.map(Item => Item.name)).toEqual(['..', 'order items 表'])
     await Viewer.reload()
-    await Expect(Viewer.getByRole('cell', { name: 'rolled_back', exact: true })).toBeVisible()
+    await Expect(Viewer.getByRole('cell', { name: 'failed', exact: true })).toBeVisible()
     const Revoked = AdminPage.waitForResponse(Response => Response.url().endsWith(`/access/${Database!.id}`) && Response.request().method() === 'DELETE')
     await AdminPage.getByRole('combobox', { name: `${Prefix}_viewer access to ${Prefix}`, exact: true }).selectOption('')
     Expect((await Revoked).status()).toBe(204)

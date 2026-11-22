@@ -6,12 +6,20 @@ export interface User {
 
 export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed'
 
+export type ExecutionKind = 'apply' | 'rollback' | 'forward' | 'retry'
+export type ExecutionDirection = 'up' | 'down'
+export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'partially_reverted'
+
 export interface Migration {
   id: string
   database_id: string
   version: number
+  revision: number
   title: string
   sql_text: string
+  down_sql?: string
+  irreversible: boolean
+  irreversible_reason?: string
   status: MigrationStatus
   error_message?: string
   created_by?: string
@@ -20,11 +28,59 @@ export interface Migration {
   created_at: string
   updated_at: string
   executed_at?: string
+  locked_at?: string
+  can_apply: boolean
+  can_rollback: boolean
+  can_forward: boolean
+  can_retry: boolean
 }
 
 export interface MigrationInput {
   title: string
   sql_text: string
+  down_sql: string
+  irreversible: boolean
+  irreversible_reason: string
+}
+
+export interface MigrationAttempt {
+  id: string
+  execution_id: string
+  attempt_no: number
+  version: number
+  revision: number
+  actor_id?: string
+  actor_username?: string
+  sql_text: string
+  status: 'running' | 'succeeded' | 'failed'
+  error_message?: string
+  started_at: string
+  finished_at?: string
+  duration_ms?: number
+}
+
+export interface MigrationExecution {
+  id: string
+  migration_id: string
+  database_id: string
+  version: number
+  revision: number
+  title: string
+  kind: ExecutionKind
+  direction: ExecutionDirection
+  status: ExecutionStatus
+  sql_text: string
+  up_sql: string
+  down_sql?: string
+  rollback_of_execution_id?: string
+  retry_of_execution_id?: string
+  requested_by?: string
+  requested_by_username?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  error_message?: string
+  attempts: MigrationAttempt[]
 }
 
 export interface QueryPlanAnalysis {
@@ -135,10 +191,39 @@ export async function DeleteMigrationDraft(DatabaseID: string, MigrationID: stri
   })
 }
 
-export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<Migration> {
-  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
+export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
     method: 'POST',
   })
+}
+
+export async function ApplyMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/apply`, {
+    method: 'POST',
+  })
+}
+
+export async function RollbackMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/rollback`, {
+    method: 'POST',
+  })
+}
+
+export async function ForwardMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/forward`, {
+    method: 'POST',
+  })
+}
+
+export async function RetryMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/retry`, {
+    method: 'POST',
+  })
+}
+
+export async function ListMigrationHistory(DatabaseID: string, HideRollback: boolean, Signal?: AbortSignal): Promise<MigrationExecution[]> {
+  const Query = HideRollback ? '?hide_rollback=true' : ''
+  return ApiRequest<MigrationExecution[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/history${Query}`, { signal: Signal })
 }
 
 export async function AnalyzeQueryPlan(DatabaseID: string, SQLText: string): Promise<QueryPlanAnalysis> {
