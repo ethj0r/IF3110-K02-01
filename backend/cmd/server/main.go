@@ -83,9 +83,11 @@ func Run() error {
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: AccessRepo, Service: InspectService}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: AccessRepo}
 	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
+	MigrationRepo := Migration.NewReviewedRepository(Pool)
 	MigrationService := &Migration.Service{
-		Repo:   &Migration.Repository{Pool: Pool},
-		Access: AccessRepo,
+		Repo:    MigrationRepo,
+		Reviews: MigrationRepo,
+		Access:  AccessRepo,
 		Resolver: Migration.DSNResolverFunc(func(Ctx Context.Context, DatabaseID string) (string, error) {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err

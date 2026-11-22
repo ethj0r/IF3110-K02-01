@@ -163,6 +163,17 @@ func (Server *Service) GetGroup(Ctx Context.Context, ID string) (Group, error) {
 	return Server.Repo.GetGroup(Ctx, ID)
 }
 
+func (Server *Service) SetGroupLeader(Ctx Context.Context, GroupID, UserID string) error {
+	GroupID, UserID = Strings.TrimSpace(GroupID), Strings.TrimSpace(UserID)
+	if GroupID == "" {
+		return ErrNotFound
+	}
+	if UserID == "" {
+		return ErrInvalidInput
+	}
+	return Server.Repo.SetGroupLeader(Ctx, GroupID, UserID)
+}
+
 func (Server *Service) CreateGroup(Ctx Context.Context, Input CreateGroupInput) (Group, error) {
 	Input = Input.Normalized()
 	if Err := Input.Validate(); Err != nil {

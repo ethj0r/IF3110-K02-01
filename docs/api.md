@@ -126,6 +126,27 @@ Execution statuses are `queued`, `running`, `succeeded`, `failed`, `partial`, an
 11. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
 12. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
 
+### Migration Review
+
+For `/databases/{dbId}/migrations/{id}/reviews/{action}` (also under `/connections`),
+`action` is `apply`, `rollback`, `forward`, or `retry`.
+
+| Method and suffix | Access | Response |
+| --- | --- | --- |
+| `GET` | View Only or View + Edit | `200` with current review, or `404` before submission |
+| `POST` | View + Edit | `200` with the submitted review or the existing one for the same revision and action |
+| `PUT /{reviewId}/approvals/{groupId}` | The active leader of that group | `204`, or `404` if the review is stale |
+
+A review includes the proposed `sql_text`, `revision`, `action`, `status`, and `groups`.
+Each group includes `approved` and `can_approve` for the signed-in user. Status is
+`approved` when every group with current database access has approved through its
+current active leader. Groups without an active leader keep the review pending.
+Editing a draft or recording a new execution makes previous reviews stale.
+Review requests and approvals do not execute SQL. Starting an action through
+`/execute`, `/apply`, `/rollback`, `/forward`, or `/retry` requires a current,
+fully approved review for that action. An otherwise eligible action with missing
+approvals returns `409 approval_required`.
+
 ## Schema Comparison
 
 `POST /databases/{dbId}/schema-diff` compares the current database with a registered reference database. Requires a session, trusted Origin, CSRF token, View + Edit on `{dbId}`, and at least View Only on `reference_database_id`. Both permissions are checked before resolving either connection. Platform administrators do not bypass grants.
@@ -173,6 +194,7 @@ the trusted Origin and CSRF header. Errors follow the common JSON envelope.
 | PUT | `/admin/users/{id}/password` | Reset `{password}` and revoke sessions |
 | GET, POST | `/admin/groups` | List / create `{name,description}` |
 | GET, PATCH, DELETE | `/admin/groups/{id}` | Read / edit `{name,description}` / delete group |
+| PUT | `/admin/groups/{id}/leader` | Assign an active group member with `{user_id}` (204) |
 | GET | `/admin/groups/{id}/members` | List group members |
 | PUT, DELETE | `/admin/groups/{id}/members/{userId}` | Add / remove member |
 | GET | `/admin/groups/{id}/access` | List group database grants |
@@ -181,4 +203,8 @@ the trusted Origin and CSRF header. Errors follow the common JSON envelope.
 
 Users inherit the highest grant across their groups. Membership/grant increases
 trigger session rotation; removal or reduction revokes affected sessions.
+
+Group responses include `leader_user_id` when a leader is assigned. Assigning
+another leader replaces the current assignment. Removing the leader's membership
+clears the assignment, so the administrator can select another active member.
 

@@ -105,7 +105,8 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: Connections, Driver: Driver.PostgresDriver{}}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: Policy}
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: Policy, Service: &Inspect.Service{Connections: Connections, Driver: Driver.PostgresDriver{}}}
-	Service := &Service{Repo: &Repository{Pool: Platform}, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
+	Repo := NewReviewedRepository(Platform)
+	Service := &Service{Repo: Repo, Reviews: Repo, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
 		_, DSN, Err := Connections.DialDSN(Ctx, ID)
 		return DSN, Err
 	})}
@@ -168,7 +169,47 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Client.Request(T, "viewer", "DELETE", Path, nil, 403)
 	Client.Request(T, "viewer", "POST", Path+"/execute", nil, 403)
 	Client.Request(T, "blocked", "GET", Path, nil, 403)
+	for _, ExecutePath := range []string{Path + "/execute", Path + "/apply", "/api/connections/" + Database.ID + "/migrations/" + First.ID + "/apply"} {
+		Client.Request(T, "editor", "POST", ExecutePath, nil, 409)
+	}
+	ReviewPath := Path + "/reviews/apply"
+	SetLeader := func(Name string) {
+		Client.Request(T, "admin", "PUT", "/api/admin/groups/"+Groups[Name].ID+"/leader", map[string]string{"user_id": Users[Name].ID}, 204)
+	}
+	ApprovalPath := func(Item Review, Name string) string {
+		return ReviewPath + "/" + Item.ID + "/approvals/" + Groups[Name].ID
+	}
+	SetLeader("editor")
+	Client.Request(T, "viewer", "GET", ReviewPath, nil, 404)
+	Client.Request(T, "viewer", "POST", ReviewPath, nil, 403)
+	Client.Request(T, "blocked", "GET", ReviewPath, nil, 403)
+	Review1 := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Review1.Revision != First.Revision || Review1.SQLText != Payload.SQLText || Review1.Status != "pending_review" || len(Review1.Groups) != 2 {
+		T.Fatalf("expected review for the original revision and both groups: %+v", Review1)
+	}
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review1, "editor"), nil, 204)
+	SetLeader("viewer")
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review1, "viewer"), nil, 403)
+	if Pending := FlowDecode[Review](T, Client.Request(T, "viewer", "GET", ReviewPath, nil, 200)); Pending.Status != "pending_review" {
+		T.Fatal("one leader's approval finalized a two-group review")
+	}
+	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review1, "viewer"), nil, 204)
+	Approved := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Approved.Status != "approved" || Approved.ID != Review1.ID {
+		T.Fatal("both leaders must approve the same review, even after resubmission")
+	}
+	Payload.SQLText += "\n-- reviewed revision"
 	Client.Request(T, "editor", "PUT", Path, Payload, 200)
+	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
+	Client.Request(T, "viewer", "GET", ReviewPath, nil, 404)
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review1, "viewer"), nil, 404)
+	Review2 := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Review2.ID == Review1.ID || Review2.Revision <= Review1.Revision || Review2.Status != "pending_review" || Review2.SQLText != Payload.SQLText {
+		T.Fatal("editing SQL must require a new review")
+	}
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review2, "editor"), nil, 204)
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review2, "viewer"), nil, 204)
 	Token := Client.Tokens["editor"]
 	Client.Tokens["editor"] = ""
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 403)
@@ -178,14 +219,38 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 		T.Fatal("execution audit fields are missing")
 	}
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
+	Client.Request(T, "editor", "GET", ReviewPath, nil, 404)
+	Client.Request(T, "editor", "POST", Path+"/rollback", nil, 409)
+	RollbackReview := FlowDecode[Review](T, Client.Request(T, "editor", "POST", Path+"/reviews/rollback", nil, 200))
+	if RollbackReview.Action != KindRollback || RollbackReview.SQLText != Payload.DownSQL || RollbackReview.Status != "pending_review" {
+		T.Fatalf("rollback must have a separate review for down SQL: %+v", RollbackReview)
+	}
 	RowsPath := Base + "/tables/order%20items/rows?schema=" + Url.QueryEscape(Schema)
 	Page := FlowDecode[Inspect.TablePage](T, Client.Request(T, "viewer", "GET", RowsPath, nil, 200))
 	if Page.Total != 1 || len(Page.Rows) != 1 || *Page.Rows[0][1] != "visible" {
 		T.Fatal("view-only user could not read committed data")
 	}
+	for _, Name := range []string{"editor", "viewer"} {
+		Client.Request(T, Name, "PUT", Path+"/reviews/rollback/"+RollbackReview.ID+"/approvals/"+Groups[Name].ID, nil, 204)
+	}
+	Client.Request(T, "editor", "POST", Path+"/rollback", nil, 200)
+	Client.Request(T, "editor", "POST", Path+"/forward", nil, 409)
+	ForwardPath := Path + "/reviews/forward"
+	ForwardReview := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ForwardPath, nil, 200))
+	for _, Name := range []string{"editor", "viewer"} {
+		Client.Request(T, Name, "PUT", ForwardPath+"/"+ForwardReview.ID+"/approvals/"+Groups[Name].ID, nil, 204)
+	}
+	Client.Request(T, "editor", "POST", Path+"/forward", nil, 200)
 	BrokenTable := Pgx.Identifier{Schema, "must rollback"}.Sanitize()
 	Broken := FlowDecode[Migration](T, Client.Request(T, "editor", "POST", Base+"/migrations", MigrationInput{Title: "Rollback", SQLText: "CREATE TABLE " + BrokenTable + " (id int); SELECT 1/0", DownSQL: "DROP TABLE " + BrokenTable + ";"}, 201))
-	Client.Request(T, "editor", "POST", Base+"/migrations/"+Broken.ID+"/execute", nil, 422)
+	BrokenPath := Base + "/migrations/" + Broken.ID
+	BrokenReviewPath := BrokenPath + "/reviews/apply"
+	BrokenReview := FlowDecode[Review](T, Client.Request(T, "editor", "POST", BrokenReviewPath, nil, 200))
+	for _, Name := range []string{"editor", "viewer"} {
+		Client.Request(T, Name, "PUT", BrokenReviewPath+"/"+BrokenReview.ID+"/approvals/"+Groups[Name].ID, nil, 204)
+	}
+	Client.Request(T, "editor", "POST", BrokenPath+"/execute", nil, 422)
+	Client.Request(T, "editor", "POST", BrokenPath+"/retry", nil, 409)
 	var Exists bool
 	if Err := Target.QueryRow(Context.Background(), "SELECT to_regclass($1) IS NOT NULL", BrokenTable).Scan(&Exists); Err != nil || Exists {
 		T.Fatal("failed migration left target changes")
@@ -195,7 +260,7 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 		T.Fatal("linear history did not preserve the failed attempt")
 	}
 	Executions := FlowDecode[[]Execution](T, Client.Request(T, "viewer", "GET", Base+"/migrations/history", nil, 200))
-	if len(Executions) != 2 || Executions[0].Status != ExecutionSucceeded || Executions[1].Status != ExecutionFailed {
+	if len(Executions) != 4 || Executions[0].Status != ExecutionSucceeded || Executions[3].Status != ExecutionFailed {
 		T.Fatal("execution history did not preserve success and failure")
 	}
 	OldCookie := Client.Cookies["viewer"].Value

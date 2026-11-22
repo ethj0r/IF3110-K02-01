@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import { ReadGeneratedMigration } from '../api/schemaDiff'
 import type { GeneratedMigration } from '../api/schemaDiff'
@@ -9,20 +9,24 @@ import {
   AnalyzeQueryPlan,
   ApiError,
   ApplyMigration,
+  ApproveMigrationReview,
   CreateMigration,
   DeleteMigrationDraft,
   ForwardMigration,
+  GetMigrationReview,
   ListMigrationHistory,
   ListMigrations,
   RetryMigration,
   RollbackMigration,
+  SubmitMigrationReview,
   UpdateMigrationDraft,
+  type ExecutionKind,
   type Migration,
   type MigrationExecution,
   type QueryPlanAnalysis,
 } from '../api/client'
 
-type Action = 'apply' | 'rollback' | 'forward' | 'retry'
+const ReviewActions: ExecutionKind[] = ['apply', 'rollback', 'forward', 'retry']
 
 export function MigrationsPage() {
   const { dbId = '' } = useParams<{ dbId?: string }>()
@@ -38,6 +42,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const QueryCache = useQueryClient()
   const [SelectedMigrationID, setSelectedMigrationID] = useState<string | null>(null)
   const [SelectedExecutionID, setSelectedExecutionID] = useState<string | null>(null)
+  const [ReviewSelection, setReviewSelection] = useState<{ ID: string; Action: ExecutionKind } | null>(null)
   const [IsEditorOpen, setIsEditorOpen] = useState(Boolean(InitialDraft))
   const [EditingMigration, setEditingMigration] = useState<Migration | null>(null)
   const [EditorTitle, setEditorTitle] = useState(InitialDraft?.Title ?? '')
@@ -63,6 +68,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const History = HistoryQuery.data ?? []
   const SelectedMigration = Definitions.find(Item => Item.id === SelectedMigrationID)
   const SelectedExecution = History.find(Item => Item.id === SelectedExecutionID)
+  const ReviewMigration = Definitions.find(Item => Item.id === ReviewSelection?.ID)
   const CanEdit = Database?.level === 'view_edit' && !MigrationsQuery.isError
   const HasPending = Definitions.some(Item => Item.status === 'pending')
 
@@ -93,7 +99,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   })
 
   const ActionMutation = useMutation({
-    mutationFn: ({ ID, Action }: { ID: string; Action: Action }) => {
+    mutationFn: ({ ID, Action }: { ID: string; Action: ExecutionKind }) => {
       switch (Action) {
         case 'rollback': return RollbackMigration(ActiveDatabase, ID)
         case 'forward': return ForwardMigration(ActiveDatabase, ID)
@@ -102,6 +108,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       }
     },
     onSuccess: Executed => {
+      setReviewSelection(null)
       setExecutionError(null)
       setSuccessMessage(`${ActionLabel(Executed.kind)} v${Executed.version} finished with status ${Executed.status}.`)
       Refresh()
@@ -153,7 +160,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     EditorAnalyze.reset()
   }
 
-  function handleAction(Item: Migration, Action: Action) {
+  function handleAction(Item: Migration, Action: ExecutionKind) {
     const Label = ActionLabel(Action)
     if (!window.confirm(`${Label} migration v${Item.version} ("${Item.title}")?`)) return
     setSuccessMessage(null)
@@ -253,19 +260,15 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
                           {CanEdit && Item.status === 'draft' && (
                             <>
                               <button disabled={Busy} onClick={() => openEditEditor(Item)} style={{ fontSize: '0.85rem' }}>Edit</button>
-                              <button disabled={Busy || !Item.can_apply} onClick={() => handleAction(Item, 'apply')} style={{ fontSize: '0.85rem', fontWeight: 'bold', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Apply</button>
                               <button disabled={Busy} onClick={() => handleDelete(Item)} style={{ fontSize: '0.85rem', color: '#c5221f' }}>Delete</button>
                             </>
                           )}
-                          {CanEdit && Item.can_rollback && (
-                            <button disabled={Busy} onClick={() => handleAction(Item, 'rollback')} style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Rollback</button>
-                          )}
-                          {CanEdit && Item.can_forward && (
-                            <button disabled={Busy} onClick={() => handleAction(Item, 'forward')} style={{ fontSize: '0.85rem', background: '#137333', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Forward</button>
-                          )}
-                          {CanEdit && Item.can_retry && (
-                            <button disabled={Busy} onClick={() => handleAction(Item, 'retry')} style={{ fontSize: '0.85rem', background: '#b06000', color: '#fff', border: 'none', borderRadius: '3px', padding: '0.2rem 0.6rem' }}>Retry</button>
-                          )}
+                          {ReviewActions.filter(Action => Item[`can_${Action}`] || (Action === 'apply' && Item.status === 'draft')).map(Action => (
+                            <button key={Action} disabled={Busy || !Item[`can_${Action}`]}
+                              onClick={() => setReviewSelection({ ID: Item.id, Action })}>
+                              Review {Action}
+                            </button>
+                          ))}
                         </div>
                       </td>
                     </tr>
@@ -275,6 +278,14 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
             )
           )}
         </section>
+      )}
+
+      {Database && ReviewSelection && ReviewMigration && (
+        <MigrationReviewPanel
+          key={`${ReviewMigration.id}:${ReviewMigration.revision}:${ReviewSelection.Action}`}
+          Item={ReviewMigration} Action={ReviewSelection.Action} CanEdit={CanEdit} Busy={Busy}
+          OnClose={() => setReviewSelection(null)} OnExecute={() => handleAction(ReviewMigration, ReviewSelection.Action)}
+        />
       )}
 
       {Database && (
@@ -386,6 +397,70 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         </section>
       )}
     </main>
+  )
+}
+
+function MigrationReviewPanel({ Item, Action, CanEdit, Busy, OnClose, OnExecute }: {
+  Item: Migration
+  Action: ExecutionKind
+  CanEdit: boolean
+  Busy: boolean
+  OnClose: () => void
+  OnExecute: () => void
+}) {
+  const Heading = useRef<HTMLHeadingElement>(null)
+  useEffect(() => Heading.current?.focus(), [])
+  const Review = useQuery({
+    queryKey: ['migrations', Item.database_id, 'review', Item.id, Item.revision, Action],
+    queryFn: ({ signal }) => GetMigrationReview(Item.database_id, Item.id, Action, signal),
+    retry: false,
+    refetchInterval: 5000,
+  })
+  const Submit = useMutation({
+    mutationFn: () => SubmitMigrationReview(Item.database_id, Item.id, Action),
+    onSuccess: () => Review.refetch(),
+  })
+  const Approve = useMutation({
+    mutationFn: ({ ReviewID, GroupID }: { ReviewID: string; GroupID: string }) =>
+      ApproveMigrationReview(Item.database_id, Item.id, Action, ReviewID, GroupID),
+    onSettled: () => Review.refetch(),
+  })
+  const Pending = Busy || Submit.isPending || Approve.isPending || Review.isFetching
+  const Available = Item[`can_${Action}`] && !Review.isError
+  const Current = Review.data
+
+  return (
+    <section className="panel migration-review" aria-labelledby="migration-review-heading">
+      <div className="migration-toolbar">
+        <h2 id="migration-review-heading" ref={Heading} tabIndex={-1}>{ActionLabel(Action)} review for v{Item.version}</h2>
+        <button type="button" onClick={OnClose}>Close review</button>
+      </div>
+      {Review.isPending && <p role="status">Loading review…</p>}
+      <RequestError error={Review.error ?? Submit.error ?? Approve.error} />
+      {Current === null && <p>No review has been requested for this action.</p>}
+      {Current && !Review.isError && (
+        <>
+          <p role="status">{Current.status === 'approved' ? 'All groups approved' : 'Waiting for group approvals'} · Revision {Current.revision}</p>
+          <SQLBlock Label="SQL for review" SQL={Current.sql_text} />
+          <ul>
+            {Current.groups.map(Group => (
+              <li key={Group.id} className="migration-toolbar">
+                <strong>{Group.name}</strong>
+                <span>{Group.approved ? 'Approved' : Group.leader_user_id ? 'Awaiting approval' : 'No active leader'}</span>
+                {Group.can_approve && <button type="button" disabled={Pending || !Available}
+                  onClick={() => Approve.mutate({ ReviewID: Current.id, GroupID: Group.id })}>Approve for {Group.name}</button>}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {CanEdit && (
+        <div className="page-actions">
+          {Current === null && <button type="button" disabled={Pending || !Available} onClick={() => Submit.mutate()}>Request review</button>}
+          <button type="button" disabled={Pending || !Available || Current?.status !== 'approved'} onClick={OnExecute}>{ActionLabel(Action)}</button>
+        </div>
+      )}
+    </section>
   )
 }
 

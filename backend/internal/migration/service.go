@@ -44,6 +44,7 @@ type MigrationRepository interface {
 
 type Service struct {
 	Repo     MigrationRepository
+	Reviews  *Repository
 	Access   Access.Evaluator
 	Resolver DSNResolver
 	Driver   Driver.Driver
