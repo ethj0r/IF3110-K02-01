@@ -11,6 +11,7 @@ import (
 var (
 	ErrReviewNotFound    = Errors.New("current migration review not found")
 	ErrReviewUnavailable = Errors.New("migration action is not available for review")
+	ErrApprovalRequired  = Errors.New("migration requires approval from every group")
 )
 
 type Review struct {
@@ -76,6 +77,17 @@ const currentReview = reviewSubject + `, current_review AS (
       AND R.previous_execution_id IS NOT DISTINCT FROM S.previous_execution_id
 )`
 
+const reviewGroups = currentReview + `, review_groups AS (
+    SELECT R.id AS review_id, G.id AS group_id, G.name, U.id AS leader_id,
+           COALESCE(V.approved_by = U.id, FALSE) AS approved
+    FROM current_review R
+    JOIN group_database_access A ON A.database_id = R.database_id
+    JOIN groups G ON G.id = A.group_id
+    LEFT JOIN group_leaders L ON L.group_id = G.id
+    LEFT JOIN users U ON U.id = L.user_id AND U.is_active
+    LEFT JOIN migration_review_approvals V ON V.review_id = R.id AND V.group_id = G.id
+)`
+
 func (Repo *Repository) submitReview(Ctx Context.Context, Key reviewKey, ActorID string) error {
 	Tag, Err := Repo.Pool.Exec(Ctx, reviewSubject+`
 INSERT INTO migration_reviews (migration_id, revision, action, previous_execution_id, sql_text, requested_by)
@@ -92,16 +104,12 @@ ON CONFLICT (migration_id, revision, action, previous_execution_id) DO UPDATE SE
 }
 
 func (Repo *Repository) getReview(Ctx Context.Context, Key reviewKey, ActorID string) (Review, error) {
-	Rows, Err := Repo.query(Ctx, currentReview+`
-SELECT R.id::text, R.revision, R.sql_text, G.id::text, G.name, U.id::text,
-       COALESCE(V.approved_by = U.id, FALSE)
+	Rows, Err := Repo.query(Ctx, reviewGroups+`
+SELECT R.id::text, R.revision, R.sql_text, G.group_id::text, G.name, G.leader_id::text,
+       COALESCE(G.approved, FALSE)
 FROM current_review R
-LEFT JOIN group_database_access A ON A.database_id = R.database_id
-LEFT JOIN groups G ON G.id = A.group_id
-LEFT JOIN group_leaders L ON L.group_id = G.id
-LEFT JOIN users U ON U.id = L.user_id AND U.is_active
-LEFT JOIN migration_review_approvals V ON V.review_id = R.id AND V.group_id = G.id
-ORDER BY G.name, G.id`, Key.DatabaseID, Key.MigrationID, Key.Action)
+LEFT JOIN review_groups G ON G.review_id = R.id
+ORDER BY G.name, G.group_id`, Key.DatabaseID, Key.MigrationID, Key.Action)
 	if Err != nil {
 		return Review{}, ErrUnavailable
 	}

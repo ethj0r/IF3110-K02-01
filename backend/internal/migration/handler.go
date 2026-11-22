@@ -69,6 +69,8 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 404, "review_not_found", "Current migration review not found")
 	case Errors.Is(Err, ErrReviewUnavailable):
 		Httpx.Error(W, 409, "review_unavailable", "Migration action is not available for review")
+	case Errors.Is(Err, ErrApprovalRequired):
+		Httpx.Error(W, 409, "approval_required", "Every group with access must approve this migration action")
 	case Errors.Is(Err, ErrNotFound):
 		Httpx.Error(W, 404, "not_found", "Migration or target database not found")
 	case Errors.Is(Err, ErrAlreadyExecuted):

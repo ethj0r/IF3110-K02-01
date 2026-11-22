@@ -142,7 +142,10 @@ Each group includes `approved` and `can_approve` for the signed-in user. Status 
 `approved` when every group with current database access has approved through its
 current active leader. Groups without an active leader keep the review pending.
 Editing a draft or recording a new execution makes previous reviews stale.
-Review requests and approvals do not execute SQL.
+Review requests and approvals do not execute SQL. Starting an action through
+`/execute`, `/apply`, `/rollback`, `/forward`, or `/retry` requires a current,
+fully approved review for that action. An otherwise eligible action with missing
+approvals returns `409 approval_required`.
 
 ## Schema Comparison
 

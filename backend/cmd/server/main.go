@@ -83,7 +83,7 @@ func Run() error {
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: AccessRepo, Service: InspectService}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: AccessRepo}
 	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
-	MigrationRepo := &Migration.Repository{Pool: Pool}
+	MigrationRepo := Migration.NewReviewedRepository(Pool)
 	MigrationService := &Migration.Service{
 		Repo:    MigrationRepo,
 		Reviews: MigrationRepo,
