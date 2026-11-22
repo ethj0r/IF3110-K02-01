@@ -173,6 +173,7 @@ the trusted Origin and CSRF header. Errors follow the common JSON envelope.
 | PUT | `/admin/users/{id}/password` | Reset `{password}` and revoke sessions |
 | GET, POST | `/admin/groups` | List / create `{name,description}` |
 | GET, PATCH, DELETE | `/admin/groups/{id}` | Read / edit `{name,description}` / delete group |
+| PUT | `/admin/groups/{id}/leader` | Assign an active group member with `{user_id}` (204) |
 | GET | `/admin/groups/{id}/members` | List group members |
 | PUT, DELETE | `/admin/groups/{id}/members/{userId}` | Add / remove member |
 | GET | `/admin/groups/{id}/access` | List group database grants |
@@ -181,4 +182,8 @@ the trusted Origin and CSRF header. Errors follow the common JSON envelope.
 
 Users inherit the highest grant across their groups. Membership/grant increases
 trigger session rotation; removal or reduction revokes affected sessions.
+
+Group responses include `leader_user_id` when a leader is assigned. Assigning
+another leader replaces the current assignment. Removing the leader's membership
+clears the assignment, so the administrator can select another active member.
 

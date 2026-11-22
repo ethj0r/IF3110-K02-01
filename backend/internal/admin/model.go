@@ -10,11 +10,12 @@ import (
 )
 
 var (
-	ErrInvalidInput = Errors.New("invalid administration request")
-	ErrNotFound     = Errors.New("administration resource not found")
-	ErrConflict     = Errors.New("administration resource already exists")
-	ErrLastAdmin    = Errors.New("at least one active platform administrator is required")
-	ErrUnavailable  = Errors.New("administration store is unavailable")
+	ErrInvalidInput  = Errors.New("invalid administration request")
+	ErrNotFound      = Errors.New("administration resource not found")
+	ErrConflict      = Errors.New("administration resource already exists")
+	ErrLastAdmin     = Errors.New("at least one active platform administrator is required")
+	ErrInvalidLeader = Errors.New("group leader must be an active member")
+	ErrUnavailable   = Errors.New("administration store is unavailable")
 )
 
 var GroupNamePattern = Regexp.MustCompile(`^[A-Za-z0-9_. -]{1,64}$`)
@@ -34,13 +35,14 @@ type GroupRef struct {
 }
 
 type Group struct {
-	ID          string    `json:"id"`
-	Name        string    `json:"name"`
-	Description string    `json:"description"`
-	MemberCount int       `json:"member_count"`
-	AccessCount int       `json:"access_count"`
-	CreatedAt   Time.Time `json:"created_at"`
-	UpdatedAt   Time.Time `json:"updated_at"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Description  string    `json:"description"`
+	MemberCount  int       `json:"member_count"`
+	AccessCount  int       `json:"access_count"`
+	LeaderUserID *string   `json:"leader_user_id,omitempty"`
+	CreatedAt    Time.Time `json:"created_at"`
+	UpdatedAt    Time.Time `json:"updated_at"`
 }
 
 type Member struct {

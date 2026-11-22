@@ -10,6 +10,7 @@ import {
   ListMembers,
   ListUsers,
   RemoveMember,
+  SetGroupLeader,
   UpdateGroup,
 } from '../../api/admin'
 import type { AdminGroup } from '../../api/admin'
@@ -232,6 +233,11 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
     mutationFn: (UserID: string) => RemoveMember(Group.id, UserID),
     onSuccess: Refresh,
   })
+  const SetLeader = useMutation({
+    mutationFn: (UserID: string) => SetGroupLeader(Group.id, UserID),
+    onSuccess: () => Cache.invalidateQueries({ queryKey: AdminQueryKeys.groups }),
+  })
+  const MembershipBusy = Add.isPending || Remove.isPending || SetLeader.isPending
 
   function Refresh() {
     void Cache.invalidateQueries({ queryKey: AdminQueryKeys.members(Group.id) })
@@ -249,7 +255,8 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
 
   return (
     <div className="stack">
-      <RequestError error={Members.error ?? Users.error ?? Add.error ?? Remove.error} />
+      <RequestError error={Members.error ?? Users.error ?? Add.error ?? Remove.error ?? SetLeader.error} />
+      {!Group.leader_user_id && <p className="muted">No leader assigned.</p>}
       {Members.isPending && <p className="state" role="status">Loading members…</p>}
 
       {Members.data && Members.data.length > 0 && (
@@ -259,8 +266,14 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
               <div>
                 <strong>{Member.username}</strong>
                 {Member.is_platform_admin && <span className="badge admin">Platform admin</span>}
+                {Member.id === Group.leader_user_id && <span className="badge admin">{Member.is_active ? 'Leader' : 'Inactive leader'}</span>}
               </div>
-              <button className="ghost small" type="button" disabled={Remove.isPending} onClick={() => Remove.mutate(Member.id)}>Remove</button>
+              <div className="row-actions">
+                {Member.is_active && Member.id !== Group.leader_user_id && (
+                  <button className="secondary small" type="button" disabled={MembershipBusy} onClick={() => SetLeader.mutate(Member.id)}>Set as leader</button>
+                )}
+                <button className="ghost small" type="button" disabled={MembershipBusy} onClick={() => Remove.mutate(Member.id)}>Remove</button>
+              </div>
             </li>
           ))}
         </ul>
@@ -276,7 +289,7 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
               {Available.map(User => <option key={User.id} value={User.id}>{User.username}</option>)}
             </select>
           </div>
-          <button className="secondary" type="submit" disabled={!Selected || Add.isPending}>{Add.isPending ? 'Adding…' : 'Add member'}</button>
+          <button className="secondary" type="submit" disabled={!Selected || MembershipBusy}>{Add.isPending ? 'Adding…' : 'Add member'}</button>
         </form>
       ) : <p className="muted">Every user is already a member.</p>}
     </div>

@@ -91,6 +91,64 @@ func ExpectStatus(T *Testing.T, Response *Httptest.ResponseRecorder, Status int)
 	}
 }
 
+func TestGroupLeaderRequiresAnAdminAndActiveMembership(T *Testing.T) {
+	App := NewFixture(T)
+	Ctx := Context.Background()
+	Group, Err := App.Service.CreateGroup(Ctx, CreateGroupInput{Name: "Reviewers"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Member, Err := App.Service.CreateUser(Ctx, CreateUserInput{Username: "reviewer", Password: TargetTestPassword})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	AdminSession, Err := App.Auth.Login(Ctx, App.Admin.Username, AdminTestPassword, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	MemberSession, Err := App.Auth.Login(Ctx, Member.Username, TargetTestPassword, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	App.Handler.Auth = &Auth.Handler{Service: App.Auth}
+	Router := Chi.NewRouter()
+	Router.Route("/api", App.Handler.Register)
+	Assign := func(Session Auth.Authenticated, UserID string) *Httptest.ResponseRecorder {
+		Request := Httptest.NewRequest(Http.MethodPut, "/api/admin/groups/"+Group.ID+"/leader", Strings.NewReader(`{"user_id":"`+UserID+`"}`))
+		Request.Header.Set("Content-Type", "application/json")
+		Request.Header.Set("Origin", "https://app.test")
+		Request.Header.Set("X-CSRF-Token", Session.CSRFToken)
+		Request.AddCookie(&Http.Cookie{Name: Auth.CookieName, Value: Session.Identifier})
+		Response := Httptest.NewRecorder()
+		Router.ServeHTTP(Response, Request)
+		return Response
+	}
+	ExpectStatus(T, Assign(MemberSession, Member.ID), Http.StatusForbidden)
+	ExpectStatus(T, Assign(AdminSession, Member.ID), Http.StatusBadRequest)
+	if Err := App.Service.AddMember(Ctx, Group.ID, Member.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := App.Service.UpdateUserActive(Ctx, Member.ID, false); Err != nil {
+		T.Fatal(Err)
+	}
+	ExpectStatus(T, Assign(AdminSession, Member.ID), Http.StatusBadRequest)
+	if _, Err := App.Service.UpdateUserActive(Ctx, Member.ID, true); Err != nil {
+		T.Fatal(Err)
+	}
+	ExpectStatus(T, Assign(AdminSession, Member.ID), Http.StatusNoContent)
+	Groups, Err := App.Service.ListGroups(Ctx)
+	if Err != nil || len(Groups) != 1 || Groups[0].LeaderUserID == nil || *Groups[0].LeaderUserID != Member.ID {
+		T.Fatalf("expected persisted group leader, got %+v (%v)", Groups, Err)
+	}
+	if Err := App.Service.RemoveMember(Ctx, Group.ID, Member.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Cleared, Err := App.Service.GetGroup(Ctx, Group.ID)
+	if Err != nil || Cleared.LeaderUserID != nil {
+		T.Fatalf("removed member still leads group: %+v (%v)", Cleared, Err)
+	}
+}
+
 func TestAdminUserGroupAndAccessLifecycle(T *Testing.T) {
 	App := NewFixture(T)
 	Admin := App.Admin
