@@ -105,7 +105,8 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: Connections, Driver: Driver.PostgresDriver{}}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: Policy}
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: Policy, Service: &Inspect.Service{Connections: Connections, Driver: Driver.PostgresDriver{}}}
-	Service := &Service{Repo: &Repository{Pool: Platform}, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
+	Repo := &Repository{Pool: Platform}
+	Service := &Service{Repo: Repo, Reviews: Repo, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: DSNResolverFunc(func(Ctx Context.Context, ID string) (string, error) {
 		_, DSN, Err := Connections.DialDSN(Ctx, ID)
 		return DSN, Err
 	})}
@@ -168,7 +169,42 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Client.Request(T, "viewer", "DELETE", Path, nil, 403)
 	Client.Request(T, "viewer", "POST", Path+"/execute", nil, 403)
 	Client.Request(T, "blocked", "GET", Path, nil, 403)
+	ReviewPath := Path + "/reviews/apply"
+	SetLeader := func(Name string) {
+		Client.Request(T, "admin", "PUT", "/api/admin/groups/"+Groups[Name].ID+"/leader", map[string]string{"user_id": Users[Name].ID}, 204)
+	}
+	ApprovalPath := func(Item Review, Name string) string {
+		return ReviewPath + "/" + Item.ID + "/approvals/" + Groups[Name].ID
+	}
+	SetLeader("editor")
+	Client.Request(T, "viewer", "GET", ReviewPath, nil, 404)
+	Client.Request(T, "viewer", "POST", ReviewPath, nil, 403)
+	Client.Request(T, "blocked", "GET", ReviewPath, nil, 403)
+	Review1 := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Review1.Revision != First.Revision || Review1.SQLText != Payload.SQLText || Review1.Status != "pending_review" || len(Review1.Groups) != 2 {
+		T.Fatalf("expected review for the original revision and both groups: %+v", Review1)
+	}
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review1, "editor"), nil, 204)
+	SetLeader("viewer")
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review1, "viewer"), nil, 403)
+	if Pending := FlowDecode[Review](T, Client.Request(T, "viewer", "GET", ReviewPath, nil, 200)); Pending.Status != "pending_review" {
+		T.Fatal("one leader's approval finalized a two-group review")
+	}
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review1, "viewer"), nil, 204)
+	Approved := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Approved.Status != "approved" || Approved.ID != Review1.ID {
+		T.Fatal("both leaders must approve the same review, even after resubmission")
+	}
+	Payload.SQLText += "\n-- reviewed revision"
 	Client.Request(T, "editor", "PUT", Path, Payload, 200)
+	Client.Request(T, "viewer", "GET", ReviewPath, nil, 404)
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review1, "viewer"), nil, 404)
+	Review2 := FlowDecode[Review](T, Client.Request(T, "editor", "POST", ReviewPath, nil, 200))
+	if Review2.ID == Review1.ID || Review2.Revision <= Review1.Revision || Review2.Status != "pending_review" || Review2.SQLText != Payload.SQLText {
+		T.Fatal("editing SQL must require a new review")
+	}
+	Client.Request(T, "editor", "PUT", ApprovalPath(Review2, "editor"), nil, 204)
+	Client.Request(T, "viewer", "PUT", ApprovalPath(Review2, "viewer"), nil, 204)
 	Token := Client.Tokens["editor"]
 	Client.Tokens["editor"] = ""
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 403)
@@ -178,6 +214,11 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 		T.Fatal("execution audit fields are missing")
 	}
 	Client.Request(T, "editor", "POST", Path+"/execute", nil, 409)
+	Client.Request(T, "editor", "GET", ReviewPath, nil, 404)
+	RollbackReview := FlowDecode[Review](T, Client.Request(T, "editor", "POST", Path+"/reviews/rollback", nil, 200))
+	if RollbackReview.Action != KindRollback || RollbackReview.SQLText != Payload.DownSQL || RollbackReview.Status != "pending_review" {
+		T.Fatalf("rollback must have a separate review for down SQL: %+v", RollbackReview)
+	}
 	RowsPath := Base + "/tables/order%20items/rows?schema=" + Url.QueryEscape(Schema)
 	Page := FlowDecode[Inspect.TablePage](T, Client.Request(T, "viewer", "GET", RowsPath, nil, 200))
 	if Page.Total != 1 || len(Page.Rows) != 1 || *Page.Rows[0][1] != "visible" {

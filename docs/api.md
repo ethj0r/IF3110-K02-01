@@ -126,6 +126,24 @@ Execution statuses are `queued`, `running`, `succeeded`, `failed`, `partial`, an
 11. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
 12. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
 
+### Migration Review
+
+For `/databases/{dbId}/migrations/{id}/reviews/{action}` (also under `/connections`),
+`action` is `apply`, `rollback`, `forward`, or `retry`.
+
+| Method and suffix | Access | Response |
+| --- | --- | --- |
+| `GET` | View Only or View + Edit | `200` with current review, or `404` before submission |
+| `POST` | View + Edit | `200` with the submitted review or the existing one for the same revision and action |
+| `PUT /{reviewId}/approvals/{groupId}` | The active leader of that group | `204`, or `404` if the review is stale |
+
+A review includes the proposed `sql_text`, `revision`, `action`, `status`, and `groups`.
+Each group includes `approved` and `can_approve` for the signed-in user. Status is
+`approved` when every group with current database access has approved through its
+current active leader. Groups without an active leader keep the review pending.
+Editing a draft or recording a new execution makes previous reviews stale.
+Review requests and approvals do not execute SQL.
+
 ## Schema Comparison
 
 `POST /databases/{dbId}/schema-diff` compares the current database with a registered reference database. Requires a session, trusted Origin, CSRF token, View + Edit on `{dbId}`, and at least View Only on `reference_database_id`. Both permissions are checked before resolving either connection. Platform administrators do not bypass grants.

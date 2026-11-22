@@ -3,6 +3,7 @@ package Migration
 import (
 	Json "encoding/json"
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
@@ -34,6 +35,9 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
 			R.Post(Prefix+"/{migrationID}/forward", Routes.Forward)
 			R.Post(Prefix+"/{migrationID}/retry", Routes.Retry)
+			R.Get(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
+			R.Post(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
+			R.Put(Prefix+"/{migrationID}/reviews/{action}/{reviewID}/approvals/{groupID}", Routes.ApproveReview)
 		})
 	}
 	registerRoutes("/databases/{dbID}/migrations")
@@ -61,6 +65,10 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 400, "invalid_request", "Invalid migration request parameters")
 	case Errors.Is(Err, ErrForbidden):
 		Httpx.Error(W, 403, "forbidden", "Insufficient database permissions for migration")
+	case Errors.Is(Err, ErrReviewNotFound):
+		Httpx.Error(W, 404, "review_not_found", "Current migration review not found")
+	case Errors.Is(Err, ErrReviewUnavailable):
+		Httpx.Error(W, 409, "review_unavailable", "Migration action is not available for review")
 	case Errors.Is(Err, ErrNotFound):
 		Httpx.Error(W, 404, "not_found", "Migration or target database not found")
 	case Errors.Is(Err, ErrAlreadyExecuted):
@@ -239,6 +247,49 @@ func (Routes *Handler) Retry(W Http.ResponseWriter, R *Http.Request) {
 		return
 	}
 	Httpx.JSON(W, 200, Result)
+}
+
+func reviewKeyFromRequest(R *Http.Request) reviewKey {
+	return reviewKey{Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), ExecutionKind(Chi.URLParam(R, "action"))}
+}
+
+func (Routes *Handler) Review(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Key := reviewKeyFromRequest(R)
+	Permission := Access.ActionView
+	if R.Method == Http.MethodPost {
+		Permission = Access.ActionEdit
+	}
+	if Err := Routes.Service.checkReviewAccess(R.Context(), User, Key, Permission); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	if R.Method == Http.MethodPost {
+		if Err := Routes.Service.Reviews.submitReview(R.Context(), Key, User.ID); Err != nil {
+			WriteMigrationError(W, Err)
+			return
+		}
+	}
+	Result, Err := Routes.Service.Reviews.getReview(R.Context(), Key, User.ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, Http.StatusOK, Result)
+}
+
+func (Routes *Handler) ApproveReview(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Key := reviewKeyFromRequest(R)
+	if Err := Routes.Service.checkReviewAccess(R.Context(), User, Key, Access.ActionView); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	if Err := Routes.Service.Reviews.approveReview(R.Context(), Key, Chi.URLParam(R, "reviewID"), Chi.URLParam(R, "groupID"), User.ID); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	W.WriteHeader(Http.StatusNoContent)
 }
 
 func (Routes *Handler) Analyze(W Http.ResponseWriter, R *Http.Request) {
