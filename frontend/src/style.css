@@ -542,6 +542,21 @@ code {
   flex: 0 0 auto;
 }
 
+.migration-review {
+  min-width: 0;
+  padding: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.migration-review .migration-toolbar > button {
+  flex: 0 1 auto;
+  white-space: normal;
+}
+
+.migration-review ul {
+  padding: 0;
+}
+
 .migration-table td:nth-child(2) {
   min-width: 12rem;
   max-width: 24rem;

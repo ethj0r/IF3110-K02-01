@@ -1,5 +1,5 @@
 import { expect as Expect, test as Test } from '@playwright/test'
-import type { APIRequestContext, BrowserContext } from '@playwright/test'
+import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test'
 import { randomBytes as RandomBytes, randomUUID as RandomUUID } from 'node:crypto'
 
 interface RecordID { id: string }
@@ -72,8 +72,18 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
   async function ExecuteSQL(Database: RecordID, SQL: string) {
     const Base = `/api/databases/${Database.id}/migrations`
     const Draft = await EditorAPI<RecordID>(Base, 'POST', { title: 'Schema diff fixture', sql_text: SQL, down_sql: 'SELECT 1;' })
+    const Path = `${Base}/${Draft.id}/reviews/apply`
+    const Review = await EditorAPI<RecordID>(Path, 'POST')
+    await EditorAPI(`${Path}/${Review.id}/approvals/${Group!.id}`, 'PUT')
     const Done = await EditorAPI<Migration>(`${Base}/${Draft.id}/execute`, 'POST')
     Expect(Done.status).toBe('succeeded')
+  }
+
+  async function ReviewAndApply(Page: Page, Row: Locator) {
+    await Row.getByRole('button', { name: 'Review apply', exact: true }).click()
+    await Page.getByRole('button', { name: 'Request review', exact: true }).click()
+    await Page.getByRole('button', { name: `Approve for ${Prefix}`, exact: true }).click()
+    await Page.getByRole('button', { name: 'Apply', exact: true }).click()
   }
 
   async function CleanupFixtures() {
@@ -101,6 +111,7 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     User = await AdminAPI<RecordID>('/api/admin/users', 'POST', { username: Prefix, password: Password })
     Group = await AdminAPI<RecordID>('/api/admin/groups', 'POST', { name: Prefix })
     await AdminAPI(`/api/admin/groups/${Group.id}/members/${User.id}`, 'PUT')
+    await AdminAPI(`/api/admin/groups/${Group.id}/leader`, 'PUT', { user_id: User.id })
     for (const Index of Targets.keys()) {
       const Database = await AdminAPI<RecordID>('/api/connections', 'POST', ConnectionData(Index))
       Databases.push(Database)
@@ -156,7 +167,7 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     await Expect(Input).toHaveValue(SQL)
     if (Scenario === 'basic') {
       await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
-      await Expect(Page.getByRole('alert')).toContainText('Plan Analysis Failed:')
+      await Expect(Page.getByRole('alert')).toContainText('Plan analysis failed:')
       await Expect(Input).toHaveValue(SQL)
       await Input.fill(`SELECT * FROM ${Table} WHERE id = 1`)
       await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
@@ -170,7 +181,7 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Row = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: 'Reviewed schema migration', exact: true }) })
     await Expect(Row.getByRole('cell', { name: 'draft', exact: true })).toBeVisible()
-    await Row.getByRole('button', { name: 'Apply', exact: true }).click()
+    await ReviewAndApply(Page, Row)
     await Expect(Row.getByRole('cell', { name: 'applied', exact: true })).toBeVisible()
     await Page.getByRole('link', { name: 'Compare schemas', exact: true }).click()
     await Page.getByLabel('Reference database', { exact: true }).selectOption(Databases[1].id)
@@ -188,7 +199,7 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
       await Page.getByLabel('Down SQL:', { exact: true }).fill('SELECT 1;')
       await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
       const Final = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: 'Finish enum migration', exact: true }) })
-      await Final.getByRole('button', { name: 'Apply', exact: true }).click()
+      await ReviewAndApply(Page, Final)
       await Expect(Final.getByRole('cell', { name: 'applied', exact: true })).toBeVisible()
       await Page.getByRole('link', { name: 'Compare schemas', exact: true }).click()
       await Page.getByLabel('Reference database', { exact: true }).selectOption(Databases[1].id)

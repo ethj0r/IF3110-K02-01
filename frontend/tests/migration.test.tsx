@@ -87,6 +87,14 @@ function ExecutionFixture(Overrides: Record<string, unknown> = {}) {
   }
 }
 
+function ReviewFixture(Action = 'apply', Approved = true) {
+  return {
+    id: 'review-1', action: Action, revision: 1, sql_text: 'SELECT 1;',
+    status: Approved ? 'approved' : 'pending_review',
+    groups: [{ id: 'group-1', name: 'Database team', leader_user_id: 'u1', approved: Approved, can_approve: !Approved }],
+  }
+}
+
 Test('loads and displays migration definitions and views details', async () => {
   Vi.stubGlobal(
     'fetch',
@@ -135,6 +143,8 @@ Test('creates and applies a draft migration', async () => {
   ]
 
   Vi.stubGlobal('confirm', () => true)
+  let ReviewRequested = false
+  let ReviewApproved = false
 
   Vi.stubGlobal(
     'fetch',
@@ -148,6 +158,15 @@ Test('creates and applies a draft migration', async () => {
         })
       }
       if (Path === '/api/auth/csrf') return Response.json({ csrf_token: 'csrf-token' })
+      if (Path.endsWith('/review-1/approvals/group-1') && Options?.method === 'PUT') {
+        ReviewApproved = true
+        return new Response(null, { status: 204 })
+      }
+      if (Path.endsWith('/reviews/apply')) {
+        ReviewRequested ||= Options?.method === 'POST'
+        if (ReviewRequested) return Response.json(ReviewFixture('apply', ReviewApproved))
+        return Response.json({ error: { code: 'review_not_found', message: 'Current migration review not found' } }, { status: 404 })
+      }
       if (Path.startsWith('/api/databases/db-1/migrations/history')) return Response.json([])
       if (Path === '/api/databases/db-1/migrations' && (!Options || Options.method === 'GET')) return Response.json(Migrations)
       if (Path === '/api/databases/db-1/migrations' && Options?.method === 'POST') {
@@ -178,7 +197,16 @@ Test('creates and applies a draft migration', async () => {
   await User.click(Screen.getByRole('button', { name: 'Save Draft' }))
   Expect(await Screen.findByText('Migration draft saved successfully.')).toBeTruthy()
 
-  await User.click(Screen.getAllByRole('button', { name: 'Apply' })[0])
+  await User.click(Screen.getAllByRole('button', { name: /^Review apply$/ })[0])
+  const RequestReview = await Screen.findByRole('button', { name: 'Request review' })
+  const Apply = Screen.getByRole<HTMLButtonElement>('button', { name: /^Apply$/ })
+  Expect(Apply.disabled).toBe(true)
+  await User.click(RequestReview)
+  const Approve = await Screen.findByRole('button', { name: 'Approve for Database team' })
+  Expect(Apply.disabled).toBe(true)
+  await User.click(Approve)
+  await Screen.findByText(/All groups approved/)
+  await User.click(Apply)
   Expect(await Screen.findByText(/finished with status succeeded/)).toBeTruthy()
   Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true)
 })
@@ -219,7 +247,7 @@ Test('viewer opens its migrations and switching database clears the editor', asy
   const User = UserEvent.setup()
   await User.click(await Screen.findByRole('link', { name: 'Migrations' }))
   await Screen.findByText('First migration')
-  const Apply = Screen.getAllByRole('button', { name: 'Apply' })
+  const Apply = Screen.getAllByRole('button', { name: /^Review apply$/ })
   Expect((Apply[0] as HTMLButtonElement).disabled).toBe(false)
   Expect((Apply[1] as HTMLButtonElement).disabled).toBe(true)
   await User.click(Screen.getAllByRole('button', { name: 'View' })[0])
@@ -235,7 +263,8 @@ Test('pending execution disables actions and explains recovery', async () => {
   InstallMigrationAPI('view_edit', 'pending')
   Mount()
   await Screen.findByText('First migration')
-  for (const Button of Screen.queryAllByRole('button', { name: 'Apply' })) Expect((Button as HTMLButtonElement).disabled).toBe(true)
+  const Apply = Screen.getByRole<HTMLButtonElement>('button', { name: /^Review apply$/ })
+  Expect(Apply.disabled).toBe(true)
   Expect(Screen.getByRole('status').textContent).toContain('Verify the target outcome')
 })
 
@@ -302,6 +331,8 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
     if (Path === '/api/auth/csrf') return Response.json({ csrf_token: 'c'.repeat(43) })
     if (Path.includes('/migrations/history')) return Response.json(Path.includes('hide_rollback=true') ? [] : History)
     if (Path === '/api/databases/db-1/migrations') return Response.json(Definitions)
+    if (Path.endsWith('/reviews/rollback')) return Response.json(ReviewFixture('rollback'))
+    if (Path.endsWith('/reviews/forward')) return Response.json(ReviewFixture('forward'))
     if (Path.endsWith('/rollback') && Options?.method === 'POST') {
       Definitions = [MigrationFixture({ status: 'rolled_back', can_rollback: false, can_forward: true })]
       return Response.json(ExecutionFixture({ id: 'exec-rollback', kind: 'rollback', direction: 'down', rollback_of_execution_id: 'exec-1' }))
@@ -315,9 +346,13 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   Mount()
   const User = UserEvent.setup()
   await Screen.findByText('Initial Schema')
-  await User.click(Screen.getByRole('button', { name: 'Rollback' }))
+  await User.click(Screen.getByRole('button', { name: /^Review rollback$/ }))
+  await Screen.findByText(/All groups approved/)
+  await User.click(Screen.getByRole('button', { name: /^Rollback$/ }))
   Expect(await Screen.findByText(/Rollback v1 finished with status succeeded/)).toBeTruthy()
-  await User.click(await Screen.findByRole('button', { name: 'Forward' }))
+  await User.click(await Screen.findByRole('button', { name: /^Review forward$/ }))
+  await Screen.findByText(/All groups approved/)
+  await User.click(Screen.getByRole('button', { name: /^Forward$/ }))
   Expect(await Screen.findByText(/Forward v1 finished with status succeeded/)).toBeTruthy()
   await User.click(Screen.getByRole('checkbox', { name: 'Hide rollback' }))
   await Screen.findByText('No execution attempts recorded.')
