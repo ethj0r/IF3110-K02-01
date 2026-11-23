@@ -27,6 +27,12 @@ func TestMetricsExposeRetainedJobsAndLivePool(T *Testing.T) {
 	if _, Err := Provider.Up(Ctx); Err != nil {
 		T.Fatal(Err)
 	}
+	Metrics := MetricsHandler{Pool: Pool}
+	Empty := Httptest.NewRecorder()
+	Metrics.ServeHTTP(Empty, Httptest.NewRequest(Http.MethodGet, "/api/metrics", nil))
+	if Empty.Code != Http.StatusOK || Strings.Contains(Empty.Body.String(), "wbd_migration_queue_wait_mean_seconds") {
+		T.Fatalf("unexpected scrape before a job has recorded a wait: %d %s", Empty.Code, Empty.Body.String())
+	}
 	if _, Err := Pool.Exec(Ctx, `WITH Target AS (
     INSERT INTO db_connections (name, host, port, dbname, username, password_ciphertext)
     VALUES ('private_target', '127.0.0.1', 5432, 'private_database', 'private_user', '\x01')
@@ -37,8 +43,9 @@ func TestMetricsExposeRetainedJobsAndLivePool(T *Testing.T) {
     RETURNING id, database_id, sql_text
 )
 INSERT INTO migration_executions
-    (migration_id, database_id, kind, direction, revision, status, sql_text, up_sql, started_at, finished_at)
+    (migration_id, database_id, kind, direction, revision, status, sql_text, up_sql, created_at, started_at, finished_at)
 SELECT D.id, D.database_id, J.kind, 'up', 1, J.status, D.sql_text, D.sql_text,
+    CURRENT_TIMESTAMP - COALESCE(J.duration, interval '0 seconds') - interval '5 seconds',
     CURRENT_TIMESTAMP - J.duration, J.finished_at
 FROM Definition D CROSS JOIN (VALUES
     ('apply', 'queued', NULL::interval, NULL),
@@ -54,7 +61,6 @@ FROM Definition D CROSS JOIN (VALUES
 	}
 	defer Conn.Release()
 
-	Metrics := MetricsHandler{Pool: Pool}
 	Result := Httptest.NewRecorder()
 	Metrics.ServeHTTP(Result, Httptest.NewRequest(Http.MethodGet, "/api/metrics", nil))
 	if Result.Code != Http.StatusOK || Result.Header().Get("Content-Type") != "text/plain; version=0.0.4; charset=utf-8" {
@@ -70,6 +76,7 @@ FROM Definition D CROSS JOIN (VALUES
 		`wbd_migration_jobs{status="partially_reverted"} 0`,
 		"wbd_migration_retry_jobs 1",
 		"wbd_migration_execution_mean_seconds 3",
+		"wbd_migration_queue_wait_mean_seconds 5",
 		`wbd_platform_pool_connections{state="active"} 1`,
 		`wbd_platform_pool_connections{state="idle"} 1`,
 	} {

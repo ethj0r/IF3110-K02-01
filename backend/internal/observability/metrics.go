@@ -23,7 +23,9 @@ const jobMetrics = `SELECT
     count(*) FILTER (WHERE status = 'partially_reverted'),
     count(*) FILTER (WHERE kind = 'retry'),
     COALESCE(avg(EXTRACT(EPOCH FROM finished_at - started_at))
-        FILTER (WHERE finished_at >= started_at), 0)::double precision
+        FILTER (WHERE finished_at >= started_at), 0)::double precision,
+    (avg(EXTRACT(EPOCH FROM started_at - created_at))
+        FILTER (WHERE started_at > created_at))::double precision
 FROM migration_executions`
 
 const prometheusMetrics = `# HELP wbd_migration_jobs Retained migration executions by status.
@@ -58,8 +60,9 @@ func (Metrics MetricsHandler) ServeHTTP(W Http.ResponseWriter, R *Http.Request) 
 
 	var Queued, Running, Succeeded, Failed, Partial, PartiallyReverted, Retries int64
 	var MeanDuration float64
+	var MeanQueueWait *float64
 	Err := Metrics.Pool.QueryRow(Ctx, jobMetrics).Scan(
-		&Queued, &Running, &Succeeded, &Failed, &Partial, &PartiallyReverted, &Retries, &MeanDuration,
+		&Queued, &Running, &Succeeded, &Failed, &Partial, &PartiallyReverted, &Retries, &MeanDuration, &MeanQueueWait,
 	)
 	if Err != nil {
 		Httpx.Error(W, Http.StatusServiceUnavailable, "metrics_unavailable", "Metrics are temporarily unavailable")
@@ -72,4 +75,10 @@ func (Metrics MetricsHandler) ServeHTTP(W Http.ResponseWriter, R *Http.Request) 
 	_, _ = Fmt.Fprintf(W, prometheusMetrics, Queued, Running, Succeeded, Failed, Partial, PartiallyReverted,
 		Retries, MeanDuration, Stats.AcquiredConns(), Stats.IdleConns(),
 		Stats.EmptyAcquireWaitTime().Seconds(), Stats.EmptyAcquireCount())
+	if MeanQueueWait != nil {
+		_, _ = Fmt.Fprintf(W, `# HELP wbd_migration_queue_wait_mean_seconds Mean time from job creation to start for retained jobs with a recorded delay.
+# TYPE wbd_migration_queue_wait_mean_seconds gauge
+wbd_migration_queue_wait_mean_seconds %g
+`, *MeanQueueWait)
+	}
 }
