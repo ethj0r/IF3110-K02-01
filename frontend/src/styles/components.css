@@ -320,11 +320,9 @@
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
   color: var(--muted);
-  font-size: 0.6875rem;
-  font-weight: 500;
-  letter-spacing: 0.06em;
+  font-size: 0.8125rem;
+  font-weight: 450;
   text-align: left;
-  text-transform: uppercase;
   white-space: nowrap;
 }
 
@@ -341,8 +339,6 @@
   color: var(--ink);
   font-size: 0.875rem;
   font-weight: 400;
-  letter-spacing: 0;
-  text-transform: none;
   white-space: normal;
 }
 
@@ -695,14 +691,12 @@
   color: var(--ink);
 }
 
-/* Eyebrow / label type */
-.eyebrow,
+/* Small secondary labels */
+.label,
 .meta-grid dt {
   color: var(--muted);
-  font-size: 0.6875rem;
-  font-weight: 500;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  font-size: 0.8125rem;
+  font-weight: 450;
 }
 
 .muted {
@@ -817,8 +811,6 @@ details[open] > summary {
 .table-data th {
   font-family: var(--font-mono);
   font-size: 0.75rem;
-  letter-spacing: 0;
-  text-transform: none;
 }
 
 .statement {
@@ -876,9 +868,6 @@ details[open] > summary {
 
 .matrix th:not(.sticky-col) {
   min-width: 180px;
-  text-transform: none;
-  letter-spacing: 0;
-  font-size: 0.8125rem;
   color: var(--ink);
 }
 

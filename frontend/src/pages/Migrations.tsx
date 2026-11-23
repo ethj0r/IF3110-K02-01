@@ -184,7 +184,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   return (
     <>
       <PageHeader
-        Eyebrow={Database?.name ?? 'Migration center'}
+        Crumbs={Database ? [{ Label: 'Databases', To: '/' }, { Label: Database.name, To: `/databases/${Database.id}` }] : undefined}
         Title="Database Migrations"
         Description="Manage immutable up/down migrations, inspect every execution attempt, and roll back or forward the active migration."
         Actions={Database && CanEdit ? (
@@ -471,7 +471,6 @@ function MigrationReviewPanel({ Item, Action, CanEdit, Busy, OnClose, OnExecute 
     <section className="card" aria-labelledby="migration-review-heading">
       <header className="card-header">
         <div className="card-title">
-          <span className="eyebrow">Approval</span>
           <h2 id="migration-review-heading" ref={Heading} tabIndex={-1}>{ActionLabel(Action)} review for v{Item.version}</h2>
           <p>Every group leader with access to this database must approve before it runs.</p>
         </div>
@@ -566,8 +565,7 @@ function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
     <div className="card-body execution-details">
       <hr className="divider" />
       <div className="card-title">
-        <span className="eyebrow">Execution</span>
-        <h3 className="mono">{Execution.id}</h3>
+        <h3>Execution <span className="mono muted">{Execution.id}</span></h3>
       </div>
       <dl className="meta-grid">
         <div><dt>Action</dt><dd>{ActionLabel(Execution.kind)} ({Execution.direction})</dd></div>
@@ -633,7 +631,7 @@ function TagList({ Items }: { Items: string[] }) {
 function Metric({ Label, Value }: { Label: string; Value: string }) {
   return (
     <div className="metric">
-      <span className="eyebrow">{Label}</span>
+      <span className="label">{Label}</span>
       <span className="metric-value">{Value}</span>
     </div>
   )

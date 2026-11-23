@@ -66,7 +66,6 @@ export function AppShell() {
         </div>
 
         <nav className="nav" aria-label="Workspace">
-          <span className="nav-label">Workspace</span>
           {WorkspaceLinks.map(Item => (
             <NavLink key={Item.To} to={Item.To} end={Item.End} className="nav-link">
               <Icon Name={Item.Glyph} />
@@ -77,7 +76,6 @@ export function AppShell() {
 
         {IsAdmin && (
           <nav className="nav" aria-label="Administration">
-            <span className="nav-label">Administration</span>
             {AdminLinks.map(Item => (
               <NavLink key={Item.To} to={Item.To} className="nav-link">
                 <Icon Name={Item.Glyph} />

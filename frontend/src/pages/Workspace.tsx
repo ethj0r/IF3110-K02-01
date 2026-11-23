@@ -15,7 +15,6 @@ export function Workspace() {
   return (
     <>
       <PageHeader
-        Eyebrow="Workspace"
         Title="Database Workspace"
         Description="Databases appear here when a group gives you access. Your highest level across all groups is shown."
         Actions={<Link to="/migrations" className="btn btn-secondary"><Icon Name="layers" Size={14} />Migration center</Link>}

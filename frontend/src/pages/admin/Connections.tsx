@@ -91,7 +91,6 @@ export function ConnectionsPage() {
   return (
     <>
       <PageHeader
-        Eyebrow="Administration"
         Title="Connections"
         Description="Target PostgreSQL databases the platform can open. Passwords are stored encrypted and never shown back."
         Actions={(

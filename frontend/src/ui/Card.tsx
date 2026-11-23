@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react'
+import { Link } from 'react-router-dom'
 
-export function PageHeader({ Eyebrow, Title, Description, Actions }: {
-  Eyebrow?: string
+export function PageHeader({ Crumbs, Title, Description, Actions }: {
+  Crumbs?: { Label: string; To: string }[]
   Title: string
   Description?: ReactNode
   Actions?: ReactNode
@@ -9,7 +10,11 @@ export function PageHeader({ Eyebrow, Title, Description, Actions }: {
   return (
     <header className="page-header">
       <div className="page-title">
-        {Eyebrow && <span className="eyebrow">{Eyebrow}</span>}
+        {Crumbs && Crumbs.length > 0 && (
+          <nav className="crumbs" aria-label="Breadcrumb">
+            {Crumbs.map(Crumb => <Link key={Crumb.To} to={Crumb.To}>{Crumb.Label}</Link>)}
+          </nav>
+        )}
         <h1>{Title}</h1>
         {Description && <p>{Description}</p>}
       </div>
@@ -51,7 +56,7 @@ export function CodeBlock({ Label, Code, Actions }: { Label: string; Code: strin
   return (
     <div className="code-block">
       <div className="code-block-header">
-        <span className="eyebrow">{Label}</span>
+        <span className="label">{Label}</span>
         {Actions}
       </div>
       <pre>{Code}</pre>

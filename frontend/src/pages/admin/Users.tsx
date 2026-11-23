@@ -80,7 +80,6 @@ export function UsersPage() {
   return (
     <>
       <PageHeader
-        Eyebrow="Administration"
         Title="Users"
         Description="Create ordinary accounts, deactivate access, and reset credentials. Platform administrators cannot be created or removed here."
         Actions={(

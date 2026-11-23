@@ -46,7 +46,7 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
   return (
     <>
       <PageHeader
-        Eyebrow={Database?.name ?? 'Database'}
+        Crumbs={Database ? [{ Label: 'Databases', To: '/' }, { Label: Database.name, To: `/databases/${DatabaseID}` }] : undefined}
         Title="Schema comparison"
         Description="Compare this database with a reference to generate reviewable SQL for the same named schema. Neither database is changed."
       />
@@ -110,7 +110,7 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
                   <ol className="list">
                     {Result.statements.map((Change, Index) => (
                       <li key={Index} className="list-item statement">
-                        <span className="eyebrow">Statement {Index + 1}</span>
+                        <span className="label">Statement {Index + 1}</span>
                         <pre className="code-pre">{Change.sql}</pre>
                         {Change.hazards.length > 0 && (
                           <ul className="hazards">

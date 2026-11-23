@@ -80,7 +80,7 @@ export function DatabaseDetailPage() {
   return (
     <>
       <PageHeader
-        Eyebrow="Database"
+        Crumbs={[{ Label: 'Databases', To: '/' }]}
         Title={Database?.name ?? 'Database'}
         Description={Database ? <><span className="mono">{Database.dbname}</span> on {Database.host}</> : 'Loading database…'}
         Actions={Database ? <LevelBadge level={Database.level} /> : undefined}

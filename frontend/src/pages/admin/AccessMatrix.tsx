@@ -23,7 +23,6 @@ export function AccessMatrixPage() {
   return (
     <>
       <PageHeader
-        Eyebrow="Administration"
         Title="Database access"
         Description="Choose the highest permission each group receives. View and edit wins over view only. Platform administrators receive no access unless a group grants it."
       />

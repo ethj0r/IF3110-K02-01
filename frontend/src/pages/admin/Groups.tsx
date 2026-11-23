@@ -78,7 +78,6 @@ export function GroupsPage() {
   return (
     <>
       <PageHeader
-        Eyebrow="Administration"
         Title="Groups"
         Description="Groups collect users and carry database grants. A user receives the highest level granted by any group they belong to."
         Actions={(
