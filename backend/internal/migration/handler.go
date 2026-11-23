@@ -7,6 +7,8 @@ import (
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Http "net/http"
@@ -24,20 +26,20 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Use(Auth.NoStore)
 			R.Use(Routes.Auth.RequireSession)
 			R.Get(Prefix, Routes.List)
-			R.Post(Prefix, Routes.Create)
-			R.Post(Prefix+"/analyze", Routes.Analyze)
+			R.With(Logging.Activity("migration.draft.create")).Post(Prefix, Routes.Create)
+			R.With(Logging.Activity("migration.plan.analyze")).Post(Prefix+"/analyze", Routes.Analyze)
 			R.Get(Prefix+"/history", Routes.History)
 			R.Get(Prefix+"/{migrationID}", Routes.Show)
-			R.Put(Prefix+"/{migrationID}", Routes.Update)
-			R.Delete(Prefix+"/{migrationID}", Routes.Delete)
-			R.Post(Prefix+"/{migrationID}/execute", Routes.Execute)
-			R.Post(Prefix+"/{migrationID}/apply", Routes.Apply)
-			R.Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
-			R.Post(Prefix+"/{migrationID}/forward", Routes.Forward)
-			R.Post(Prefix+"/{migrationID}/retry", Routes.Retry)
+			R.With(Logging.Activity("migration.draft.update")).Put(Prefix+"/{migrationID}", Routes.Update)
+			R.With(Logging.Activity("migration.draft.delete")).Delete(Prefix+"/{migrationID}", Routes.Delete)
+			R.With(Logging.Activity("migration.action.execute")).Post(Prefix+"/{migrationID}/execute", Routes.Execute)
+			R.With(Logging.Activity("migration.action.apply")).Post(Prefix+"/{migrationID}/apply", Routes.Apply)
+			R.With(Logging.Activity("migration.action.rollback")).Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
+			R.With(Logging.Activity("migration.action.forward")).Post(Prefix+"/{migrationID}/forward", Routes.Forward)
+			R.With(Logging.Activity("migration.action.retry")).Post(Prefix+"/{migrationID}/retry", Routes.Retry)
 			R.Get(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
-			R.Post(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
-			R.Put(Prefix+"/{migrationID}/reviews/{action}/{reviewID}/approvals/{groupID}", Routes.ApproveReview)
+			R.With(Logging.Activity("migration.review.submit")).Post(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
+			R.With(Logging.Activity("migration.review.approve")).Put(Prefix+"/{migrationID}/reviews/{action}/{reviewID}/approvals/{groupID}", Routes.ApproveReview)
 		})
 	}
 	registerRoutes("/databases/{dbID}/migrations")
@@ -185,11 +187,12 @@ func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
-	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), R.Header.Get("traceparent"))
+	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Tracing.Inject(R.Context()))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
 	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
 	Httpx.JSON(W, 202, Result)
 }
 
@@ -205,11 +208,12 @@ func (Routes *Handler) Job(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) enqueue(W Http.ResponseWriter, R *Http.Request, Action JobAction) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
-	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, R.Header.Get("traceparent"))
+	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, Tracing.Inject(R.Context()))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
 	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
 	Httpx.JSON(W, 202, Result)
 }
 

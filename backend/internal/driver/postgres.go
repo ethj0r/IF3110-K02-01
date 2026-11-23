@@ -32,7 +32,8 @@ type Driver interface {
 	Open(DSN string) (Conn, error)
 }
 
-type PostgresDriver struct{}
+// PostgresDriver opens target pools. Tracer, when set, receives every target statement.
+type PostgresDriver struct{ Tracer Pgx.QueryTracer }
 
 type PostgresConn struct{ Pool *Pgxpool.Pool }
 
@@ -49,10 +50,13 @@ func BuildDSN(Host string, Port int, DBName, Username, Password string) (string,
 	return Value.String(), nil
 }
 
-func openPool(DSN string) (*Pgxpool.Pool, error) {
+func openPool(DSN string, Tracer Pgx.QueryTracer) (*Pgxpool.Pool, error) {
 	Cfg, Err := Pgxpool.ParseConfig(DSN)
 	if Err != nil {
 		return nil, ErrInvalidDSN
+	}
+	if Tracer != nil {
+		Cfg.ConnConfig.Tracer = Tracer
 	}
 	Cfg.ConnConfig.ConnectTimeout = 5 * Time.Second
 	Ctx, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
@@ -68,8 +72,8 @@ func openPool(DSN string) (*Pgxpool.Pool, error) {
 	return Pool, nil
 }
 
-func (PostgresDriver) Open(DSN string) (Conn, error) {
-	Pool, Err := openPool(DSN)
+func (Current PostgresDriver) Open(DSN string) (Conn, error) {
+	Pool, Err := openPool(DSN, Current.Tracer)
 	if Err != nil {
 		if Errors.Is(Err, ErrInvalidDSN) {
 			return nil, ErrInvalidDSN

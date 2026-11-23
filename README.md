@@ -63,6 +63,196 @@ Client environment variables use the `VITE_` prefix. Never use that prefix for s
 
 API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must not contain raw database errors or credentials.
 
+### Logging and Tracing
+
+The API and the worker write one JSON object per line to stdout through `log/slog` (`backend/internal/logging`). The CLI commands (`migrate`, `seed-*`) write the same format to stderr, so their normal output stays readable. Set `LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`. Logs are never stored in the platform database.
+
+| Event | Level | Written when |
+| --- | --- | --- |
+| `http.request` | info, warn (4xx), error (5xx) | An `/api` request finishes: method, route pattern, status, bytes, duration |
+| `sql.start` | info | A statement is sent: SQL text and bound parameters |
+| `sql.finish` | info, error | A statement returns: duration, rows, command, and SQLSTATE and message on failure |
+| `sql.begin` / `sql.commit` / `sql.rollback` | info, error | Transaction control, each logged as its own event |
+| `migration.lock.acquired` / `.released` / `.failed` | info, warn, error | The per-database advisory lock, with `wait_ms` and `held_ms` |
+| `migration.execution.*` | info, error | Execution started, committed, succeeded, rolled back, failed, or uncertain |
+| `migration.job.claimed` / `.succeeded` / `.failed` / `.retry_scheduled` / `.idempotent` | info, warn, error | Worker job lifecycle; `claimed` includes `queue_wait_ms` |
+| `migration.batch.committed` / `.reverted` / `.reconciled` / `.uncertain` | info, error | Each batch, with `batch`, cursor range, rows, and duration |
+| `auth.login`, `auth.logout`, `admin.*`, `migration.draft.*`, `migration.review.*`, `migration.action.*`, `migration.plan.analyze`, `schema.compare` | info, warn | A state-changing action finished, with `outcome` (`succeeded`, `failed`, or `denied`), `status`, and the route IDs under `target` |
+| `auth.session.rejected`, `auth.csrf.rejected`, `access.denied` | info, warn | A missing or invalid session, a failed CSRF or origin check, or a missing database or administrator permission |
+
+Correlation attributes are added automatically:
+
+- `request_id` on every record of one request.
+- `trace_id` and `span_id` of the active span.
+- `actor_id` and `actor` once the session is authenticated.
+- `database_id` from the access check, or from the route for connection and grant administration.
+- `migration_id`, `execution_id`, `version`, and `attempt` during migration execution.
+- `job_id`, `worker_id`, and `batch` in the worker.
+
+`db` is `platform` or `target`, and `query_id` pairs each `sql.start` with its result. Platform pools, target pools (viewer, EXPLAIN, migrations, connection tests), schema comparison snapshots, and goose platform migrations are traced through a `pgx` query tracer.
+
+Redaction:
+
+- Attributes whose key mentions a password, secret, token, cookie, CSRF, session identifier, DSN, or ciphertext become `[REDACTED]`.
+- Connection URL credentials, `password=` pairs, and SQL `PASSWORD '...'` literals are masked in every value and in span query text.
+- All parameters are masked when a statement touches credentials or sessions. Binary values are logged only by length.
+- PostgreSQL detail lines, which can contain row values, are never logged.
+- SQL is truncated at 4 KiB and each parameter at 256 bytes.
+
+#### Tracing
+
+OpenTelemetry tracing (`backend/internal/tracing`) is always on in the API and the worker. One queued migration produces one trace across both processes:
+
+1. An `HTTP <METHOD> <route>` server span in the API, continuing an incoming W3C `traceparent` header.
+2. The enqueue handler stores that span's `traceparent` with the job (`Tracing.Inject`).
+3. The worker continues it (`Tracing.Extract`) with a consumer span `migration.job <action>`. It records `job_id`, `worker_id`, `attempt`, and `queue.wait_ms`.
+4. `migration.lock`, with `migration.lock.acquire` measuring the lock wait.
+5. `migration.execute`, recording migration and execution IDs, kind, direction, attempt, and the final status.
+6. One `migration.batch` span per batch, with batch number and cursor range.
+7. A client span per SQL statement (`sql SELECT`, `sql BEGIN`, `sql UPDATE`, `sql COMMIT`, …) with `db.query.text`, `db.response.rows`, and `db.response.status_code` (SQLSTATE).
+
+Failures set the span status to error with a safe message.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OTEL_TRACES_EXPORTER` | `console` | `console` writes JSON spans to stderr, `otlp` sends OTLP/HTTP, `none` keeps trace IDs in logs without exporting spans (quieter local runs) |
+| `OTEL_LOGS_EXPORTER` | `none` | `otlp` also ships every log record (same redaction and level) to the Collector with its trace and span IDs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Collector endpoint for `otlp` traces and logs |
+| `OTEL_SERVICE_NAME` | `wbd-api` (API), `wbd-worker` (worker) | `service.name` resource attribute; leave unset so the two processes stay distinguishable |
+
+Sample log records captured from a local run, in time order: a forward migration (lock, execution, target SQL, commit, activity), then a failing EXPLAIN request. UUIDs are shortened and the request ID host is replaced.
+
+```json
+{"time":"2026-11-23T18:15:47.415395+07:00","level":"INFO","msg":"migration lock acquired","event":"migration.lock.acquired","database_id":"7288ccc1-…","wait_ms":0.323,"trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"5f8abd93b9a2edb5","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","migration_id":"193909ec-…"}
+{"time":"2026-11-23T18:15:47.427082+07:00","level":"INFO","msg":"migration execution started","event":"migration.execution.started","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"revision":1,"kind":"forward","direction":"up","attempt":1,"sql":"CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"85b0c50f3d04e8d4","request_id":"host/etZhqJPnIk-000021"}
+{"time":"2026-11-23T18:15:47.442016+07:00","level":"INFO","msg":"sql statement finished","event":"sql.finish","db":"target","query_id":148,"duration_ms":5.249,"sql":"DO LANGUAGE plpgsql 'BEGIN EXECUTE ''CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)''; END'","status":"ok","rows":0,"command":"DO","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"518ad095620387d2","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"attempt":1}
+{"time":"2026-11-23T18:15:47.442565+07:00","level":"INFO","msg":"sql transaction committed","event":"sql.commit","db":"target","query_id":149,"duration_ms":0.483,"status":"ok","rows":0,"command":"COMMIT","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"4dd7f52af5e037f9","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"attempt":1}
+{"time":"2026-11-23T18:15:47.448188+07:00","level":"INFO","msg":"migration.action.forward","event":"migration.action.forward","outcome":"succeeded","status":200,"target":{"dbID":"7288ccc1-…","migrationID":"193909ec-…"},"trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"e9f2af90ad0cf833","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+{"time":"2026-11-23T18:17:41.921575+07:00","level":"ERROR","msg":"sql statement failed","event":"sql.finish","db":"target","query_id":51,"duration_ms":0.678,"sql":"EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON) SELECT * FROM demo.missing_table","status":"error","sqlstate":"42P01","error":"relation \"demo.missing_table\" does not exist","trace_id":"dfe14e609b85b4bc3bb33f9fa853d4aa","span_id":"157079a1fa300720","request_id":"host/MiE29545E9-000012","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+{"time":"2026-11-23T18:17:41.922058+07:00","level":"WARN","msg":"http request completed","event":"http.request","method":"POST","route":"/api/databases/{dbID}/migrations/analyze","status":422,"bytes":93,"duration_ms":12.436,"trace_id":"dfe14e609b85b4bc3bb33f9fa853d4aa","span_id":"3c5a960783f5f892","request_id":"host/MiE29545E9-000012","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+```
+
+Sample spans from the console exporter, trimmed to the main fields: a viewer request and its row query. `SpanKind` 2 is server and 3 is client. The SQL span's `Parent.SpanID` is the HTTP span.
+
+```json
+[
+  {
+    "Name": "HTTP GET /api/databases/{id}/tables/{table}/rows",
+    "SpanContext": {
+      "TraceID": "9fae9c7bd6a878dbf886cabcc2b24518",
+      "SpanID": "04f640a8bc964308"
+    },
+    "Parent": {
+      "SpanID": "0000000000000000"
+    },
+    "SpanKind": 2,
+    "StartTime": "2026-11-23T18:17:10.814532+07:00",
+    "EndTime": "2026-11-23T18:17:10.842979791+07:00",
+    "Attributes": [
+      {
+        "Key": "http.request.method",
+        "Value": "GET"
+      },
+      {
+        "Key": "url.path",
+        "Value": "/api/databases/7288ccc1-1ca1-419e-882a-8d1c885f031c/tables/movies/rows"
+      },
+      {
+        "Key": "http.route",
+        "Value": "/api/databases/{id}/tables/{table}/rows"
+      },
+      {
+        "Key": "http.response.status_code",
+        "Value": 200
+      }
+    ],
+    "Status": {
+      "Code": "Unset",
+      "Description": ""
+    },
+    "Resource": [
+      {
+        "Key": "service.name",
+        "Value": {
+          "Type": "STRING",
+          "Value": "wbd-api"
+        }
+      }
+    ]
+  },
+  {
+    "Name": "sql SELECT",
+    "SpanContext": {
+      "TraceID": "9fae9c7bd6a878dbf886cabcc2b24518",
+      "SpanID": "2325ebab4d6c9cf9"
+    },
+    "Parent": {
+      "SpanID": "04f640a8bc964308"
+    },
+    "SpanKind": 3,
+    "StartTime": "2026-11-23T18:17:10.841588+07:00",
+    "EndTime": "2026-11-23T18:17:10.842579958+07:00",
+    "Attributes": [
+      {
+        "Key": "db.system.name",
+        "Value": "postgresql"
+      },
+      {
+        "Key": "db.namespace",
+        "Value": "target"
+      },
+      {
+        "Key": "db.operation.name",
+        "Value": "SELECT"
+      },
+      {
+        "Key": "db.query.text",
+        "Value": "SELECT browse_row.* FROM \"demo\".\"movies\" AS browse_row ORDER BY \"browse_row\".\"id\", ROW(browse_row.*)::text COLLATE \"C\" LIMIT $1 OFFSET $2"
+      },
+      {
+        "Key": "query_id",
+        "Value": 28
+      },
+      {
+        "Key": "db.response.rows",
+        "Value": 2
+      }
+    ],
+    "Status": {
+      "Code": "Unset",
+      "Description": ""
+    },
+    "Resource": [
+      {
+        "Key": "service.name",
+        "Value": {
+          "Type": "STRING",
+          "Value": "wbd-api"
+        }
+      }
+    ]
+  }
+]
+```
+
+#### Central collection (Collector, Tempo, Loki)
+
+Follow [Grafana and OpenTelemetry Collector](#grafana-and-opentelemetry-collector) to run the API and worker with OTLP export. Traces go to Tempo and logs go to Loki. Each record keeps the same redaction as stdout and arrives with its trace and span IDs. The Collector removes SQL attributes before storage.
+
+To correlate, copy a `trace_id` from any log line. Open it in Grafana Explore → Tempo, or run this query in Explore → Loki:
+
+```logql
+{service_name=~"wbd-api|wbd-worker"} | trace_id = "<trace_id>"
+```
+
+Filter by service or event to find the enqueue or completion record when the trace has many log entries.
+
+Local check (batch migration, 12 rows, batch size 5, forwarded through the queue):
+
+- Tempo returned one trace of 85 spans across `wbd-api` (14) and `wbd-worker` (71). Its chain is `HTTP POST …/forward` → `migration.job forward` → `migration.lock` → `migration.execute` → `migration.batch` → `sql UPDATE`.
+- Loki returned 163 log records with the same `trace_id` (28 from the API, 135 from the worker): `http.request`, `migration.action.forward`, `migration.job.claimed` / `.succeeded`, `migration.lock.acquired` / `.released`, `migration.execution.started` / `.succeeded`, three `migration.batch.committed`, and the SQL events.
+- No `sql` or `password` attribute was stored.
+
 ### Prometheus Metrics
 
 Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
@@ -95,17 +285,19 @@ touch observability/logs/api.log observability/logs/worker.log
 docker compose -f docker-compose.observability.yml up -d --wait
 ```
 
-Start the API and worker in separate terminals. The Collector tails both JSON log files, forwards them to Loki, and removes SQL attributes from centralized logs.
+Start the API and worker in separate terminals with OTLP export for traces and logs.
 
 ```sh
-make dev-api METRICS_ENABLED=true 2>&1 | tee -a observability/logs/api.log
+make dev-api METRICS_ENABLED=true OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
 ```sh
-make dev-worker 2>&1 | tee -a observability/logs/worker.log
+make dev-worker OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
-On native Linux Docker, use `make dev-api METRICS_ENABLED=true HTTP_ADDR=0.0.0.0:8080` on a trusted development network so Prometheus can reach the host listener through the Docker bridge. If the API listens on another port, update the scrape target in `observability/prometheus.yml`.
+For file-based log collection, set `OTEL_LOGS_EXPORTER=none` on those commands and pipe stdout to `tee -a observability/logs/api.log` and `tee -a observability/logs/worker.log` respectively. Select one log export path per process to keep one copy of each record.
+
+On native Linux Docker, append `HTTP_ADDR=0.0.0.0:8080` to the API command on a trusted development network so Prometheus can reach the host listener through the Docker bridge. If the API listens on another port, update the scrape target in `observability/prometheus.yml`.
 
 1. Check the `wbd-api` scrape target at [Prometheus Targets](http://127.0.0.1:9090/targets).
 2. Open [WBD Migration Observability](http://127.0.0.1:3000/d/wbd-migrations/wbd-migration-observability) with the local Grafana credentials `admin` / `admin`. Run an approved batch migration and check the job, queue wait, batch, and row panels.

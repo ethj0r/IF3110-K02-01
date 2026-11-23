@@ -5,6 +5,7 @@ import (
 	Errors "errors"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Mime "mime"
@@ -17,7 +18,7 @@ type Handler struct {
 }
 
 func (Routes *Handler) Register(Api Chi.Router) {
-	Api.With(Routes.Auth.RequireSession).Post("/databases/{id}/schema-diff", Routes.Compare)
+	Api.With(Routes.Auth.RequireSession, Logging.Activity("schema.compare")).Post("/databases/{id}/schema-diff", Routes.Compare)
 }
 
 func (Routes *Handler) Compare(W Http.ResponseWriter, R *Http.Request) {

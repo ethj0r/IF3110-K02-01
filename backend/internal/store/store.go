@@ -3,13 +3,18 @@ package Store
 import (
 	Context "context"
 	Errors "errors"
+	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
 )
 
-func Open(Ctx Context.Context, DatabaseURL string) (*Pgxpool.Pool, error) {
+// Open connects the platform pool. An optional tracer receives every statement.
+func Open(Ctx Context.Context, DatabaseURL string, Tracers ...Pgx.QueryTracer) (*Pgxpool.Pool, error) {
 	Cfg, Err := Pgxpool.ParseConfig(DatabaseURL)
 	if Err != nil {
 		return nil, Errors.New("invalid platform database configuration")
+	}
+	if len(Tracers) > 0 && Tracers[0] != nil {
+		Cfg.ConnConfig.Tracer = Tracers[0]
 	}
 	Pool, Err := Pgxpool.NewWithConfig(Ctx, Cfg)
 	if Err != nil {

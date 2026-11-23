@@ -2,12 +2,13 @@ package main
 
 import (
 	Context "context"
-	Sql "database/sql"
 	Errors "errors"
 	Fmt "fmt"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Migrations "github.com/ethj0r/IF3110-K02-01/backend/migrations"
-	_ "github.com/jackc/pgx/v5/stdlib"
+	Pgx "github.com/jackc/pgx/v5"
+	Stdlib "github.com/jackc/pgx/v5/stdlib"
 	Goose "github.com/pressly/goose/v3"
 	Slog "log/slog"
 	Os "os"
@@ -15,6 +16,7 @@ import (
 )
 
 func main() {
+	Slog.SetDefault(Logging.New(Os.Stderr, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
 		Slog.Error("migration command failed", "error", Err)
 		Os.Exit(1)
@@ -29,10 +31,12 @@ func Run() error {
 	if Err != nil {
 		return Err
 	}
-	Db, Err := Sql.Open("pgx", Cfg.DatabaseURL)
+	ConnConfig, Err := Pgx.ParseConfig(Cfg.DatabaseURL)
 	if Err != nil {
 		return Errors.New("invalid platform database configuration")
 	}
+	ConnConfig.Tracer = Logging.SQLTracer{Database: "platform"}
+	Db := Stdlib.OpenDB(*ConnConfig)
 	defer Db.Close()
 	Ctx, Cancel := Context.WithTimeout(Context.Background(), Time.Minute)
 	defer Cancel()

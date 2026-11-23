@@ -3,7 +3,11 @@ package Migration
 import (
 	Context "context"
 	Errors "errors"
+	Slog "log/slog"
 	Time "time"
+
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
+	Attribute "go.opentelemetry.io/otel/attribute"
 
 	Pgx "github.com/jackc/pgx/v5"
 	Pgconn "github.com/jackc/pgx/v5/pgconn"
@@ -52,49 +56,59 @@ func (Repo *Repository) exec(Ctx Context.Context, SQL string, Args ...any) (Pgco
 
 const AdvisoryLockSQL = "SELECT pg_advisory_lock(hashtext('migration_' || $1::uuid::text))"
 
-func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pgxpool.Conn, error) {
+// acquireLock takes the per-database advisory lock and records the wait as a
+// span and a migration.lock.acquired (or .failed) log event.
+func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pgxpool.Conn, Time.Time, error) {
+	Started := Time.Now()
+	Ctx, Span := Tracing.Start(Ctx, "migration.lock.acquire", Attribute.String("database_id", DatabaseID))
+	defer Span.End()
 	Conn, Err := Repo.Pool.Acquire(Ctx)
+	if Err == nil {
+		if _, Err = Conn.Exec(Ctx, AdvisoryLockSQL, DatabaseID); Err != nil {
+			Conn.Release()
+		}
+	}
+	Wait := float64(Time.Since(Started).Microseconds()) / 1000
+	Span.SetAttributes(Attribute.Float64("lock.wait_ms", Wait))
 	if Err != nil {
-		return nil, ErrUnavailable
+		Tracing.Fail(Span, Err, "migration lock unavailable")
+		Slog.ErrorContext(Ctx, "migration lock unavailable", "event", "migration.lock.failed", "database_id", DatabaseID, "wait_ms", Wait)
+		return nil, Time.Time{}, ErrUnavailable
 	}
-	if _, Err := Conn.Exec(Ctx, AdvisoryLockSQL, DatabaseID); Err != nil {
-		Conn.Release()
-		return nil, ErrUnavailable
+	Slog.InfoContext(Ctx, "migration lock acquired", "event", "migration.lock.acquired", "database_id", DatabaseID, "wait_ms", Wait)
+	return Conn, Time.Now(), nil
+}
+
+func (Repo *Repository) releaseLock(Ctx Context.Context, Conn *Pgxpool.Conn, DatabaseID string, Acquired Time.Time) {
+	Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	Held := float64(Time.Since(Acquired).Microseconds()) / 1000
+	if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
+		_ = Conn.Hijack().Close(Cleanup)
+		Slog.WarnContext(Cleanup, "migration lock released by closing the connection", "event", "migration.lock.released", "database_id", DatabaseID, "held_ms", Held, "status", "connection_closed")
+		return
 	}
-	return Conn, nil
+	Conn.Release()
+	Slog.InfoContext(Cleanup, "migration lock released", "event", "migration.lock.released", "database_id", DatabaseID, "held_ms", Held, "status", "ok")
 }
 
 func (Repo *Repository) WithDatabaseLock(Ctx Context.Context, DatabaseID string, Run func(MigrationRepository) (Migration, error)) (Migration, error) {
-	Conn, Err := Repo.acquireLock(Ctx, DatabaseID)
+	Conn, Acquired, Err := Repo.acquireLock(Ctx, DatabaseID)
 	if Err != nil {
 		return Migration{}, Err
 	}
-	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
-		defer Cancel()
-		if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
-			_ = Conn.Hijack().Close(Cleanup)
-		}
-		Conn.Release()
-	}()
+	defer Repo.releaseLock(Ctx, Conn, DatabaseID, Acquired)
 	Locked := *Repo
 	Locked.Conn = Conn
 	return Run(&Locked)
 }
 
 func (Repo *Repository) WithExecutionLock(Ctx Context.Context, DatabaseID string, Run func(MigrationRepository) (Execution, error)) (Execution, error) {
-	Conn, Err := Repo.acquireLock(Ctx, DatabaseID)
+	Conn, Acquired, Err := Repo.acquireLock(Ctx, DatabaseID)
 	if Err != nil {
 		return Execution{}, Err
 	}
-	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
-		defer Cancel()
-		if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
-			_ = Conn.Hijack().Close(Cleanup)
-		}
-		Conn.Release()
-	}()
+	defer Repo.releaseLock(Ctx, Conn, DatabaseID, Acquired)
 	Locked := *Repo
 	Locked.Conn = Conn
 	return Run(&Locked)
