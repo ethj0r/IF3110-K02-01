@@ -236,7 +236,7 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     const Broken = await SaveDraft(Editor, 'Browser rollback', `CREATE TABLE ${QuotedSchema}."must rollback" (id int); SELECT 1/0`)
     await ReviewAndApply(Editor, Viewer, Broken)
     await Expect(Broken.getByRole('cell', { name: 'failed', exact: true })).toBeVisible()
-    await Expect(Editor.getByRole('alert')).toContainText('Target database migration execution failed')
+    await Expect(Editor.getByRole('alert')).toContainText('target SQL execution failed')
     const StoredHistory = await EditorAPI<HistoryItem[]>(`${Base}/migrations`)
     Expect(StoredHistory.map(Item => Item.status)).toEqual(['applied', 'failed'])
     const Tables = await EditorAPI<{ tables: { name: string }[] }>(`${Base}/tables?schema=${encodeURIComponent(Schema)}`)

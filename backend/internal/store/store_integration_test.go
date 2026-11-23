@@ -3,14 +3,17 @@
 package Store_test
 
 import (
+	Bytes "bytes"
 	Context "context"
 	Sql "database/sql"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Testutil "github.com/ethj0r/IF3110-K02-01/backend/internal/testutil"
 	Migrations "github.com/ethj0r/IF3110-K02-01/backend/migrations"
 	Stdlib "github.com/jackc/pgx/v5/stdlib"
 	Goose "github.com/pressly/goose/v3"
+	Slog "log/slog"
 	Http "net/http"
 	Httptest "net/http/httptest"
 	Os "os"
@@ -85,5 +88,23 @@ func TestIsolatedSchemasAndGoose(T *Testing.T) {
 	var Exists bool
 	if Err := First.QueryRow(Ctx, "SELECT to_regclass('goose_probe') IS NOT NULL").Scan(&Exists); Err != nil || !Exists {
 		T.Fatal("goose must apply migration to isolated schema")
+	}
+}
+
+func TestOpenAttachesSQLTracer(T *Testing.T) {
+	Ctx, Cancel := Context.WithTimeout(Context.Background(), 10*Time.Second)
+	defer Cancel()
+	Buffer := &Bytes.Buffer{}
+	Pool, Err := Store.Open(Ctx, Os.Getenv("TEST_DATABASE_URL"), Logging.SQLTracer{Database: "platform", Logger: Logging.New(Buffer, Slog.LevelInfo)})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	defer Pool.Close()
+	var Value int
+	if Err := Pool.QueryRow(Ctx, "SELECT $1::int + 1", 41).Scan(&Value); Err != nil || Value != 42 {
+		T.Fatal("query through traced pool failed")
+	}
+	if !Strings.Contains(Buffer.String(), `"db":"platform"`) || !Strings.Contains(Buffer.String(), `"params":["41"]`) {
+		T.Fatalf("platform pool did not trace the statement: %s", Buffer.String())
 	}
 }

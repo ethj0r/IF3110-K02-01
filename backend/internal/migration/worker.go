@@ -8,6 +8,10 @@ import (
 
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
+	Attribute "go.opentelemetry.io/otel/attribute"
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 type Worker struct {
@@ -41,21 +45,21 @@ func (W *Worker) poll() Time.Duration {
 }
 
 func (W *Worker) Run(Ctx Context.Context) error {
-	W.logger().Info("worker started", "worker_id", W.ID, "lease", W.lease().String(), "poll", W.poll().String())
+	W.logger().InfoContext(Ctx, "worker started", "worker_id", W.ID, "lease", W.lease().String(), "poll", W.poll().String())
 	for {
 		if Ctx.Err() != nil {
-			W.logger().Info("worker stopped", "worker_id", W.ID)
+			W.logger().InfoContext(Ctx, "worker stopped", "worker_id", W.ID)
 			return nil
 		}
 		if Count, Err := W.Repo.ExpireStaleJobs(Ctx, 20); Err != nil {
-			W.logger().Error("worker could not expire stale jobs", "worker_id", W.ID, "error", Err)
+			W.logger().ErrorContext(Ctx, "worker could not expire stale jobs", "worker_id", W.ID, "error", Err)
 		} else if Count > 0 {
-			W.logger().Warn("worker expired stale jobs", "worker_id", W.ID, "count", Count)
+			W.logger().WarnContext(Ctx, "worker expired stale jobs", "worker_id", W.ID, "count", Count)
 		}
 		Job, Err := W.Repo.ClaimJob(Ctx, W.ID, W.lease())
 		if Err != nil {
 			if !Errors.Is(Err, ErrJobNotFound) {
-				W.logger().Error("worker could not claim a job", "worker_id", W.ID, "error", Err)
+				W.logger().ErrorContext(Ctx, "worker could not claim a job", "worker_id", W.ID, "error", Err)
 			}
 			if !sleep(Ctx, W.poll()) {
 				return nil
@@ -77,6 +81,9 @@ func sleep(Ctx Context.Context, Duration Time.Duration) bool {
 	}
 }
 
+// Process runs one claimed job. It continues the trace stored with the job, so
+// the worker span joins the API request that enqueued it, and every record and
+// SQL statement of the job carries job_id, worker_id, and attempt.
 func (W *Worker) Process(Ctx Context.Context, Job Job) {
 	User := Auth.Principal{}
 	if Job.RequestedBy != nil {
@@ -85,10 +92,22 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 	if Job.RequestedByUsername != nil {
 		User.Username = *Job.RequestedByUsername
 	}
-	W.logger().Info("worker claimed migration job",
-		"event", "migration.job.claimed", "worker_id", W.ID,
-		"job_id", Job.ID, "database_id", Job.DatabaseID, "migration_id", Job.MigrationID,
-		"action", Job.Action, "attempt", Job.Attempts, "traceparent", stringValue(Job.TraceParent))
+	QueueWait := float64(Time.Since(Job.CreatedAt).Microseconds()) / 1000
+	Ctx = Tracing.Extract(Ctx, stringValue(Job.TraceParent))
+	Ctx, Span := Tracing.Tracer().Start(Ctx, "migration.job "+string(Job.Action),
+		Trace.WithSpanKind(Trace.SpanKindConsumer),
+		Trace.WithAttributes(
+			Attribute.String("job_id", Job.ID), Attribute.String("worker_id", W.ID),
+			Attribute.String("database_id", Job.DatabaseID), Attribute.String("migration_id", Job.MigrationID),
+			Attribute.String("migration.action", string(Job.Action)), Attribute.Int("attempt", Job.Attempts),
+			Attribute.Float64("queue.wait_ms", QueueWait),
+		))
+	defer Span.End()
+	Ctx = Logging.NewScope(Ctx, "job_id", Job.ID, "worker_id", W.ID, "database_id", Job.DatabaseID,
+		"migration_id", Job.MigrationID, "action", string(Job.Action), "attempt", Job.Attempts,
+		"actor_id", User.ID, "actor", User.Username)
+	W.logger().InfoContext(Ctx, "worker claimed migration job",
+		"event", "migration.job.claimed", "queue_wait_ms", QueueWait)
 
 	Latest, LatestErr := W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID)
 	UseRetry := LatestErr == nil && (Latest.Status.IsFailure() || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted)
@@ -122,10 +141,10 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 	}
 	if Err == nil {
 		if FinishErr := W.Repo.FinishJob(Ctx, Job.ID, JobSucceeded, ExecutionID, nil); FinishErr != nil {
-			W.logger().Error("worker could not record job success", "event", "migration.job.finish_failed", "worker_id", W.ID, "job_id", Job.ID, "error", FinishErr)
+			W.logger().ErrorContext(Ctx, "worker could not record job success", "event", "migration.job.finish_failed", "worker_id", W.ID, "job_id", Job.ID, "error", FinishErr)
 			return
 		}
-		W.logger().Info("worker completed migration job",
+		W.logger().InfoContext(Ctx, "worker completed migration job",
 			"event", "migration.job.succeeded", "worker_id", W.ID,
 			"job_id", Job.ID, "execution_id", stringValue(ExecutionID), "action", Job.Action)
 		return
@@ -133,7 +152,7 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 
 	if Errors.Is(Err, ErrAlreadyExecuted) {
 		if FinishErr := W.Repo.FinishJob(Ctx, Job.ID, JobSucceeded, ExecutionID, nil); FinishErr == nil {
-			W.logger().Info("worker job was already applied",
+			W.logger().InfoContext(Ctx, "worker job was already applied",
 				"event", "migration.job.idempotent", "worker_id", W.ID,
 				"job_id", Job.ID, "execution_id", stringValue(ExecutionID), "action", Job.Action)
 			return
@@ -146,19 +165,21 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 	if !Uncertain && W.retryable(Err) && Job.Attempts < Job.MaxAttempts {
 		Delay := retryDelay(Job.Attempts)
 		if RequeueErr := W.Repo.RequeueJob(Ctx, Job.ID, Time.Now().Add(Delay), Message); RequeueErr == nil {
-			W.logger().Warn("worker scheduled a migration job retry",
+			Span.SetAttributes(Attribute.String("job.outcome", "retry_scheduled"), Attribute.Float64("retry.delay_ms", float64(Delay.Milliseconds())))
+			W.logger().WarnContext(Ctx, "worker scheduled a migration job retry",
 				"event", "migration.job.retry_scheduled", "worker_id", W.ID,
 				"job_id", Job.ID, "attempt", Job.Attempts, "delay", Delay.String(), "error", Message)
 			return
 		} else {
-			W.logger().Error("worker could not requeue a migration job", "event", "migration.job.requeue_failed", "worker_id", W.ID, "job_id", Job.ID, "error", RequeueErr)
+			W.logger().ErrorContext(Ctx, "worker could not requeue a migration job", "event", "migration.job.requeue_failed", "worker_id", W.ID, "job_id", Job.ID, "error", RequeueErr)
 		}
 	}
 	if FinishErr := W.Repo.FinishJob(Ctx, Job.ID, JobFailed, ExecutionID, &Message); FinishErr != nil {
-		W.logger().Error("worker could not record job failure", "event", "migration.job.finish_failed", "worker_id", W.ID, "job_id", Job.ID, "error", FinishErr)
+		W.logger().ErrorContext(Ctx, "worker could not record job failure", "event", "migration.job.finish_failed", "worker_id", W.ID, "job_id", Job.ID, "error", FinishErr)
 		return
 	}
-	W.logger().Error("worker failed migration job",
+	Tracing.Fail(Span, Err, Message)
+	W.logger().ErrorContext(Ctx, "worker failed migration job",
 		"event", "migration.job.failed", "worker_id", W.ID,
 		"job_id", Job.ID, "execution_id", stringValue(ExecutionID), "action", Job.Action,
 		"attempt", Job.Attempts, "error", Message)

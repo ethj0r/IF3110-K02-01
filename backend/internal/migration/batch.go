@@ -7,6 +7,10 @@ import (
 
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
+	Attribute "go.opentelemetry.io/otel/attribute"
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 type batchEvidence struct {
@@ -80,18 +84,30 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 	}
 	Cursor := Exec.CheckpointCursor
 	BatchNo := Exec.CommittedBatches + 1
+	var BatchSpan Trace.Span
+	defer func() {
+		if BatchSpan != nil {
+			BatchSpan.End()
+		}
+	}()
 	for {
+		if BatchSpan != nil {
+			BatchSpan.End()
+		}
+		var BatchCtx Context.Context
+		BatchCtx, BatchSpan = Tracing.Start(Logging.With(Ctx, "batch", BatchNo), "migration.batch",
+			Attribute.Int64("batch", BatchNo), Attribute.String("migration.direction", "up"), Attribute.Int64("cursor_from", Cursor))
 		Started := Time.Now()
-		Evidence, Found, Err := readBatchEvidence(Ctx, Target, Exec.ID, BatchNo)
+		Evidence, Found, Err := readBatchEvidence(BatchCtx, Target, Exec.ID, BatchNo)
 		if Err != nil {
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
 		}
 		if Found {
-			Exec, Err = Repo.RecordBatchUp(Ctx, Exec.ID, Current.DatabaseID, BatchNo, Evidence.CursorFrom, Evidence.CursorTo, Evidence.RowCount)
+			Exec, Err = Repo.RecordBatchUp(BatchCtx, Exec.ID, Current.DatabaseID, BatchNo, Evidence.CursorFrom, Evidence.CursorTo, Evidence.RowCount)
 			if Err != nil {
 				return Exec, ErrUnavailable
 			}
-			Server.logger().Info("migration batch reconciled from target evidence",
+			Server.logger().InfoContext(BatchCtx, "migration batch reconciled from target evidence",
 				"event", "migration.batch.reconciled", "database_id", Current.DatabaseID,
 				"migration_id", Current.ID, "execution_id", Exec.ID, "batch", BatchNo,
 				"cursor_from", Evidence.CursorFrom, "cursor_to", Evidence.CursorTo, "rows", Evidence.RowCount)
@@ -99,14 +115,14 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 			BatchNo++
 			continue
 		}
-		TargetTx, Err := Target.Begin(Ctx)
+		TargetTx, Err := Target.Begin(BatchCtx)
 		if Err != nil {
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
 		}
-		Rows, Err := TargetTx.Query(Ctx, Exec.SQLText, Cursor, *Exec.BatchSize)
+		Rows, Err := TargetTx.Query(BatchCtx, Exec.SQLText, Cursor, *Exec.BatchSize)
 		if Err != nil {
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 		}
 		Count := int64(0)
 		CursorTo := Cursor
@@ -114,8 +130,8 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 			var Value int64
 			if Err := Rows.Scan(&Value); Err != nil {
 				Rows.Close()
-				_ = TargetTx.Rollback(Ctx)
-				return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+				_ = TargetTx.Rollback(BatchCtx)
+				return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 			}
 			Count++
 			if Value > CursorTo {
@@ -124,29 +140,31 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 		}
 		if Err := Rows.Err(); Err != nil {
 			Rows.Close()
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 		}
 		Rows.Close()
 		if Count == 0 {
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchSuccess(Ctx, Repo, Current, Exec, Attempt)
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchSuccess(BatchCtx, Repo, Current, Exec, Attempt)
 		}
-		if Err := writeBatchEvidence(Ctx, TargetTx, Exec.ID, BatchNo, string(DirectionUp), Cursor, CursorTo, Count, Attempt.AttemptNo); Err != nil {
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+		if Err := writeBatchEvidence(BatchCtx, TargetTx, Exec.ID, BatchNo, string(DirectionUp), Cursor, CursorTo, Count, Attempt.AttemptNo); Err != nil {
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 		}
-		if Err := TargetTx.Commit(Ctx); Err != nil {
-			Server.logger().Error("migration batch commit response is uncertain",
+		if Err := TargetTx.Commit(BatchCtx); Err != nil {
+			Tracing.Fail(BatchSpan, ErrUnavailable, "migration batch commit outcome is uncertain")
+			Server.logger().ErrorContext(BatchCtx, "migration batch commit response is uncertain",
 				"event", "migration.batch.uncertain", "database_id", Current.DatabaseID,
 				"migration_id", Current.ID, "execution_id", Exec.ID, "batch", BatchNo)
 			return Exec, ErrUnavailable
 		}
-		Exec, Err = Repo.RecordBatchUp(Ctx, Exec.ID, Current.DatabaseID, BatchNo, Cursor, CursorTo, Count)
+		Exec, Err = Repo.RecordBatchUp(BatchCtx, Exec.ID, Current.DatabaseID, BatchNo, Cursor, CursorTo, Count)
 		if Err != nil {
 			return Exec, ErrUnavailable
 		}
-		Server.logger().Info("migration batch committed",
+		BatchSpan.SetAttributes(Attribute.Int64("cursor_to", CursorTo), Attribute.Int64("db.response.rows", Count))
+		Server.logger().InfoContext(BatchCtx, "migration batch committed",
 			"event", "migration.batch.committed", "database_id", Current.DatabaseID,
 			"migration_id", Current.ID, "execution_id", Exec.ID, "batch", BatchNo,
 			"attempt", Attempt.AttemptNo, "cursor_from", Cursor, "cursor_to", CursorTo,
@@ -176,45 +194,59 @@ func (Server *Service) runBatchDown(Ctx Context.Context, Repo MigrationRepositor
 	if Err != nil {
 		return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
 	}
+	var BatchSpan Trace.Span
+	defer func() {
+		if BatchSpan != nil {
+			BatchSpan.End()
+		}
+	}()
 	for _, Batch := range Batches {
+		if BatchSpan != nil {
+			BatchSpan.End()
+		}
+		var BatchCtx Context.Context
+		BatchCtx, BatchSpan = Tracing.Start(Logging.With(Ctx, "batch", Batch.BatchNo), "migration.batch",
+			Attribute.Int64("batch", Batch.BatchNo), Attribute.String("migration.direction", "down"), Attribute.Int64("cursor_from", Batch.CursorFrom), Attribute.Int64("cursor_to", Batch.CursorTo))
 		Started := Time.Now()
-		_, Found, Err := readBatchEvidence(Ctx, Target, Exec.ID, Batch.BatchNo)
+		_, Found, Err := readBatchEvidence(BatchCtx, Target, Exec.ID, Batch.BatchNo)
 		if Err != nil {
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
 		}
 		if Found {
-			Exec, Err = Repo.RecordBatchReverted(Ctx, Exec.ID, *Exec.RollbackOfExecutionID, Current.DatabaseID, Batch.BatchNo)
+			Exec, Err = Repo.RecordBatchReverted(BatchCtx, Exec.ID, *Exec.RollbackOfExecutionID, Current.DatabaseID, Batch.BatchNo)
 			if Err != nil {
 				return Exec, ErrUnavailable
 			}
-			Server.logger().Info("migration batch revert reconciled from target evidence",
+			Server.logger().InfoContext(BatchCtx, "migration batch revert reconciled from target evidence",
 				"event", "migration.batch.revert_reconciled", "database_id", Current.DatabaseID,
 				"migration_id", Current.ID, "execution_id", Exec.ID, "batch", Batch.BatchNo)
 			continue
 		}
-		TargetTx, Err := Target.Begin(Ctx)
+		TargetTx, Err := Target.Begin(BatchCtx)
 		if Err != nil {
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
 		}
-		if Err := TargetTx.Exec(Ctx, Exec.SQLText, Batch.CursorTo, Batch.CursorFrom); Err != nil {
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+		if Err := TargetTx.Exec(BatchCtx, Exec.SQLText, Batch.CursorTo, Batch.CursorFrom); Err != nil {
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 		}
-		if Err := writeBatchEvidence(Ctx, TargetTx, Exec.ID, Batch.BatchNo, string(DirectionDown), Batch.CursorFrom, Batch.CursorTo, Batch.RowCount, Attempt.AttemptNo); Err != nil {
-			_ = TargetTx.Rollback(Ctx)
-			return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+		if Err := writeBatchEvidence(BatchCtx, TargetTx, Exec.ID, Batch.BatchNo, string(DirectionDown), Batch.CursorFrom, Batch.CursorTo, Batch.RowCount, Attempt.AttemptNo); Err != nil {
+			_ = TargetTx.Rollback(BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
 		}
-		if Err := TargetTx.Commit(Ctx); Err != nil {
-			Server.logger().Error("migration batch revert commit response is uncertain",
+		if Err := TargetTx.Commit(BatchCtx); Err != nil {
+			Tracing.Fail(BatchSpan, ErrUnavailable, "migration batch revert outcome is uncertain")
+			Server.logger().ErrorContext(BatchCtx, "migration batch revert commit response is uncertain",
 				"event", "migration.batch.uncertain", "database_id", Current.DatabaseID,
 				"migration_id", Current.ID, "execution_id", Exec.ID, "batch", Batch.BatchNo)
 			return Exec, ErrUnavailable
 		}
-		Exec, Err = Repo.RecordBatchReverted(Ctx, Exec.ID, *Exec.RollbackOfExecutionID, Current.DatabaseID, Batch.BatchNo)
+		Exec, Err = Repo.RecordBatchReverted(BatchCtx, Exec.ID, *Exec.RollbackOfExecutionID, Current.DatabaseID, Batch.BatchNo)
 		if Err != nil {
 			return Exec, ErrUnavailable
 		}
-		Server.logger().Info("migration batch reverted",
+		BatchSpan.SetAttributes(Attribute.Int64("db.response.rows", Batch.RowCount))
+		Server.logger().InfoContext(BatchCtx, "migration batch reverted",
 			"event", "migration.batch.reverted", "database_id", Current.DatabaseID,
 			"migration_id", Current.ID, "execution_id", Exec.ID, "batch", Batch.BatchNo,
 			"attempt", Attempt.AttemptNo, "cursor_from", Batch.CursorFrom, "cursor_to", Batch.CursorTo,
@@ -239,7 +271,7 @@ func (Server *Service) finishBatchSuccess(Ctx Context.Context, Repo MigrationRep
 	if Err != nil {
 		return Exec, ErrUnavailable
 	}
-	Server.logger().Info("migration batch execution succeeded",
+	Server.logger().InfoContext(Ctx, "migration batch execution succeeded",
 		"event", "migration.execution.succeeded", "database_id", Current.DatabaseID,
 		"migration_id", Current.ID, "execution_id", Exec.ID, "direction", Exec.Direction,
 		"committed_batches", Updated.CommittedBatches, "committed_rows", Updated.CommittedRows,
@@ -248,6 +280,7 @@ func (Server *Service) finishBatchSuccess(Ctx Context.Context, Repo MigrationRep
 }
 
 func (Server *Service) finishBatchFailure(Ctx Context.Context, Repo MigrationRepository, Exec Execution, Attempt Attempt, Cause error) (Execution, error) {
+	Tracing.Fail(Trace.SpanFromContext(Ctx), Cause, "migration batch failed")
 	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 	defer Cancel()
 	Safe := safeMessage(Cause)
@@ -278,7 +311,7 @@ func (Server *Service) finishBatchFailure(Ctx Context.Context, Repo MigrationRep
 	if Errors.Is(Err, ErrNotFound) {
 		Updated = Exec
 	}
-	Server.logger().Error("migration batch execution failed",
+	Server.logger().ErrorContext(Ctx, "migration batch execution failed",
 		"event", "migration.batch.failed", "database_id", Exec.DatabaseID,
 		"migration_id", Exec.MigrationID, "execution_id", Exec.ID,
 		"direction", Exec.Direction, "status", Status,

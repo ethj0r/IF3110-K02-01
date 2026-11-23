@@ -4,6 +4,7 @@ import (
 	Context "context"
 	Errors "errors"
 	Fmt "fmt"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Pgx "github.com/jackc/pgx/v5"
 	Slog "log/slog"
 	Os "os"
@@ -19,6 +20,7 @@ type dataset struct {
 }
 
 func main() {
+	Slog.SetDefault(Logging.New(Os.Stderr, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
 		Slog.Error("sample dataset seeding failed", "error", Err)
 		Os.Exit(1)
@@ -53,6 +55,7 @@ func Seed(Parent Context.Context, DSN string, Item dataset) error {
 		return Fmt.Errorf("invalid database URL for %s", Item.Label)
 	}
 	Cfg.ConnectTimeout = 5 * Time.Second
+	Cfg.Tracer = Logging.SQLTracer{Database: "target"}
 	Ctx, Cancel := Context.WithTimeout(Parent, 2*Time.Minute)
 	defer Cancel()
 	Conn, Err := Pgx.ConnectConfig(Ctx, Cfg)
