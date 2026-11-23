@@ -71,15 +71,19 @@ The endpoint is disabled by default. When enabled, restrict access to the monito
 
 | Metric | Meaning |
 | --- | --- |
-| `wbd_migration_jobs{status}` | Retained execution records by status, including queued, running, succeeded, and failed |
-| `wbd_migration_retry_jobs` | Retained retry execution records |
+| `wbd_migration_jobs{status}` | Retained queue records by status, including jobs without an execution yet |
+| `wbd_migration_retry_jobs` | Retained jobs explicitly requested as retries |
+| `wbd_migration_retry_attempts` | Additional worker attempts across retained jobs |
 | `wbd_migration_execution_mean_seconds` | Mean duration of retained executions with start and finish timestamps |
-| `wbd_migration_queue_wait_mean_seconds` | Mean time from job creation to start for executions with a recorded delay |
+| `wbd_migration_queue_wait_mean_seconds` | Mean time from eligibility to the latest recorded worker claim |
+| `wbd_migration_lock_wait_max_seconds` | Longest current wait for a migration advisory lock |
+| `wbd_migration_batches_processed{direction}` | Retained batches applied (`up`) or reverted (`down`) |
+| `wbd_migration_rows_processed{direction}` | Rows applied (`up`) or reverted (`down`) in retained batches |
 | `wbd_platform_pool_connections{state}` | Active and idle PostgreSQL connections in the platform pool |
 | `wbd_platform_pool_wait_seconds_total` | Cumulative wait in seconds for successful acquisitions from the empty platform pool |
 | `wbd_platform_pool_waited_acquires_total` | Successful acquisitions that waited for the pool |
 
-Job counts are snapshots of the migration store and reflect record removal. Pool wait counters reset on API restart. Divide the rates of the two wait counters to graph mean wait per delayed acquisition.
+Job and batch counts are snapshots of the migration store and reflect record removal. Queue wait excludes retry backoff and appears when a worker has a recorded claim. Lock wait measures ongoing contention at scrape time. Pool wait counters reset on API restart. Divide their rates to graph mean wait per delayed acquisition.
 
 ### Grafana and OpenTelemetry Collector
 
@@ -87,21 +91,25 @@ With the local PostgreSQL databases running, start the optional monitoring stack
 
 ```sh
 mkdir -p observability/logs
-touch observability/logs/api.log
+touch observability/logs/api.log observability/logs/worker.log
 docker compose -f docker-compose.observability.yml up -d --wait
 ```
 
-Start the API in another terminal. The Collector tails new JSON log records, forwards them to Loki, and omits the SQL attributes from centralized logs.
+Start the API and worker in separate terminals. The Collector tails both JSON log files, forwards them to Loki, and removes SQL attributes from centralized logs.
 
 ```sh
 make dev-api METRICS_ENABLED=true 2>&1 | tee -a observability/logs/api.log
 ```
 
+```sh
+make dev-worker 2>&1 | tee -a observability/logs/worker.log
+```
+
 On native Linux Docker, use `make dev-api METRICS_ENABLED=true HTTP_ADDR=0.0.0.0:8080` on a trusted development network so Prometheus can reach the host listener through the Docker bridge. If the API listens on another port, update the scrape target in `observability/prometheus.yml`.
 
 1. Check the `wbd-api` scrape target at [Prometheus Targets](http://127.0.0.1:9090/targets).
-2. Open [WBD Migration Observability](http://127.0.0.1:3000/d/wbd-migrations/wbd-migration-observability) with the local Grafana credentials `admin` / `admin`. Run an approved migration and check the jobs, duration, and pool panels. The queue wait panel needs an execution with a recorded delay between creation and start.
-3. Open Grafana Explore with Loki and run `{service_name="wbd-api"} | event = "migration.execution.succeeded"` to see the application event recorded at the same time as the metrics change.
+2. Open [WBD Migration Observability](http://127.0.0.1:3000/d/wbd-migrations/wbd-migration-observability) with the local Grafana credentials `admin` / `admin`. Run an approved batch migration and check the job, queue wait, batch, and row panels.
+3. Open Grafana Explore with Loki and run `{service_name="wbd-worker"} | event = "migration.job.succeeded"` to see the corresponding worker completion event.
 
 The Collector accepts OTLP/HTTP on port 4318 and OTLP/gRPC on port 4317. It sends traces to Tempo and logs to Loki. To verify correlation independently of application instrumentation, run the demo below and paste its Loki query into Explore. Open the log's trace link to view the matching `observability.demo` span in Tempo. The demo emits synthetic telemetry and leaves application metrics unchanged.
 
