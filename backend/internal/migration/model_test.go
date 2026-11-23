@@ -50,6 +50,21 @@ func TestMigrationInputValidationAndNormalization(T *Testing.T) {
 		T.Fatalf("unexpected normalized output: %+v", Normalized)
 	}
 
+	Batch := MigrationInput{
+		Title:       "Batch update",
+		SQLText:     "UPDATE t SET v = v + 1 WHERE id > $1 ORDER BY id LIMIT $2 RETURNING id",
+		DownSQL:     "UPDATE t SET v = v - 1 WHERE id > $2 AND id <= $1",
+		BatchMode:   true,
+		BatchColumn: "  id  ",
+		BatchSize:   1000,
+	}
+	if Err := Batch.Validate(); Err != nil {
+		T.Fatalf("valid batch migration rejected: %v", Err)
+	}
+	if Batch.Normalized().BatchColumn != "id" {
+		T.Fatal("batch column was not normalized")
+	}
+
 	Irreversible := MigrationInput{
 		Title:              "Remove data",
 		SQLText:            "DELETE FROM users;",
@@ -74,6 +89,11 @@ func TestMigrationInputValidationAndNormalization(T *Testing.T) {
 		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", Irreversible: true},
 		{Title: "Valid Title", SQLText: "SELECT 1;", Irreversible: true},
 		{Title: "Valid Title", SQLText: "SELECT 1;", Irreversible: true, IrreversibleReason: Strings.Repeat("x", 501)},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", BatchMode: true, BatchColumn: "", BatchSize: 10},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", BatchMode: true, BatchColumn: "id", BatchSize: 0},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", BatchMode: true, BatchColumn: "id", BatchSize: 1000001},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", BatchColumn: "id"},
+		{Title: "Valid Title", SQLText: "SELECT 1;", DownSQL: "SELECT 1;", BatchSize: 10},
 	} {
 		if Err := Invalid.Validate(); !Errors.Is(Err, ErrInvalidInput) {
 			T.Fatalf("expected ErrInvalidInput for %+v, got %v", Invalid, Err)

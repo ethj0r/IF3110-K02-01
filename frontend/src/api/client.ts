@@ -18,6 +18,9 @@ export interface Migration {
   title: string
   sql_text: string
   down_sql?: string
+  batch_mode: boolean
+  batch_column?: string
+  batch_size?: number
   irreversible: boolean
   irreversible_reason?: string
   status: MigrationStatus
@@ -39,6 +42,9 @@ export interface MigrationInput {
   title: string
   sql_text: string
   down_sql: string
+  batch_mode: boolean
+  batch_column: string
+  batch_size: number
   irreversible: boolean
   irreversible_reason: string
 }
@@ -72,6 +78,14 @@ export interface MigrationExecution {
   sql_text: string
   up_sql: string
   down_sql?: string
+  mode: 'normal' | 'batch'
+  batch_column?: string
+  batch_size?: number
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
   rollback_of_execution_id?: string
   retry_of_execution_id?: string
   requested_by?: string
@@ -213,6 +227,12 @@ export interface MigrationJob {
   requested_by?: string
   requested_by_username?: string
   traceparent?: string
+  mode?: string
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
   created_at: string
   updated_at: string
   finished_at?: string

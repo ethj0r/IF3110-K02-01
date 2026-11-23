@@ -90,25 +90,34 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 		"job_id", Job.ID, "database_id", Job.DatabaseID, "migration_id", Job.MigrationID,
 		"action", Job.Action, "attempt", Job.Attempts, "traceparent", stringValue(Job.TraceParent))
 
+	Latest, LatestErr := W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID)
+	UseRetry := LatestErr == nil && (Latest.Status.IsFailure() || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted)
+
 	var Exec Execution
 	var Err error
-	switch Job.Action {
-	case JobApply:
-		Exec, Err = W.Service.Apply(Ctx, User, Job.DatabaseID, Job.MigrationID)
-	case JobRollback:
-		Exec, Err = W.Service.Rollback(Ctx, User, Job.DatabaseID, Job.MigrationID)
-	case JobForward:
-		Exec, Err = W.Service.Forward(Ctx, User, Job.DatabaseID, Job.MigrationID)
-	case JobRetry:
+	if UseRetry {
 		Exec, Err = W.Service.Retry(Ctx, User, Job.DatabaseID, Job.MigrationID)
-	default:
-		Err = ErrInvalidInput
+	} else {
+		switch Job.Action {
+		case JobApply:
+			Exec, Err = W.Service.Apply(Ctx, User, Job.DatabaseID, Job.MigrationID)
+		case JobRollback:
+			Exec, Err = W.Service.Rollback(Ctx, User, Job.DatabaseID, Job.MigrationID)
+		case JobForward:
+			Exec, Err = W.Service.Forward(Ctx, User, Job.DatabaseID, Job.MigrationID)
+		case JobRetry:
+			Exec, Err = W.Service.Retry(Ctx, User, Job.DatabaseID, Job.MigrationID)
+		default:
+			Err = ErrInvalidInput
+		}
 	}
 
 	var ExecutionID *string
 	if Exec.ID != "" {
 		ExecutionID = &Exec.ID
-	} else if Latest, LatestErr := W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID); LatestErr == nil {
+	} else if Latest.ID != "" {
+		ExecutionID = &Latest.ID
+	} else if Latest, LatestErr = W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID); LatestErr == nil {
 		ExecutionID = &Latest.ID
 	}
 	if Err == nil {
@@ -131,7 +140,20 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 		}
 	}
 
+	Latest, LatestErr = W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID)
+	Uncertain := LatestErr == nil && (Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted)
 	Message := jobErrorMessage(Err)
+	if !Uncertain && W.retryable(Err) && Job.Attempts < Job.MaxAttempts {
+		Delay := retryDelay(Job.Attempts)
+		if RequeueErr := W.Repo.RequeueJob(Ctx, Job.ID, Time.Now().Add(Delay), Message); RequeueErr == nil {
+			W.logger().Warn("worker scheduled a migration job retry",
+				"event", "migration.job.retry_scheduled", "worker_id", W.ID,
+				"job_id", Job.ID, "attempt", Job.Attempts, "delay", Delay.String(), "error", Message)
+			return
+		} else {
+			W.logger().Error("worker could not requeue a migration job", "event", "migration.job.requeue_failed", "worker_id", W.ID, "job_id", Job.ID, "error", RequeueErr)
+		}
+	}
 	if FinishErr := W.Repo.FinishJob(Ctx, Job.ID, JobFailed, ExecutionID, &Message); FinishErr != nil {
 		W.logger().Error("worker could not record job failure", "event", "migration.job.finish_failed", "worker_id", W.ID, "job_id", Job.ID, "error", FinishErr)
 		return
@@ -140,6 +162,25 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 		"event", "migration.job.failed", "worker_id", W.ID,
 		"job_id", Job.ID, "execution_id", stringValue(ExecutionID), "action", Job.Action,
 		"attempt", Job.Attempts, "error", Message)
+}
+
+func (W *Worker) retryable(Err error) bool {
+	return Errors.Is(Err, ErrUnavailable) || Errors.Is(Err, Driver.ErrUnavailable) || Errors.Is(Err, ErrJobUnavailable)
+}
+
+func retryDelay(Attempts int) Time.Duration {
+	if Attempts < 1 {
+		Attempts = 1
+	}
+	Shift := Attempts - 1
+	if Shift > 4 {
+		Shift = 4
+	}
+	Delay := Time.Duration(1<<Shift) * 2 * Time.Second
+	if Delay > 30*Time.Second {
+		return 30 * Time.Second
+	}
+	return Delay
 }
 
 func jobErrorMessage(Err error) string {

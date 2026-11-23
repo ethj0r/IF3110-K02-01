@@ -45,6 +45,11 @@ type MigrationRepository interface {
 	ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error)
 	FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error
 	ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error)
+	RequeueJob(Ctx Context.Context, JobID string, AvailableAt Time.Time, LastError string) error
+	SetExecutionRunning(Ctx Context.Context, DatabaseID string, ExecutionID string) (Execution, error)
+	RecordBatchUp(Ctx Context.Context, ExecutionID string, DatabaseID string, BatchNo int64, CursorFrom int64, CursorTo int64, RowCount int64) (Execution, error)
+	RecordBatchReverted(Ctx Context.Context, RollbackExecutionID string, UpExecutionID string, DatabaseID string, BatchNo int64) (Execution, error)
+	ListCommittedBatches(Ctx Context.Context, ExecutionID string) ([]Batch, error)
 }
 
 type Service struct {
@@ -310,6 +315,9 @@ func (Server *Service) retryLocked(Ctx Context.Context, Repo MigrationRepository
 	if Err := ValidateRetry(Current, History); Err != nil {
 		return Execution{}, Err
 	}
+	if Latest.Mode == ModeBatch {
+		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
+	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
 		Kind:        KindRetry,
 		Direction:   Latest.Direction,
@@ -393,6 +401,14 @@ func (Server *Service) GetJob(Ctx Context.Context, User Auth.Principal, Database
 	return Server.Repo.GetJob(Ctx, DatabaseID, JobID)
 }
 
+func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
+	Running, Err := Repo.SetExecutionRunning(Ctx, Current.DatabaseID, Latest.ID)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	return Server.runExecution(Ctx, Repo, User, Current, Running)
+}
+
 func (Server *Service) loadState(Ctx Context.Context, Repo MigrationRepository, DatabaseID string) ([]Migration, []Execution, error) {
 	Items, Err := Repo.List(Ctx, DatabaseID)
 	if Err != nil {
@@ -433,6 +449,12 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 
 	if Server.Resolver == nil {
 		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Driver.ErrUnavailable)
+	}
+	if Exec.Mode == ModeBatch {
+		if Exec.Direction == DirectionUp {
+			return Server.runBatchUp(Ctx, Repo, User, Current, Exec, Attempt)
+		}
+		return Server.runBatchDown(Ctx, Repo, User, Current, Exec, Attempt)
 	}
 	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, Current.DatabaseID)
 	if Err != nil {
@@ -574,8 +596,11 @@ func ValidateRollback(Current Migration, Items []Migration, History []Execution)
 	if Current.Irreversible || Current.DownSQL == nil {
 		return Execution{}, ErrIrreversible
 	}
-	Success, Ok := LatestSuccessfulFor(History, Current.ID)
-	if !Ok || Success.Direction != DirectionUp {
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionUp {
+		return Execution{}, ErrNotApplied
+	}
+	if Latest.Status != ExecutionSucceeded && Latest.Status != ExecutionPartial {
 		return Execution{}, ErrNotApplied
 	}
 	if HasPending(History) {
@@ -584,12 +609,12 @@ func ValidateRollback(Current Migration, Items []Migration, History []Execution)
 	if Current.Version != FrontierVersion(Items) {
 		return Execution{}, ErrRollbackOrder
 	}
-	return Success, nil
+	return Latest, nil
 }
 
 func ValidateForward(Current Migration, Items []Migration, History []Execution) error {
-	Success, Ok := LatestSuccessfulFor(History, Current.ID)
-	if !Ok || Success.Direction != DirectionDown {
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionDown || Latest.Status != ExecutionSucceeded {
 		return ErrNotRolledBack
 	}
 	if HasPending(History) {
@@ -695,12 +720,15 @@ func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 		switch {
 		case Item.LockedAt == nil && Item.Status.IsDraft():
 			Item.CanApply = CanApplyNow(Result, Item.Version)
-		case Item.Status.IsApplied():
-			Item.CanRollback = Item.Version == MaxApplied && !Item.Irreversible && Item.DownSQL != nil
+		case Item.Status.IsApplied() || Item.Status == StatusPartial:
+			LatestItem, HasLatest := Latest[Item.ID]
+			Item.CanRollback = Item.Version == FrontierVersion(Result) && !Item.Irreversible && Item.DownSQL != nil &&
+				HasLatest && LatestItem.Direction == DirectionUp && (LatestItem.Status == ExecutionSucceeded || LatestItem.Status == ExecutionPartial)
 		case Item.Status.IsRolledBack():
-			Item.CanForward = Item.Version == Next
+			LatestItem, HasLatest := Latest[Item.ID]
+			Item.CanForward = Item.Version == Next && HasLatest && LatestItem.Direction == DirectionDown && LatestItem.Status == ExecutionSucceeded
 		}
-		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.Status.IsFailure() && LatestItem.ID == Last.ID {
+		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.ID == Last.ID && (LatestItem.Status.IsFailure() || LatestItem.Status == ExecutionPartial || LatestItem.Status == ExecutionPartiallyReverted) {
 			Item.CanRetry = true
 		}
 	}

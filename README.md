@@ -107,6 +107,24 @@ Target connections currently force `sslmode=disable`; a target that only accepts
 
 `make seed-large` creates `batch_demo.movies` in `target-db-large` (`TARGET_DATABASE_URL_3`): a generated movie catalog with `SEED_LARGE_ROWS` rows (default 2,000,000), then times one unbatched `UPDATE batch_demo.movies SET views = views + 1`. Re-running skips the insert unless `SEED_LARGE_FORCE=true`, which truncates and reseeds. All seeds are idempotent and use `ON CONFLICT (id) DO NOTHING` for the curated lists.
 
+### Batch Dataset Measurement
+
+The required large-dataset check was run on the local Compose target with
+`SEED_LARGE_ROWS=2000000` and a batch size of 10,000:
+
+| Operation | Rows | Duration |
+| --- | --- | --- |
+| Unbatched `UPDATE batch_demo.movies SET views = views + 1` | 2,000,000 | 11.808s |
+| Batched apply (200 batches, each in its own transaction) | 2,000,000 | 23.522s |
+| Batched rollback in reverse batch order | 2,000,000 | 15.105s |
+
+This satisfies the requirement that one unbatched full-table update takes longer
+than one second in the test environment. The batch run uses the same table and
+dataset and reports 200 committed batches / 2,000,000 rows, then 200 reverted
+batches / 2,000,000 rows. Reproduce with `make seed-large` (and optionally
+`SEED_LARGE_ROWS`/`SEED_LARGE_FORCE`) plus a batch migration using the SQL form
+described above.
+
 ## Validation
 
 ```sh
@@ -207,6 +225,15 @@ version after the highest applied version and never runs subsequent migrations
 automatically. Retry repeats the latest failed execution snapshot. Hide rollback
 removes a successful rollback execution and the execution it cancelled, paired by
 execution ID; failed attempts remain visible.
+
+Batch mode executes a cursor-based statement once per batch, each in its own target
+transaction. The up script receives `$1` as the cursor and `$2` as the batch size and
+must return the cursor column; `down_sql` receives `$1` as `cursor_to` and `$2` as
+`cursor_from`. Committed batches and rows are recorded, a later failure leaves the
+execution `partial`, retry resumes from the checkpoint, and rollback compensates
+committed batches in reverse order. The worker writes a target-side evidence row in
+each batch transaction so a lost platform record can be reconciled. See the sample
+large dataset from `make seed-large`.
 
 SQL runs atomically inside a target transaction. Confirmed failure records a generic
 error and preserves history. Jobs and executions survive restarts. A worker that

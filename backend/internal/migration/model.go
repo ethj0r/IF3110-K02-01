@@ -47,6 +47,11 @@ func (S Status) IsPartial() bool {
 	return S == StatusPartial || S == StatusPartiallyReverted
 }
 
+const (
+	ModeNormal = "normal"
+	ModeBatch  = "batch"
+)
+
 type ExecutionKind string
 
 const (
@@ -117,6 +122,9 @@ type Migration struct {
 	Title              string     `json:"title"`
 	SQLText            string     `json:"sql_text"`
 	DownSQL            *string    `json:"down_sql,omitempty"`
+	BatchMode          bool       `json:"batch_mode"`
+	BatchColumn        *string    `json:"batch_column,omitempty"`
+	BatchSize          *int       `json:"batch_size,omitempty"`
 	Irreversible       bool       `json:"irreversible"`
 	IrreversibleReason *string    `json:"irreversible_reason,omitempty"`
 	Status             Status     `json:"status"`
@@ -138,6 +146,9 @@ type MigrationInput struct {
 	Title              string `json:"title"`
 	SQLText            string `json:"sql_text"`
 	DownSQL            string `json:"down_sql"`
+	BatchMode          bool   `json:"batch_mode"`
+	BatchColumn        string `json:"batch_column"`
+	BatchSize          int    `json:"batch_size"`
 	Irreversible       bool   `json:"irreversible"`
 	IrreversibleReason string `json:"irreversible_reason"`
 }
@@ -154,9 +165,15 @@ func (Input MigrationInput) Validate() error {
 		if len(Strings.TrimSpace(Input.DownSQL)) > 0 || len(Strings.TrimSpace(Input.IrreversibleReason)) < 1 || len(Input.IrreversibleReason) > 500 {
 			return ErrInvalidInput
 		}
-		return nil
+	} else if len(Strings.TrimSpace(Input.DownSQL)) < 1 {
+		return ErrInvalidInput
 	}
-	if len(Strings.TrimSpace(Input.DownSQL)) < 1 {
+	if Input.BatchMode {
+		Column := Strings.TrimSpace(Input.BatchColumn)
+		if len(Column) < 1 || len(Column) > 63 || Input.BatchSize < 1 || Input.BatchSize > 1000000 {
+			return ErrInvalidInput
+		}
+	} else if Strings.TrimSpace(Input.BatchColumn) != "" || Input.BatchSize != 0 {
 		return ErrInvalidInput
 	}
 	return nil
@@ -167,6 +184,9 @@ func (Input MigrationInput) Normalized() MigrationInput {
 		Title:              Strings.TrimSpace(Input.Title),
 		SQLText:            Strings.TrimSpace(Input.SQLText),
 		DownSQL:            Strings.TrimSpace(Input.DownSQL),
+		BatchMode:          Input.BatchMode,
+		BatchColumn:        Strings.TrimSpace(Input.BatchColumn),
+		BatchSize:          Input.BatchSize,
 		Irreversible:       Input.Irreversible,
 		IrreversibleReason: Strings.TrimSpace(Input.IrreversibleReason),
 	}
@@ -185,6 +205,14 @@ type Execution struct {
 	SQLText               string          `json:"sql_text"`
 	UpSQL                 string          `json:"up_sql"`
 	DownSQL               *string         `json:"down_sql,omitempty"`
+	Mode                  string          `json:"mode"`
+	BatchColumn           *string         `json:"batch_column,omitempty"`
+	BatchSize             *int            `json:"batch_size,omitempty"`
+	CommittedBatches      int64           `json:"committed_batches"`
+	CommittedRows         int64           `json:"committed_rows"`
+	RevertedBatches       int64           `json:"reverted_batches"`
+	RevertedRows          int64           `json:"reverted_rows"`
+	CheckpointCursor      int64           `json:"checkpoint_cursor"`
 	RollbackOfExecutionID *string         `json:"rollback_of_execution_id,omitempty"`
 	RetryOfExecutionID    *string         `json:"retry_of_execution_id,omitempty"`
 	RequestedBy           *string         `json:"requested_by,omitempty"`
@@ -254,6 +282,12 @@ type Job struct {
 	RequestedBy         *string    `json:"requested_by,omitempty"`
 	RequestedByUsername *string    `json:"requested_by_username,omitempty"`
 	TraceParent         *string    `json:"traceparent,omitempty"`
+	Mode                *string    `json:"mode,omitempty"`
+	CommittedBatches    int64      `json:"committed_batches"`
+	CommittedRows       int64      `json:"committed_rows"`
+	RevertedBatches     int64      `json:"reverted_batches"`
+	RevertedRows        int64      `json:"reverted_rows"`
+	CheckpointCursor    int64      `json:"checkpoint_cursor"`
 	CreatedAt           Time.Time  `json:"created_at"`
 	UpdatedAt           Time.Time  `json:"updated_at"`
 	FinishedAt          *Time.Time `json:"finished_at,omitempty"`
@@ -264,3 +298,17 @@ var (
 	ErrJobNotFound    = Errors.New("migration job not found")
 	ErrJobUnavailable = Errors.New("migration job store is unavailable")
 )
+
+type Batch struct {
+	ID                    string     `json:"id"`
+	ExecutionID           string     `json:"execution_id"`
+	DatabaseID            string     `json:"database_id"`
+	BatchNo               int64      `json:"batch_no"`
+	CursorFrom            int64      `json:"cursor_from"`
+	CursorTo              int64      `json:"cursor_to"`
+	RowCount              int64      `json:"row_count"`
+	Status                string     `json:"status"`
+	CommittedAt           Time.Time  `json:"committed_at"`
+	RevertedAt            *Time.Time `json:"reverted_at,omitempty"`
+	RevertedByExecutionID *string    `json:"reverted_by_execution_id,omitempty"`
+}

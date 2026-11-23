@@ -46,6 +46,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const [EditorDownSQL, setEditorDownSQL] = useState('')
   const [EditorIrreversible, setEditorIrreversible] = useState(false)
   const [EditorReason, setEditorReason] = useState('')
+  const [EditorBatchMode, setEditorBatchMode] = useState(false)
+  const [EditorBatchColumn, setEditorBatchColumn] = useState('id')
+  const [EditorBatchSize, setEditorBatchSize] = useState(1000)
   const [HideRollback, setHideRollback] = useState(false)
   const [ExecutionError, setExecutionError] = useState<string | null>(null)
   const [SuccessMessage, setSuccessMessage] = useState<string | null>(null)
@@ -79,6 +82,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         title: EditorTitle,
         sql_text: EditorSQL,
         down_sql: EditorIrreversible ? '' : EditorDownSQL,
+        batch_mode: EditorBatchMode,
+        batch_column: EditorBatchMode ? EditorBatchColumn : '',
+        batch_size: EditorBatchMode ? Number(EditorBatchSize) : 0,
         irreversible: EditorIrreversible,
         irreversible_reason: EditorIrreversible ? EditorReason : '',
       }
@@ -152,6 +158,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     setEditorDownSQL('')
     setEditorIrreversible(false)
     setEditorReason('')
+    setEditorBatchMode(false)
+    setEditorBatchColumn('id')
+    setEditorBatchSize(1000)
   }
 
   function openCreateEditor() {
@@ -169,6 +178,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     setEditorDownSQL(Item.down_sql ?? '')
     setEditorIrreversible(Item.irreversible)
     setEditorReason(Item.irreversible_reason ?? '')
+    setEditorBatchMode(Item.batch_mode)
+    setEditorBatchColumn(Item.batch_column ?? 'id')
+    setEditorBatchSize(Item.batch_size ?? 1000)
     setIsEditorOpen(true)
     setExecutionError(null)
     EditorAnalyze.reset()
@@ -241,6 +253,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           <strong>{ActionLabel(Job.action)} job:</strong> {Job.status}
           {' '}(attempt {Job.attempts}/{Job.max_attempts})
           {Job.execution_id && <> · execution <code>{Job.execution_id.slice(0, 8)}</code></>}
+          {Job.mode === 'batch' && <> · {Job.committed_batches} batch(es) / {Job.committed_rows} row(s) committed{Job.reverted_batches > 0 ? `, ${Job.reverted_batches} batch(es) / ${Job.reverted_rows} row(s) reverted` : ''}</>}
           {Job.last_error && <div style={{ marginTop: '0.35rem' }}>{Job.last_error}</div>}
           {JobFinished && <button type="button" className="ghost small" style={{ marginLeft: '0.75rem' }} onClick={() => setActiveJobID(null)}>Dismiss</button>}
         </div>
@@ -284,6 +297,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
                       <td style={{ fontWeight: 'bold' }}>v{Item.version}</td>
                       <td>
                         {Item.title}
+                        {Item.batch_mode && <span className="badge" style={{ marginLeft: '0.4rem' }}>batch {Item.batch_column} × {Item.batch_size}</span>}
                         {Item.irreversible && <span className="badge" style={{ marginLeft: '0.4rem' }}>irreversible</span>}
                       </td>
                       <td><StatusBadge Status={Item.status} /></td>
@@ -404,6 +418,19 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
               <label htmlFor="migration-title"><strong>Title:</strong></label>
               <input id="migration-title" value={EditorTitle} onChange={E => setEditorTitle(E.target.value)} placeholder="e.g. Create users table" required maxLength={128} style={{ width: '100%', padding: '0.5rem', marginTop: '0.3rem', boxSizing: 'border-box' }} />
             </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '0.75rem', alignItems: 'center', margin: '0.75rem 0' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem' }}>
+                <input type="checkbox" checked={EditorBatchMode} onChange={E => setEditorBatchMode(E.target.checked)} />
+                Batch mode
+              </label>
+              {EditorBatchMode && (
+                <>
+                  <label>Cursor column <input value={EditorBatchColumn} onChange={E => setEditorBatchColumn(E.target.value)} required maxLength={63} style={{ width: '8rem', marginLeft: '0.35rem' }} /></label>
+                  <label>Batch size <input type="number" min={1} max={1000000} value={EditorBatchSize} onChange={E => setEditorBatchSize(Number(E.target.value))} required style={{ width: '7rem', marginLeft: '0.35rem' }} /></label>
+                </>
+              )}
+            </div>
+            {EditorBatchMode && <p className="muted">Use one statement per up/down script. Up SQL receives <code>$1</code> as the cursor and <code>$2</code> as the batch size, and must return the cursor column. Down SQL receives <code>$1</code> as cursor_to and <code>$2</code> as cursor_from for each committed batch.</p>}
             <SQLInput Label="Up SQL" Value={EditorSQL} OnChange={Value => { setEditorSQL(Value); if (EditorAnalyze.data || EditorAnalyze.error) EditorAnalyze.reset() }} OnAnalyze={() => EditorAnalyze.mutate(EditorSQL)} Pending={EditorAnalyze.isPending} />
             <label style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', margin: '0.75rem 0' }}>
               <input type="checkbox" checked={EditorIrreversible} onChange={E => setEditorIrreversible(E.target.checked)} />
@@ -488,6 +515,14 @@ function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
         {Execution.rollback_of_execution_id && <> &nbsp;|&nbsp; <strong>Rollback of:</strong> <code>{Execution.rollback_of_execution_id}</code></>}
         {Execution.retry_of_execution_id && <> &nbsp;|&nbsp; <strong>Retry of:</strong> <code>{Execution.retry_of_execution_id}</code></>}
       </p>
+      {Execution.mode === 'batch' && (
+        <p style={{ fontSize: '0.9rem' }}>
+          <strong>Batch mode:</strong> cursor {Execution.batch_column ?? '—'} · size {Execution.batch_size ?? '—'} &nbsp;|&nbsp;
+          <strong>Committed:</strong> {Execution.committed_batches} batch(es) / {Execution.committed_rows} row(s) &nbsp;|&nbsp;
+          <strong>Reverted:</strong> {Execution.reverted_batches} batch(es) / {Execution.reverted_rows} row(s) &nbsp;|&nbsp;
+          <strong>Checkpoint:</strong> {Execution.checkpoint_cursor}
+        </p>
+      )}
       <SQLBlock Label="Executed SQL Snapshot" SQL={Execution.sql_text} />
       {Execution.error_message && <p role="alert" style={{ color: '#c5221f' }}>{Execution.error_message}</p>}
       <div className="table-wrap"><table className="data-table">

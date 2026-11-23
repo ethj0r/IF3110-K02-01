@@ -233,3 +233,164 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 		T.Fatalf("next version could not execute: %v", Err)
 	}
 }
+
+func TestServiceBatchExecutionRollbackAndForward(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_items (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_items SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Input := MigrationInput{
+		Title:       "Batch increment",
+		SQLText:     `UPDATE batch_items SET value = value + 1 WHERE id IN (SELECT id FROM batch_items WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_items SET value = value - 1 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, Input)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Applied, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch apply failed: %v", Err)
+	}
+	if Applied.Status != ExecutionSucceeded || Applied.CommittedBatches != 3 || Applied.CommittedRows != 25 {
+		T.Fatalf("unexpected batch apply progress: %+v", Applied)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_items WHERE value = 1").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("batch update did not touch every row: %d %v", Count, Err)
+	}
+	RolledBack, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch rollback failed: %v", Err)
+	}
+	if RolledBack.Status != ExecutionSucceeded || RolledBack.RevertedBatches != 3 || RolledBack.RevertedRows != 25 {
+		T.Fatalf("unexpected batch rollback progress: %+v", RolledBack)
+	}
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_items WHERE value = 0").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("batch rollback did not restore every row: %d %v", Count, Err)
+	}
+	Forward, Err := Service.Forward(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch forward failed: %v", Err)
+	}
+	if Forward.Status != ExecutionSucceeded || Forward.CommittedBatches != 3 {
+		T.Fatalf("unexpected batch forward: %+v", Forward)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusApplied {
+		T.Fatalf("batch migration state is wrong: %+v %v", Migration, Err)
+	}
+}
+
+func TestServiceBatchPartialFailureAndRollback(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_partial (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_partial SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Input := MigrationInput{
+		Title:       "Batch partial",
+		SQLText:     `UPDATE batch_partial SET value = 1 / (CASE WHEN id = 15 THEN 0 ELSE 1 END) WHERE id IN (SELECT id FROM batch_partial WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_partial SET value = 0 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, Input)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) {
+		T.Fatalf("expected batch SQL failure, got %v", Err)
+	}
+	if Partial.Status != ExecutionPartial || Partial.CommittedBatches != 1 || Partial.CommittedRows != 10 {
+		T.Fatalf("unexpected partial progress: %+v", Partial)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusPartial {
+		T.Fatalf("migration should be partial: %+v %v", Migration, Err)
+	}
+	Reverted, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("partial rollback failed: %v", Err)
+	}
+	if Reverted.Status != ExecutionSucceeded || Reverted.RevertedBatches != 1 || Reverted.RevertedRows != 10 {
+		T.Fatalf("unexpected partial rollback: %+v", Reverted)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_partial WHERE value = 0").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("partial rollback did not restore committed batch: %d %v", Count, Err)
+	}
+}
+
+func TestServiceBatchRetryResumesCheckpoint(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_retry (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_retry SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{
+		Title:       "Batch retry",
+		SQLText:     `UPDATE batch_retry SET value = 1 / (CASE WHEN id = 15 THEN 0 ELSE 1 END) WHERE id IN (SELECT id FROM batch_retry WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_retry SET value = 0 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) || Partial.Status != ExecutionPartial || Partial.CommittedBatches != 1 {
+		T.Fatalf("unexpected partial apply: %+v %v", Partial, Err)
+	}
+	if _, Err := Target.Exec(Ctx, "DELETE FROM batch_retry WHERE id = 15"); Err != nil {
+		T.Fatal(Err)
+	}
+	Retried, Err := Service.Retry(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch retry failed: %v", Err)
+	}
+	if Retried.ID != Partial.ID || Retried.Status != ExecutionSucceeded || Retried.CommittedBatches != 3 || Retried.CommittedRows != 24 {
+		T.Fatalf("batch retry did not resume the checkpoint: %+v", Retried)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_retry WHERE value = 1").Scan(&Count); Err != nil || Count != 24 {
+		T.Fatalf("batch retry did not apply remaining rows: %d %v", Count, Err)
+	}
+}

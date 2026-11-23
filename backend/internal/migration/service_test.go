@@ -62,6 +62,7 @@ func (M *MockRepo) Create(_ Context.Context, DatabaseID string, Input MigrationI
 		Revision:     1,
 		Title:        Input.Title,
 		SQLText:      Input.SQLText,
+		BatchMode:    Input.BatchMode,
 		Irreversible: Input.Irreversible,
 		Status:       StatusDraft,
 		CreatedBy:    CreatedBy,
@@ -71,6 +72,12 @@ func (M *MockRepo) Create(_ Context.Context, DatabaseID string, Input MigrationI
 	if !Input.Irreversible {
 		Down := Input.DownSQL
 		Item.DownSQL = &Down
+	}
+	if Input.BatchMode {
+		Column := Input.BatchColumn
+		Size := Input.BatchSize
+		Item.BatchColumn = &Column
+		Item.BatchSize = &Size
 	}
 	if Input.Irreversible {
 		Reason := Input.IrreversibleReason
@@ -123,12 +130,21 @@ func (M *MockRepo) UpdateDraft(_ Context.Context, DatabaseID string, ID string, 
 	Item.Irreversible = Input.Irreversible
 	Item.DownSQL = nil
 	Item.IrreversibleReason = nil
+	Item.BatchMode = Input.BatchMode
+	Item.BatchColumn = nil
+	Item.BatchSize = nil
 	if Input.Irreversible {
 		Reason := Input.IrreversibleReason
 		Item.IrreversibleReason = &Reason
 	} else {
 		Down := Input.DownSQL
 		Item.DownSQL = &Down
+	}
+	if Input.BatchMode {
+		Column := Input.BatchColumn
+		Size := Input.BatchSize
+		Item.BatchColumn = &Column
+		Item.BatchSize = &Size
 	}
 	Item.Revision++
 	Item.UpdatedAt = Time.Now().UTC()
@@ -224,6 +240,42 @@ func (M *MockRepo) ExpireStaleJobs(_ Context.Context, _ int) (int, error) {
 	return 0, nil
 }
 
+func (M *MockRepo) RequeueJob(_ Context.Context, JobID string, AvailableAt Time.Time, LastError string) error {
+	Item, Ok := M.Jobs[JobID]
+	if !Ok {
+		return ErrJobNotFound
+	}
+	Item.Status = JobQueued
+	Item.AvailableAt = AvailableAt
+	Item.LastError = &LastError
+	Item.LockedBy = nil
+	Item.UpdatedAt = Time.Now().UTC()
+	M.Jobs[JobID] = Item
+	return nil
+}
+
+func (M *MockRepo) SetExecutionRunning(_ Context.Context, DatabaseID string, ExecutionID string) (Execution, error) {
+	Exec, Ok := M.Executions[ExecutionID]
+	if !Ok || Exec.DatabaseID != DatabaseID {
+		return Execution{}, ErrNotFound
+	}
+	Exec.Status = ExecutionRunning
+	M.Executions[ExecutionID] = Exec
+	return Exec, nil
+}
+
+func (M *MockRepo) RecordBatchUp(_ Context.Context, ExecutionID string, DatabaseID string, _ int64, _ int64, _ int64, _ int64) (Execution, error) {
+	return M.GetExecution(Context.Background(), DatabaseID, ExecutionID)
+}
+
+func (M *MockRepo) RecordBatchReverted(_ Context.Context, RollbackExecutionID string, _ string, DatabaseID string, _ int64) (Execution, error) {
+	return M.GetExecution(Context.Background(), DatabaseID, RollbackExecutionID)
+}
+
+func (M *MockRepo) ListCommittedBatches(_ Context.Context, _ string) ([]Batch, error) {
+	return []Batch{}, nil
+}
+
 func (M *MockRepo) CreateExecution(_ Context.Context, DatabaseID string, MigrationID string, Request ExecutionRequest) (Execution, error) {
 	Item, Ok := M.Items[MigrationID]
 	if !Ok || Item.DatabaseID != DatabaseID {
@@ -258,6 +310,13 @@ func (M *MockRepo) CreateExecution(_ Context.Context, DatabaseID string, Migrati
 	M.Executions[Exec.ID] = Exec
 	M.Order = append(M.Order, Exec.ID)
 	return Exec, nil
+}
+
+func modeFor(Item Migration) string {
+	if Item.BatchMode {
+		return ModeBatch
+	}
+	return ModeNormal
 }
 
 func (M *MockRepo) GetExecution(_ Context.Context, DatabaseID string, ExecutionID string) (Execution, error) {
@@ -365,16 +424,29 @@ func (M *MockRepo) RefreshStatus(_ Context.Context, DatabaseID string, Migration
 			Success, SuccessOk = Exec, true
 		}
 	}
+	Applied, AppliedOk := Execution{}, false
+	for _, ID := range M.Order {
+		Exec := M.Executions[ID]
+		if Exec.DatabaseID == DatabaseID && Exec.MigrationID == MigrationID && Exec.Direction == DirectionUp && (Exec.Status == ExecutionSucceeded || Exec.Status == ExecutionPartial) {
+			Applied, AppliedOk = Exec, true
+		}
+	}
 	switch {
 	case !LatestOk:
 		Item.Status = StatusDraft
 	case Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning:
 		Item.Status = StatusPending
+	case Latest.Status == ExecutionPartial:
+		Item.Status = StatusPartial
+	case Latest.Status == ExecutionPartiallyReverted:
+		Item.Status = StatusPartiallyReverted
 	case Latest.Status == ExecutionSucceeded && Latest.Direction == DirectionUp:
 		Item.Status = StatusApplied
 	case Latest.Status == ExecutionSucceeded && Latest.Direction == DirectionDown:
 		Item.Status = StatusRolledBack
-	case SuccessOk && Success.Direction == DirectionUp:
+	case AppliedOk && Applied.Status == ExecutionPartial:
+		Item.Status = StatusPartial
+	case AppliedOk && Applied.Direction == DirectionUp:
 		Item.Status = StatusApplied
 	case SuccessOk && Success.Direction == DirectionDown:
 		Item.Status = StatusRolledBack
@@ -382,7 +454,7 @@ func (M *MockRepo) RefreshStatus(_ Context.Context, DatabaseID string, Migration
 		Item.Status = StatusFailed
 	}
 	Item.ErrorMessage = nil
-	if Item.Status == StatusFailed && Latest.ErrorMessage != nil {
+	if (Item.Status == StatusFailed || Item.Status == StatusPartial || Item.Status == StatusPartiallyReverted) && Latest.ErrorMessage != nil {
 		Item.ErrorMessage = Latest.ErrorMessage
 	}
 	Item.ExecutedAt = nil
@@ -729,3 +801,64 @@ func TestAnnotateCapabilities(T *Testing.T) {
 }
 
 func strPtr(Value string) *string { return &Value }
+
+type FlakyDriver struct {
+	Conn     *MockConn
+	Failures int
+	Calls    int
+}
+
+func (D *FlakyDriver) Open(_ string) (Driver.Conn, error) {
+	D.Calls++
+	if D.Calls <= D.Failures {
+		return nil, Driver.ErrUnavailable
+	}
+	return D.Conn, nil
+}
+
+func TestWorkerRetriesTransientFailureWithBackoff(T *Testing.T) {
+	Ctx := Context.Background()
+	Editor := Auth.Principal{ID: "editor", Username: "editor"}
+	Repo := NewMockRepo()
+	Flaky := &FlakyDriver{Conn: &MockConn{Tx: &MockTx{}}, Failures: 1}
+	Service := &Service{
+		Repo:     Repo,
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   Flaky,
+		Logger:   Slog.New(Slog.NewTextHandler(Io.Discard, nil)),
+	}
+	Created, Err := Service.Create(Ctx, Editor, "db", validInput("Retry me", "SELECT 1;", "SELECT 2;"))
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Queued, Err := Service.Enqueue(Ctx, Editor, "db", Created.ID, JobApply, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Worker := &Worker{Repo: Repo, Service: Service, ID: "worker", Lease: Time.Minute}
+	First, Err := Repo.ClaimJob(Ctx, "worker", Time.Minute)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Worker.Process(Ctx, First)
+	RetryJob, Ok := Repo.Jobs[Queued.ID]
+	if !Ok || RetryJob.Status != JobQueued || RetryJob.Attempts != 1 || RetryJob.LastError == nil {
+		T.Fatalf("transient failure was not requeued: %+v", RetryJob)
+	}
+	if !RetryJob.AvailableAt.After(Time.Now()) {
+		T.Fatal("retry was not delayed")
+	}
+	Second, Err := Repo.ClaimJob(Ctx, "worker", Time.Minute)
+	if Err != nil || Second.ID != Queued.ID || Second.Attempts != 2 {
+		T.Fatalf("retry claim failed: %+v %v", Second, Err)
+	}
+	Worker.Process(Ctx, Second)
+	Finished := Repo.Jobs[Queued.ID]
+	if Finished.Status != JobSucceeded || Finished.ExecutionID == nil {
+		T.Fatalf("retry did not succeed: %+v", Finished)
+	}
+	if Repo.Items[Created.ID].Status != StatusApplied {
+		T.Fatal("retry did not apply the migration")
+	}
+}
