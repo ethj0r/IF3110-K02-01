@@ -57,6 +57,16 @@ func Run() error {
 			Slog.Warn("trace exporter shutdown failed", "event", "tracing.shutdown_failed", "error", Err)
 		}
 	}()
+	LogHandler, ShutdownLogs, Err := Tracing.SetupLogs(Ctx, Tracing.OptionsFromEnv("wbd-api").ServiceName, Tracing.LogExporterFromEnv())
+	if Err != nil {
+		return Err
+	}
+	defer func() {
+		Flush, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		_ = ShutdownLogs(Flush)
+	}()
+	Slog.SetDefault(Logging.New(Os.Stdout, Logging.ParseLevel(Os.Getenv("LOG_LEVEL")), LogHandler))
 	Startup, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
 	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL, Logging.SQLTracer{Database: "platform"})
 	TargetDriver := Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}}

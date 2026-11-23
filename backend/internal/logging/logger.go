@@ -11,8 +11,19 @@ import (
 
 // New returns a JSON logger that adds request/migration context attributes to
 // every record and redacts credentials, session identifiers, and DSN secrets.
-func New(W Io.Writer, Level Slog.Leveler) *Slog.Logger {
-	Inner := Slog.NewJSONHandler(W, &Slog.HandlerOptions{Level: Level, ReplaceAttr: RedactAttr})
+// Extra handlers (for example an OTLP log exporter) receive the same records
+// after the same level filter and redaction.
+func New(W Io.Writer, Level Slog.Leveler, Extra ...Slog.Handler) *Slog.Logger {
+	var Inner Slog.Handler = Slog.NewJSONHandler(W, &Slog.HandlerOptions{Level: Level, ReplaceAttr: RedactAttr})
+	Handlers := fanout{Inner}
+	for _, Handler := range Extra {
+		if Handler != nil {
+			Handlers = append(Handlers, &redacting{Inner: Handler, Level: Level})
+		}
+	}
+	if len(Handlers) > 1 {
+		Inner = Handlers
+	}
 	return Slog.New(&ContextHandler{Inner: Inner})
 }
 
