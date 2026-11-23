@@ -81,7 +81,6 @@ export function UsersPage() {
     <>
       <PageHeader
         Title="Users"
-        Description="Create ordinary accounts, deactivate access, and reset credentials. Platform administrators cannot be created or removed here."
         Actions={(
           <button type="button" className={ShowCreate ? 'btn btn-secondary' : 'btn'} onClick={() => SetShowCreate(Value => !Value)}>
             {ShowCreate ? 'Cancel' : <><Icon Name="plus" Size={14} />New user</>}
@@ -90,18 +89,16 @@ export function UsersPage() {
       />
 
       {ShowCreate && (
-        <Card Title="Create user" Description="The account can sign in immediately and inherits access from its groups.">
+        <Card Title="Create user">
           <form className="stack" onSubmit={HandleCreate}>
             <div className="form-grid">
               <div className="field">
                 <label htmlFor="new-username">Username</label>
                 <input className="input" id="new-username" name="username" required minLength={3} maxLength={64} autoComplete="off" />
-                <span className="field-hint">3–64 letters, digits, dots, underscores, or hyphens.</span>
               </div>
               <div className="field">
                 <label htmlFor="new-password">Password</label>
                 <input className="input" id="new-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
-                <span className="field-hint">At least 12 characters.</span>
               </div>
             </div>
             <RequestError error={Create.error} />
@@ -115,7 +112,6 @@ export function UsersPage() {
       {ResetTarget && (
         <Card
           Title={`Reset password for ${ResetTarget.username}`}
-          Description="This revokes every existing session for the account."
           Actions={<button className="btn btn-ghost btn-sm" type="button" onClick={() => SetResetTarget(null)}>Cancel</button>}
         >
           <form className="stack" key={ResetTarget.id} onSubmit={HandleReset}>
@@ -123,7 +119,6 @@ export function UsersPage() {
               <div className="field">
                 <label htmlFor="reset-password">New password</label>
                 <input className="input" id="reset-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
-                <span className="field-hint">At least 12 characters.</span>
               </div>
             </div>
             <RequestError error={Reset.error} />
@@ -137,12 +132,7 @@ export function UsersPage() {
       {Notice !== '' && <NoticeBanner Tone="success" Role="status">{Notice}</NoticeBanner>}
       <RequestError error={Toggle.error ?? Remove.error} />
 
-      <Card
-        Title="All users"
-        Description="Accounts that can sign in to the workspace."
-        Actions={<Badge Tone="outline">{Users.data?.length ?? 0} total</Badge>}
-        Flush
-      >
+      <Card Flush>
         {Users.isPending && <div className="card-body"><Loading>Loading users…</Loading></div>}
         {Users.error !== null && <div className="card-body"><RequestError error={Users.error} /></div>}
         {Users.data?.length === 0 && <EmptyState IconName="users" Title="No users yet" />}
@@ -213,7 +203,7 @@ export function UsersPage() {
       {DeleteTarget && (
         <ConfirmDialog
           Title="Delete user"
-          Description={`Delete ${DeleteTarget.username}? Their group memberships will be removed and existing sessions revoked.`}
+          Description={`Delete ${DeleteTarget.username}?`}
           ConfirmLabel="Delete user"
           Pending={Remove.isPending}
           OnConfirm={() => Remove.mutate(DeleteTarget.id)}

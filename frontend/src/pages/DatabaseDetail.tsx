@@ -75,14 +75,13 @@ export function DatabaseDetailPage() {
   const Database = Access.data?.find(Item => Item.id === DatabaseId)
   const TotalPages = Rows.data ? Math.max(1, Math.ceil(Rows.data.total / Rows.data.page_size)) : 1
   const Forbidden = [Schemas.error, Tables.error, Columns.error, Rows.error].some(IsForbidden)
-  const TableCount = Tables.data?.tables.length ?? 0
 
   return (
     <>
       <PageHeader
         Crumbs={[{ Label: 'Databases', To: '/' }]}
         Title={Database?.name ?? 'Database'}
-        Description={Database ? <><span className="mono">{Database.dbname}</span> on {Database.host}</> : 'Loading database…'}
+        Description={Database ? <span className="mono">{Database.dbname} · {Database.host}</span> : undefined}
         Actions={Database ? <LevelBadge level={Database.level} /> : undefined}
       />
 
@@ -91,7 +90,6 @@ export function DatabaseDetailPage() {
       {Forbidden ? (
         <div className="card">
           <EmptyState IconName="lock" Title="No access to this database">
-            <p>Ask an administrator to grant your group access first.</p>
             <Link to="/" className="btn btn-secondary btn-sm">Back to databases<Icon Name="arrow-right" Size={14} /></Link>
           </EmptyState>
         </div>
@@ -102,11 +100,7 @@ export function DatabaseDetailPage() {
             <Loading>Loading schema…</Loading>
           ) : (
             <div className="stack-lg">
-              <Card
-                Title="Schema and tables"
-                Description="Pick a schema, then a table to inspect its structure and data."
-                Actions={Tables.data ? <Badge Tone="outline">{TableCount} object{TableCount === 1 ? '' : 's'}</Badge> : undefined}
-              >
+              <Card>
                 <div className="form-grid">
                   <div className="field">
                     <label htmlFor="schema-select">Schema</label>
@@ -129,9 +123,7 @@ export function DatabaseDetailPage() {
 
               {Table === '' && (
                 <div className="card">
-                  <EmptyState IconName="table" Title="Choose a table">
-                    <p>Columns, constraints, indexes, and paginated rows appear here once a table is selected.</p>
-                  </EmptyState>
+                  <EmptyState IconName="table" Title="Choose a table" />
                 </div>
               )}
 
@@ -205,7 +197,7 @@ export function DatabaseDetailPage() {
 
                   <Card
                     Title="Data"
-                    Description={Rows.data ? `${Rows.data.total} rows` : 'Rows ordered by primary key.'}
+                    Description={Rows.data ? `${Rows.data.total} rows` : undefined}
                     Actions={<Badge Tone="outline">Page {Page} of {TotalPages}</Badge>}
                     Flush
                   >

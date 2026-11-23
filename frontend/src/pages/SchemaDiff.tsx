@@ -48,7 +48,6 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
       <PageHeader
         Crumbs={Database ? [{ Label: 'Databases', To: '/' }, { Label: Database.name, To: `/databases/${DatabaseID}` }] : undefined}
         Title="Schema comparison"
-        Description="Compare this database with a reference to generate reviewable SQL for the same named schema. Neither database is changed."
       />
       {Database && <DatabaseTabs Database={Database} />}
 
@@ -59,10 +58,7 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
 
       {Database?.level === 'view_edit' && (
         <div className="stack-lg">
-          <Card
-            Title={<>Compare <strong>{Database.name}</strong> with a reference</>}
-            Description="Generation reads both databases. Review the SQL in the migration editor before saving or executing it."
-          >
+          <Card>
             <form className="stack" onSubmit={Event => { Event.preventDefault(); Compare.mutate() }}>
               <div className="form-grid">
                 <div className="field">
@@ -86,7 +82,6 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
                   <Icon Name="diff" Size={14} />
                   {Compare.isPending ? 'Comparing…' : 'Compare schemas'}
                 </button>
-                <span className="field-hint">Direction: current → reference</span>
               </div>
             </form>
           </Card>
@@ -97,7 +92,6 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
             <Card
               Label="Schema comparison results"
               Title="Schema differences"
-              Description={Result.statements.length === 0 ? undefined : `${Result.statements.length} schema change statements found. Neither database has been changed.`}
               Actions={Result.statements.length > 0 ? <Badge Tone="info">{Result.statements.length} statements</Badge> : undefined}
             >
               {Result.statements.length === 0 ? (
@@ -110,7 +104,6 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
                   <ol className="list">
                     {Result.statements.map((Change, Index) => (
                       <li key={Index} className="list-item statement">
-                        <span className="label">Statement {Index + 1}</span>
                         <pre className="code-pre">{Change.sql}</pre>
                         {Change.hazards.length > 0 && (
                           <ul className="hazards">
@@ -128,7 +121,6 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
                   </div>
                   <div className="form-actions">
                     <button className="btn" type="button" onClick={UseInEditor}>Use SQL in migration editor<Icon Name="arrow-right" Size={14} /></button>
-                    <span className="field-hint">Run comparison again if either schema changes before execution.</span>
                   </div>
                 </>
               )}

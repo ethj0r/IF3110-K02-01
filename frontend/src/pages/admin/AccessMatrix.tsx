@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { AdminQueryKeys, GetMatrix, RemoveGroupAccess, SetGroupAccess } from '../../api/admin'
 import type { AccessLevel, AdminMatrix } from '../../api/admin'
 import { Card, PageHeader } from '../../ui/Card'
-import { Badge, EmptyState, Loading, RequestError } from '../../ui/Feedback'
+import { EmptyState, Loading, RequestError } from '../../ui/Feedback'
 import { Icon } from '../../ui/Icon'
 
 export function AccessMatrixPage() {
@@ -24,33 +24,20 @@ export function AccessMatrixPage() {
     <>
       <PageHeader
         Title="Database access"
-        Description="Choose the highest permission each group receives. View and edit wins over view only. Platform administrators receive no access unless a group grants it."
       />
 
-      <div className="legend">
-        <span className="legend-item"><Badge>View only</Badge><span className="muted">can read schema, data, and history.</span></span>
-        <span className="legend-item"><Badge Tone="ink">View and edit</Badge><span className="muted">can also create and run migrations.</span></span>
-      </div>
 
       <RequestError error={Change.error} />
 
-      <Card
-        Title="Group grants"
-        Description="Changes take effect immediately and may rotate or revoke member sessions."
-        Actions={<Badge Tone="outline">{Matrix.data?.grants.length ?? 0} grants</Badge>}
-        Flush
-      >
+      <Card Flush>
         {Matrix.isPending && <div className="card-body"><Loading>Loading access matrix…</Loading></div>}
         {Matrix.error !== null && <div className="card-body"><RequestError error={Matrix.error} /></div>}
 
         {Matrix.data && (Matrix.data.groups.length === 0 || Matrix.data.databases.length === 0) && (
-          <EmptyState IconName="shield" Title="Nothing to assign yet">
-            <p>
-              {Matrix.data.groups.length === 0
-                ? 'Create a group before assigning database access.'
-                : 'No database connections are configured. Add a connection before assigning access.'}
-            </p>
-            {Matrix.data.groups.length === 0 && <Link to="/admin/groups" className="btn btn-secondary btn-sm">Go to groups<Icon Name="arrow-right" Size={14} /></Link>}
+          <EmptyState IconName="shield" Title={Matrix.data.groups.length === 0 ? 'No groups yet' : 'No connections yet'}>
+            <Link to={Matrix.data.groups.length === 0 ? '/admin/groups' : '/admin/connections'} className="btn btn-secondary btn-sm">
+              {Matrix.data.groups.length === 0 ? 'Go to groups' : 'Go to connections'}<Icon Name="arrow-right" Size={14} />
+            </Link>
           </EmptyState>
         )}
 
@@ -89,7 +76,6 @@ function MatrixTable({ Matrix, Disabled, OnChange }: {
               <th scope="row" className="sticky-col">
                 <span className="cell-stack">
                   <strong>{Group.name}</strong>
-                  <span className="cell-sub">{Group.member_count} member{Group.member_count === 1 ? '' : 's'}</span>
                 </span>
               </th>
               {Matrix.databases.map(Database => {

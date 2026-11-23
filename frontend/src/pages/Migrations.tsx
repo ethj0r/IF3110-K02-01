@@ -186,7 +186,6 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       <PageHeader
         Crumbs={Database ? [{ Label: 'Databases', To: '/' }, { Label: Database.name, To: `/databases/${Database.id}` }] : undefined}
         Title="Database Migrations"
-        Description="Manage immutable up/down migrations, inspect every execution attempt, and roll back or forward the active migration."
         Actions={Database && CanEdit ? (
           <button className="btn" type="button" disabled={Busy} onClick={OpenCreateEditor}><Icon Name="plus" Size={14} />New migration</button>
         ) : undefined}
@@ -208,25 +207,16 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
               <option value="">Select a database…</option>
               {Databases.data?.map(Item => <option key={Item.id} value={Item.id}>{Item.name}</option>)}
             </select>
-            <span className="field-hint">Changing database clears unsaved editor changes.</span>
           </div>
-          {Database && (
-            <div className="badge-list">
-              <Badge Tone={Database.level === 'view_edit' ? 'ink' : 'neutral'}>{Database.level === 'view_edit' ? 'View and edit' : 'View only'}</Badge>
-              <Badge Tone="outline">{Definitions.length} definition{Definitions.length === 1 ? '' : 's'}</Badge>
-            </div>
-          )}
         </div>
         <RequestError error={Databases.error} />
-        {Databases.data?.length === 0 && <p className="muted">No databases assigned. Ask an administrator for group access.</p>}
+        {Databases.data?.length === 0 && <p className="muted">No databases assigned.</p>}
         {ActiveDatabase && !Databases.isPending && !Databases.isError && !Database && <Notice Tone="danger" Role="alert">No access to this database.</Notice>}
       </Card>
 
       {!ActiveDatabase && Databases.data && Databases.data.length > 0 && (
         <div className="card">
-          <EmptyState IconName="layers" Title="Choose a database">
-            <p>Select a database above to review its migration definitions and execution history.</p>
-          </EmptyState>
+          <EmptyState IconName="layers" Title="Choose a database" />
         </div>
       )}
 
@@ -238,7 +228,6 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       {IsEditorOpen && CanEdit && (
         <Card
           Title={EditingMigration ? `Edit migration v${EditingMigration.version}` : 'New migration'}
-          Description="Up SQL applies the change. Down SQL reverts it, or mark the migration irreversible with a reason."
         >
           <form className="stack" onSubmit={Event => { Event.preventDefault(); SaveMutation.mutate() }}>
             <div className="field">
@@ -270,14 +259,12 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       )}
 
       {Database && (
-        <Card Title="Migration definitions" Description="Linear, versioned definitions. Executed SQL is immutable." Flush>
+        <Card Title="Definitions" Flush>
           {HasPending && <div className="card-body"><Notice Tone="warning" Role="status">An execution is pending. Verify the target outcome before retrying.</Notice></div>}
           {MigrationsQuery.isPending && <div className="card-body"><Loading>Loading migrations…</Loading></div>}
           {MigrationsQuery.isError && <div className="card-body"><Notice Tone="danger" Role="alert">{ErrorMessage(MigrationsQuery.error, 'Failed to load migrations.')}</Notice></div>}
           {MigrationsQuery.data && MigrationsQuery.data.length === 0 && (
-            <EmptyState IconName="layers" Title="No migrations yet">
-              <p>No migrations recorded for this database yet.</p>
-            </EmptyState>
+            <EmptyState IconName="layers" Title="No migrations yet" />
           )}
           {MigrationsQuery.data && MigrationsQuery.data.length > 0 && (
             <div className="table-scroll">
@@ -342,7 +329,6 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         <Card
           Label="Migration details"
           Title={`v${SelectedMigration.version} · ${SelectedMigration.title}`}
-          Description="Definition details and the SQL stored for each direction."
           Actions={<button className="btn btn-secondary btn-sm" type="button" onClick={() => SetSelectedMigrationID(null)}>Close</button>}
         >
           <dl className="meta-grid">
@@ -364,8 +350,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
 
       {Database && (
         <Card
-          Title="Execution history"
-          Description="Rollback pairs are hidden by execution ID. Failed attempts remain visible."
+          Title="History"
           Actions={(
             <label className="check">
               <input type="checkbox" checked={HideRollback} onChange={Event => SetHideRollback(Event.target.checked)} />
@@ -377,9 +362,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           {HistoryQuery.isPending && <div className="card-body"><Loading>Loading execution history…</Loading></div>}
           {HistoryQuery.isError && <div className="card-body"><Notice Tone="danger" Role="alert">Failed to load execution history.</Notice></div>}
           {HistoryQuery.data && HistoryQuery.data.length === 0 && (
-            <EmptyState IconName="history" Title="Nothing executed yet">
-              <p>No execution attempts recorded.</p>
-            </EmptyState>
+            <EmptyState IconName="history" Title="No execution attempts recorded." />
           )}
           {HistoryQuery.data && HistoryQuery.data.length > 0 && (
             <div className="table-scroll">
@@ -472,7 +455,6 @@ function MigrationReviewPanel({ Item, Action, CanEdit, Busy, OnClose, OnExecute 
       <header className="card-header">
         <div className="card-title">
           <h2 id="migration-review-heading" ref={Heading} tabIndex={-1}>{ActionLabel(Action)} review for v{Item.version}</h2>
-          <p>Every group leader with access to this database must approve before it runs.</p>
         </div>
         <div className="card-actions">
           <button className="btn btn-secondary btn-sm" type="button" onClick={OnClose}>Close review</button>
@@ -481,7 +463,6 @@ function MigrationReviewPanel({ Item, Action, CanEdit, Busy, OnClose, OnExecute 
       <div className="card-body">
         {Review.isPending && <Loading>Loading review…</Loading>}
         <RequestError error={Review.error ?? Submit.error ?? Approve.error} />
-        {Current === null && <p className="muted">No review has been requested for this action.</p>}
         {Current && !Review.isError && (
           <>
             <Notice Tone={Current.status === 'approved' ? 'success' : 'neutral'} Role="status">

@@ -44,7 +44,6 @@ export function LoginPage() {
             <span className="brand-name">Database Platform</span>
           </span>
           <h1>Sign in</h1>
-          <p>Use your platform account to continue.</p>
         </div>
         <form className="auth-form" method="post" onSubmit={HandleSubmit}>
           <div className="field">
@@ -62,7 +61,6 @@ export function LoginPage() {
           )}
           <button className="btn btn-block" type="submit" disabled={Submit.isPending}>{Submit.isPending ? 'Signing in…' : 'Sign in'}</button>
         </form>
-        <p className="auth-foot">Access is granted per group by your platform administrator.</p>
       </div>
     </main>
   )

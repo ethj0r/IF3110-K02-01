@@ -10,23 +10,12 @@ export function Workspace() {
   const Session = useQuery(SessionQuery)
   const Databases = useQuery({ queryKey: AccessQueryKeys.databases, queryFn: ListAccessibleDatabases })
   const IsAdmin = Session.data?.user.is_platform_admin === true
-  const Count = Databases.data?.length ?? 0
 
   return (
     <>
-      <PageHeader
-        Title="Database Workspace"
-        Description="Databases appear here when a group gives you access. Your highest level across all groups is shown."
-        Actions={<Link to="/migrations" className="btn btn-secondary"><Icon Name="layers" Size={14} />Migration center</Link>}
-      />
+      <PageHeader Title="Database Workspace" />
 
-      <section className="stack" aria-labelledby="databases-heading">
-        <div className="toolbar">
-          <div className="card-title">
-            <h2 id="databases-heading">Available databases</h2>
-            <p className="muted">{Databases.data ? `${Count} connection${Count === 1 ? '' : 's'} granted through your groups.` : 'Connections granted through your groups.'}</p>
-          </div>
-        </div>
+      <section className="stack" aria-label="Databases">
 
         {Databases.isPending && <Loading>Loading databases…</Loading>}
         <RequestError error={Databases.error} />
@@ -34,7 +23,6 @@ export function Workspace() {
         {Databases.data?.length === 0 && (
           <div className="card">
             <EmptyState Title="No databases assigned">
-              <p>Ask an administrator to add you to a group with database access.</p>
               {IsAdmin && <Link to="/admin/access" className="btn btn-secondary btn-sm">Manage database access<Icon Name="arrow-right" Size={14} /></Link>}
             </EmptyState>
           </div>

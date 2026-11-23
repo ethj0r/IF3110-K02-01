@@ -79,7 +79,6 @@ export function GroupsPage() {
     <>
       <PageHeader
         Title="Groups"
-        Description="Groups collect users and carry database grants. A user receives the highest level granted by any group they belong to."
         Actions={(
           <button type="button" className={ShowCreate ? 'btn btn-secondary' : 'btn'} onClick={() => SetShowCreate(Value => !Value)}>
             {ShowCreate ? 'Cancel' : <><Icon Name="plus" Size={14} />New group</>}
@@ -88,18 +87,16 @@ export function GroupsPage() {
       />
 
       {ShowCreate && (
-        <Card Title="Create group" Description="Add members and database grants after creating the group.">
+        <Card Title="Create group">
           <form className="stack" onSubmit={HandleCreate}>
             <div className="form-grid">
               <div className="field">
                 <label htmlFor="group-name">Name</label>
                 <input className="input" id="group-name" name="name" required maxLength={64} autoComplete="off" />
-                <span className="field-hint">1–64 letters, digits, spaces, dots, underscores, or hyphens.</span>
               </div>
               <div className="field">
                 <label htmlFor="group-description">Description</label>
                 <input className="input" id="group-description" name="description" maxLength={500} autoComplete="off" />
-                <span className="field-hint">Optional, up to 500 characters.</span>
               </div>
             </div>
             <RequestError error={Create.error} />
@@ -113,12 +110,7 @@ export function GroupsPage() {
       {Notice !== '' && <NoticeBanner Tone="success" Role="status">{Notice}</NoticeBanner>}
       <RequestError error={Update.error ?? Remove.error} />
 
-      <Card
-        Title="All groups"
-        Description="Select a group to edit its details, members, and leader."
-        Actions={<Badge Tone="outline">{Groups.data?.length ?? 0} total</Badge>}
-        Flush
-      >
+      <Card Flush>
         {Groups.isPending && <div className="card-body"><Loading>Loading groups…</Loading></div>}
         {Groups.error !== null && <div className="card-body"><RequestError error={Groups.error} /></div>}
         {Groups.data?.length === 0 && <EmptyState IconName="group" Title="No groups yet" />}
@@ -140,12 +132,12 @@ export function GroupsPage() {
                     <td>
                       <div className="cell-stack">
                         <strong>{Group.name}</strong>
-                        <span className="cell-sub">{Group.description || 'No description'}</span>
+                        {Group.description && <span className="cell-sub">{Group.description}</span>}
                       </div>
                     </td>
                     <td className="mono">{Group.member_count}</td>
                     <td className="mono">{Group.access_count}</td>
-                    <td>{Group.leader_user_id ? <Badge Tone="success" Dot>Assigned</Badge> : <Badge Tone="outline">None</Badge>}</td>
+                    <td>{Group.leader_user_id ? <Badge Tone="success" Dot>Assigned</Badge> : <span className="muted">—</span>}</td>
                     <td className="cell-actions">
                       <button className="btn btn-secondary btn-sm" type="button" onClick={() => SetSelectedID(Group.id === SelectedID ? null : Group.id)}>
                         {Group.id === SelectedID ? 'Close' : 'Manage'}
@@ -162,7 +154,6 @@ export function GroupsPage() {
       {Selected && (
         <Card
           Title={Selected.name}
-          Description={Selected.description || 'No description'}
           Actions={(
             <>
               <button className="btn btn-ghost btn-sm" type="button" onClick={() => SetSelectedID(null)}>Close</button>
@@ -172,7 +163,6 @@ export function GroupsPage() {
         >
           <div className="split">
             <div className="stack">
-              <h3>Group settings</h3>
               <form className="stack" key={`${Selected.id}-${Selected.updated_at}`} onSubmit={HandleUpdate}>
                 <div className="field">
                   <label htmlFor={`name-${Selected.id}`}>Name</label>
@@ -198,7 +188,7 @@ export function GroupsPage() {
       {DeleteTarget && (
         <ConfirmDialog
           Title="Delete group"
-          Description={`Delete ${DeleteTarget.name}? Memberships and database grants will be removed, and member sessions revoked.`}
+          Description={`Delete ${DeleteTarget.name}?`}
           ConfirmLabel="Delete group"
           Pending={Remove.isPending}
           OnConfirm={() => Remove.mutate(DeleteTarget.id)}
@@ -245,7 +235,6 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
   return (
     <div className="stack">
       <RequestError error={Members.error ?? Users.error ?? Add.error ?? Remove.error ?? SetLeader.error} />
-      {!Group.leader_user_id && <NoticeBanner Tone="warning">No leader assigned. Approvals for this group cannot be given until one is set.</NoticeBanner>}
       {Members.isPending && <Loading>Loading members…</Loading>}
 
       {Members.data && Members.data.length > 0 && (
@@ -281,7 +270,7 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
           </div>
           <button className="btn btn-secondary" type="submit" disabled={!Selected || MembershipBusy}>{Add.isPending ? 'Adding…' : 'Add member'}</button>
         </form>
-      ) : <p className="muted">Every user is already a member.</p>}
+      ) : null}
     </div>
   )
 }

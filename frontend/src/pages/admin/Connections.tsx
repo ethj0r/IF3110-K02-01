@@ -49,7 +49,7 @@ export function ConnectionsPage() {
 
   const Create = useMutation({
     mutationFn: CreateConnection,
-    onSuccess: () => { SetNotice('Connection created. Grant group access before it appears in the workspace.'); SetShowCreate(false); Refresh() },
+    onSuccess: () => { SetNotice('Connection created.'); SetShowCreate(false); Refresh() },
   })
   const Update = useMutation({
     mutationFn: ({ ID, Input }: { ID: string; Input: ConnectionInput }) => UpdateConnection(ID, Input),
@@ -57,7 +57,7 @@ export function ConnectionsPage() {
   })
   const Remove = useMutation({
     mutationFn: DeleteConnection,
-    onSuccess: () => { SetNotice('Connection deleted with its group grants.'); SetDeleteTarget(null); SetSelectedID(null); Refresh() },
+    onSuccess: () => { SetNotice('Connection deleted.'); SetDeleteTarget(null); SetSelectedID(null); Refresh() },
   })
   const Test = useMutation({
     mutationFn: TestConnection,
@@ -92,7 +92,6 @@ export function ConnectionsPage() {
     <>
       <PageHeader
         Title="Connections"
-        Description="Target PostgreSQL databases the platform can open. Passwords are stored encrypted and never shown back."
         Actions={(
           <button type="button" className={ShowCreate ? 'btn btn-secondary' : 'btn'} onClick={() => SetShowCreate(Value => !Value)}>
             {ShowCreate ? 'Cancel' : <><Icon Name="plus" Size={14} />New connection</>}
@@ -101,7 +100,7 @@ export function ConnectionsPage() {
       />
 
       {ShowCreate && (
-        <Card Title="Create connection" Description="Grant group access afterwards so members can browse it.">
+        <Card Title="Create connection">
           <form className="stack" onSubmit={HandleCreate}>
             <div className="form-grid">
               <div className="field">
@@ -127,7 +126,6 @@ export function ConnectionsPage() {
               <div className="field">
                 <label htmlFor="connection-password">Password</label>
                 <input className="input" id="connection-password" name="password" type="password" required autoComplete="new-password" />
-                <span className="field-hint">Stored encrypted, never displayed again.</span>
               </div>
             </div>
             <RequestError error={Create.error} />
@@ -141,12 +139,7 @@ export function ConnectionsPage() {
       {Notice !== '' && <NoticeBanner Tone={Notice.startsWith('Fill') ? 'warning' : 'success'} Role="status">{Notice}</NoticeBanner>}
       <RequestError error={Update.error ?? Remove.error ?? Test.error} />
 
-      <Card
-        Title="All connections"
-        Description="Test reachability before granting access."
-        Actions={<Badge Tone="outline">{Connections.data?.length ?? 0} total</Badge>}
-        Flush
-      >
+      <Card Flush>
         {Connections.isPending && <div className="card-body"><Loading>Loading connections…</Loading></div>}
         {Connections.error !== null && <div className="card-body"><RequestError error={Connections.error} /></div>}
         {Connections.data?.length === 0 && <EmptyState IconName="plug" Title="No connections yet" />}
@@ -166,7 +159,6 @@ export function ConnectionsPage() {
                     <td>
                       <div className="cell-stack">
                         <strong>{Item.name}</strong>
-                        <span className="cell-sub">Updated {new Date(Item.updated_at).toLocaleString()}</span>
                       </div>
                     </td>
                     <td>
@@ -196,7 +188,6 @@ export function ConnectionsPage() {
       {Selected && (
         <Card
           Title={Selected.name}
-          Description={<code className="inline-code">{Selected.username}@{Selected.host}:{Selected.port}/{Selected.dbname}</code>}
           Actions={(
             <>
               <button className="btn btn-ghost btn-sm" type="button" onClick={() => SetSelectedID(null)}>Close</button>
@@ -229,7 +220,6 @@ export function ConnectionsPage() {
               <div className="field">
                 <label htmlFor={`password-${Selected.id}`}>Password</label>
                 <input className="input" id={`password-${Selected.id}`} name="password" type="password" required autoComplete="new-password" />
-                <span className="field-hint">Re-enter on every change.</span>
               </div>
             </div>
             <div className="form-actions">
@@ -242,7 +232,7 @@ export function ConnectionsPage() {
       {DeleteTarget && (
         <ConfirmDialog
           Title="Delete connection"
-          Description={`Delete ${DeleteTarget.name}? Its group grants and platform migration history will be removed. The target database is kept.`}
+          Description={`Delete ${DeleteTarget.name}?`}
           ConfirmLabel="Delete connection"
           Pending={Remove.isPending}
           OnConfirm={() => Remove.mutate(DeleteTarget.id)}
