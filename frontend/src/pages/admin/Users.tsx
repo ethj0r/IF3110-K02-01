@@ -3,9 +3,10 @@ import type { FormEvent } from 'react'
 import { useState } from 'react'
 import { AdminQueryKeys, CreateUser, DeleteUser, ListUsers, ResetUserPassword, SetUserActive } from '../../api/admin'
 import type { AdminUser } from '../../api/admin'
-import { ConfirmDialog } from '../../components/ConfirmDialog'
-import { RequestError, StatusBadge } from '../../components/Feedback'
-import { PageHeading } from '../../components/PageHeading'
+import { Card, PageHeader } from '../../ui/Card'
+import { ConfirmDialog } from '../../ui/ConfirmDialog'
+import { Badge, EmptyState, Loading, Notice as NoticeBanner, RequestError, StatusBadge } from '../../ui/Feedback'
+import { Icon } from '../../ui/Icon'
 
 export function UsersPage() {
   const Cache = useQueryClient()
@@ -77,110 +78,110 @@ export function UsersPage() {
   }
 
   return (
-    <section>
-      <PageHeading
+    <>
+      <PageHeader
+        Eyebrow="Administration"
         Title="Users"
         Description="Create ordinary accounts, deactivate access, and reset credentials. Platform administrators cannot be created or removed here."
         Actions={(
-          <button type="button" className={ShowCreate ? 'secondary' : ''} onClick={() => SetShowCreate(Value => !Value)}>
-            {ShowCreate ? 'Cancel' : 'New user'}
+          <button type="button" className={ShowCreate ? 'btn btn-secondary' : 'btn'} onClick={() => SetShowCreate(Value => !Value)}>
+            {ShowCreate ? 'Cancel' : <><Icon Name="plus" Size={14} />New user</>}
           </button>
         )}
       />
 
       {ShowCreate && (
-        <form className="panel form-panel" onSubmit={HandleCreate}>
-          <header className="panel-header">
-            <div>
-              <h3>Create user</h3>
-              <p>The account can sign in immediately and inherits access from its groups.</p>
+        <Card Title="Create user" Description="The account can sign in immediately and inherits access from its groups.">
+          <form className="stack" onSubmit={HandleCreate}>
+            <div className="form-grid">
+              <div className="field">
+                <label htmlFor="new-username">Username</label>
+                <input className="input" id="new-username" name="username" required minLength={3} maxLength={64} autoComplete="off" />
+                <span className="field-hint">3–64 letters, digits, dots, underscores, or hyphens.</span>
+              </div>
+              <div className="field">
+                <label htmlFor="new-password">Password</label>
+                <input className="input" id="new-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
+                <span className="field-hint">At least 12 characters.</span>
+              </div>
             </div>
-          </header>
-          <div className="form-grid">
-            <div className="field">
-              <label htmlFor="new-username">Username</label>
-              <input id="new-username" name="username" required minLength={3} maxLength={64} autoComplete="off" />
-              <span className="hint">3–64 letters, digits, dots, underscores, or hyphens.</span>
+            <RequestError error={Create.error} />
+            <div className="form-actions">
+              <button className="btn" type="submit" disabled={Create.isPending}>{Create.isPending ? 'Creating…' : 'Create user'}</button>
             </div>
-            <div className="field">
-              <label htmlFor="new-password">Password</label>
-              <input id="new-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
-              <span className="hint">At least 12 characters.</span>
-            </div>
-            <button type="submit" disabled={Create.isPending}>{Create.isPending ? 'Creating…' : 'Create user'}</button>
-          </div>
-          <RequestError error={Create.error} />
-        </form>
+          </form>
+        </Card>
       )}
 
       {ResetTarget && (
-        <form className="panel form-panel" key={ResetTarget.id} onSubmit={HandleReset}>
-          <header className="panel-header">
-            <div>
-              <h3>Reset password for {ResetTarget.username}</h3>
-              <p>This revokes every existing session for the account.</p>
+        <Card
+          Title={`Reset password for ${ResetTarget.username}`}
+          Description="This revokes every existing session for the account."
+          Actions={<button className="btn btn-ghost btn-sm" type="button" onClick={() => SetResetTarget(null)}>Cancel</button>}
+        >
+          <form className="stack" key={ResetTarget.id} onSubmit={HandleReset}>
+            <div className="form-grid">
+              <div className="field">
+                <label htmlFor="reset-password">New password</label>
+                <input className="input" id="reset-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
+                <span className="field-hint">At least 12 characters.</span>
+              </div>
             </div>
-            <button className="ghost small" type="button" onClick={() => SetResetTarget(null)}>Cancel</button>
-          </header>
-          <div className="form-grid">
-            <div className="field">
-              <label htmlFor="reset-password">New password</label>
-              <input id="reset-password" name="password" type="password" required minLength={12} maxLength={1024} autoComplete="new-password" />
-              <span className="hint">At least 12 characters.</span>
+            <RequestError error={Reset.error} />
+            <div className="form-actions">
+              <button className="btn" type="submit" disabled={Reset.isPending}>{Reset.isPending ? 'Saving…' : 'Save password'}</button>
             </div>
-            <button type="submit" disabled={Reset.isPending}>{Reset.isPending ? 'Saving…' : 'Save password'}</button>
-          </div>
-          <RequestError error={Reset.error} />
-        </form>
+          </form>
+        </Card>
       )}
 
-      {Notice && <p className="notice-banner" role="status">{Notice}</p>}
+      {Notice !== '' && <NoticeBanner Tone="success" Role="status">{Notice}</NoticeBanner>}
       <RequestError error={Toggle.error ?? Remove.error} />
 
-      <div className="panel">
-        <header className="panel-header">
-          <div>
-            <h3>All users</h3>
-            <p>Accounts that can sign in to the workspace.</p>
-          </div>
-          <span className="count-badge">{Users.data?.length ?? 0}</span>
-        </header>
-
-        {Users.isPending && <p className="state" role="status">Loading users…</p>}
-        <RequestError error={Users.error} />
-
-        {Users.data && (
-          <div className="table-wrap">
-            <table className="data-table">
+      <Card
+        Title="All users"
+        Description="Accounts that can sign in to the workspace."
+        Actions={<Badge Tone="outline">{Users.data?.length ?? 0} total</Badge>}
+        Flush
+      >
+        {Users.isPending && <div className="card-body"><Loading>Loading users…</Loading></div>}
+        {Users.error !== null && <div className="card-body"><RequestError error={Users.error} /></div>}
+        {Users.data?.length === 0 && <EmptyState IconName="users" Title="No users yet" />}
+        {Users.data && Users.data.length > 0 && (
+          <div className="table-scroll">
+            <table className="table">
               <thead>
                 <tr>
                   <th>User</th>
                   <th>Status</th>
                   <th>Groups</th>
-                  <th className="actions-column">Actions</th>
+                  <th className="cell-actions">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {Users.data.map(User => (
                   <tr key={User.id}>
                     <td>
-                      <strong>{User.username}</strong>
-                      {User.is_platform_admin && <span className="badge admin">Platform admin</span>}
+                      <div className="list-item-main">
+                        <span className="avatar" aria-hidden="true">{User.username.slice(0, 1)}</span>
+                        <strong>{User.username}</strong>
+                        {User.is_platform_admin && <Badge Tone="ink">Platform admin</Badge>}
+                      </div>
                     </td>
                     <td><StatusBadge active={User.is_active} /></td>
                     <td>
                       {User.groups.length === 0 ? (
                         <span className="muted">No groups</span>
                       ) : (
-                        <div className="chip-list">
-                          {User.groups.map(Group => <span key={Group.id} className="chip">{Group.name}</span>)}
+                        <div className="badge-list">
+                          {User.groups.map(Group => <Badge key={Group.id}>{Group.name}</Badge>)}
                         </div>
                       )}
                     </td>
-                    <td className="actions-column">
+                    <td className="cell-actions">
                       <div className="row-actions">
                         <button
-                          className="secondary small"
+                          className="btn btn-secondary btn-sm"
                           type="button"
                           disabled={Toggle.isPending || User.is_platform_admin}
                           title={User.is_platform_admin ? 'Platform administrators cannot be deactivated here' : undefined}
@@ -188,15 +189,11 @@ export function UsersPage() {
                         >
                           {User.is_active ? 'Deactivate' : 'Activate'}
                         </button>
-                        <button
-                          className="ghost small"
-                          type="button"
-                          onClick={() => { SetNotice(''); SetResetTarget(User) }}
-                        >
+                        <button className="btn btn-ghost btn-sm" type="button" onClick={() => { SetNotice(''); SetResetTarget(User) }}>
                           Reset password
                         </button>
                         <button
-                          className="ghost danger small"
+                          className="btn btn-danger btn-sm"
                           type="button"
                           disabled={User.is_platform_admin}
                           title={User.is_platform_admin ? 'Platform administrators cannot be deleted here' : undefined}
@@ -208,16 +205,11 @@ export function UsersPage() {
                     </td>
                   </tr>
                 ))}
-                {Users.data.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="empty-cell">No users yet.</td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </Card>
 
       {DeleteTarget && (
         <ConfirmDialog
@@ -229,6 +221,6 @@ export function UsersPage() {
           OnCancel={() => SetDeleteTarget(null)}
         />
       )}
-    </section>
+    </>
   )
 }

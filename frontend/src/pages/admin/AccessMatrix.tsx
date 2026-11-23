@@ -2,8 +2,9 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { AdminQueryKeys, GetMatrix, RemoveGroupAccess, SetGroupAccess } from '../../api/admin'
 import type { AccessLevel, AdminMatrix } from '../../api/admin'
-import { RequestError } from '../../components/Feedback'
-import { PageHeading } from '../../components/PageHeading'
+import { Card, PageHeader } from '../../ui/Card'
+import { Badge, EmptyState, Loading, RequestError } from '../../ui/Feedback'
+import { Icon } from '../../ui/Icon'
 
 export function AccessMatrixPage() {
   const Cache = useQueryClient()
@@ -20,48 +21,45 @@ export function AccessMatrixPage() {
   })
 
   return (
-    <section>
-      <PageHeading
+    <>
+      <PageHeader
+        Eyebrow="Administration"
         Title="Database access"
         Description="Choose the highest permission each group receives. View and edit wins over view only. Platform administrators receive no access unless a group grants it."
       />
 
       <div className="legend">
-        <span><span className="level-badge view">View only</span> can read database content.</span>
-        <span><span className="level-badge edit">View and edit</span> can read and change content.</span>
+        <span className="legend-item"><Badge>View only</Badge><span className="muted">can read schema, data, and history.</span></span>
+        <span className="legend-item"><Badge Tone="ink">View and edit</Badge><span className="muted">can also create and run migrations.</span></span>
       </div>
 
       <RequestError error={Change.error} />
 
-      <div className="panel">
-        <header className="panel-header">
-          <div>
-            <h3>Group grants</h3>
-            <p>Changes take effect immediately and may rotate or revoke member sessions.</p>
-          </div>
-          <span className="count-badge">{Matrix.data?.grants.length ?? 0}</span>
-        </header>
-
-        {Matrix.isPending && <p className="state" role="status">Loading access matrix…</p>}
-        <RequestError error={Matrix.error} />
+      <Card
+        Title="Group grants"
+        Description="Changes take effect immediately and may rotate or revoke member sessions."
+        Actions={<Badge Tone="outline">{Matrix.data?.grants.length ?? 0} grants</Badge>}
+        Flush
+      >
+        {Matrix.isPending && <div className="card-body"><Loading>Loading access matrix…</Loading></div>}
+        {Matrix.error !== null && <div className="card-body"><RequestError error={Matrix.error} /></div>}
 
         {Matrix.data && (Matrix.data.groups.length === 0 || Matrix.data.databases.length === 0) && (
-          <div className="empty-state">
-            <h3>Nothing to assign yet</h3>
+          <EmptyState IconName="shield" Title="Nothing to assign yet">
             <p>
               {Matrix.data.groups.length === 0
                 ? 'Create a group before assigning database access.'
                 : 'No database connections are configured. Add a connection before assigning access.'}
             </p>
-            {Matrix.data.groups.length === 0 && <Link to="/admin/groups" className="link-button">Go to groups →</Link>}
-          </div>
+            {Matrix.data.groups.length === 0 && <Link to="/admin/groups" className="btn btn-secondary btn-sm">Go to groups<Icon Name="arrow-right" Size={14} /></Link>}
+          </EmptyState>
         )}
 
         {Matrix.data && Matrix.data.groups.length > 0 && Matrix.data.databases.length > 0 && (
           <MatrixTable Matrix={Matrix.data} Disabled={Change.isPending} OnChange={Input => Change.mutate(Input)} />
         )}
-      </div>
-    </section>
+      </Card>
+    </>
   )
 }
 
@@ -71,15 +69,17 @@ function MatrixTable({ Matrix, Disabled, OnChange }: {
   OnChange: (Input: { GroupID: string; DatabaseID: string; Level: AccessLevel | '' }) => void
 }) {
   return (
-    <div className="table-wrap matrix-wrap">
-      <table className="data-table matrix">
+    <div className="table-scroll">
+      <table className="table matrix">
         <thead>
           <tr>
-            <th scope="col" className="sticky-column">Group</th>
+            <th scope="col" className="sticky-col">Group</th>
             {Matrix.databases.map(Database => (
               <th key={Database.id} scope="col">
-                {Database.name}
-                <span className="table-subtext">{Database.host} · {Database.dbname}</span>
+                <span className="cell-stack">
+                  <span>{Database.name}</span>
+                  <span className="cell-sub mono">{Database.dbname}</span>
+                </span>
               </th>
             ))}
           </tr>
@@ -87,16 +87,18 @@ function MatrixTable({ Matrix, Disabled, OnChange }: {
         <tbody>
           {Matrix.groups.map(Group => (
             <tr key={Group.id}>
-              <th scope="row" className="sticky-column">
-                <strong>{Group.name}</strong>
-                <span className="table-subtext">{Group.member_count} member{Group.member_count === 1 ? '' : 's'}</span>
+              <th scope="row" className="sticky-col">
+                <span className="cell-stack">
+                  <strong>{Group.name}</strong>
+                  <span className="cell-sub">{Group.member_count} member{Group.member_count === 1 ? '' : 's'}</span>
+                </span>
               </th>
               {Matrix.databases.map(Database => {
                 const Current = CurrentLevel(Matrix, Group.id, Database.id)
                 return (
                   <td key={Database.id}>
                     <select
-                      className={`level-select ${Current === 'view_edit' ? 'edit' : Current === 'view_only' ? 'view' : ''}`}
+                      className={`select level-select ${Current === 'view_edit' ? 'is-edit' : Current === 'view_only' ? 'is-view' : ''}`}
                       aria-label={`${Group.name} access to ${Database.name}`}
                       value={Current}
                       disabled={Disabled}
