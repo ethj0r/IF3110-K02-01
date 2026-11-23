@@ -8,6 +8,7 @@ import (
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Http "net/http"
@@ -186,11 +187,12 @@ func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
-	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), R.Header.Get("traceparent"))
+	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Tracing.Inject(R.Context()))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
 	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
 	Httpx.JSON(W, 202, Result)
 }
 
@@ -206,11 +208,12 @@ func (Routes *Handler) Job(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) enqueue(W Http.ResponseWriter, R *Http.Request, Action JobAction) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
-	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, R.Header.Get("traceparent"))
+	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, Tracing.Inject(R.Context()))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
 	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
 	Httpx.JSON(W, 202, Result)
 }
 

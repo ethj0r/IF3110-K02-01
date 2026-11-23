@@ -9,8 +9,10 @@ import (
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Slog "log/slog"
 	Os "os"
 	Signal "os/signal"
@@ -20,9 +22,9 @@ import (
 )
 
 func main() {
-	Slog.SetDefault(Slog.New(Slog.NewJSONHandler(Os.Stdout, &Slog.HandlerOptions{Level: Slog.LevelInfo})))
+	Slog.SetDefault(Logging.New(Os.Stdout, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
-		Slog.Error("worker stopped", "error", Err)
+		Slog.Error("worker stopped", "event", "worker.stopped", "error", Err)
 		Os.Exit(1)
 	}
 }
@@ -38,8 +40,27 @@ func Run() error {
 	}
 	Ctx, Stop := Signal.NotifyContext(Context.Background(), Os.Interrupt, Syscall.SIGTERM)
 	defer Stop()
+	ShutdownTracing, Err := Tracing.Setup(Ctx, Tracing.OptionsFromEnv("wbd-worker"))
+	if Err != nil {
+		return Err
+	}
+	defer func() {
+		Flush, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		_ = ShutdownTracing(Flush)
+	}()
+	LogHandler, ShutdownLogs, Err := Tracing.SetupLogs(Ctx, Tracing.OptionsFromEnv("wbd-worker").ServiceName, Tracing.LogExporterFromEnv())
+	if Err != nil {
+		return Err
+	}
+	defer func() {
+		Flush, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		_ = ShutdownLogs(Flush)
+	}()
+	Slog.SetDefault(Logging.New(Os.Stdout, Logging.ParseLevel(Os.Getenv("LOG_LEVEL")), LogHandler))
 	Startup, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
-	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL)
+	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL, Logging.SQLTracer{Database: "platform"})
 	Cancel()
 	if Err != nil {
 		return Err
@@ -60,7 +81,7 @@ func Run() error {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err
 		}),
-		Driver: Driver.PostgresDriver{},
+		Driver: Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}},
 		Logger: Slog.Default(),
 	}
 	WorkerID := Strings.TrimSpace(Os.Getenv("WORKER_ID"))
