@@ -65,7 +65,7 @@ API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must n
 
 ### Logging and Tracing
 
-The API writes one JSON object per line to stdout through `log/slog` (`backend/internal/logging`). The CLI commands (`migrate`, `seed-*`) write the same format to stderr, so their normal output stays readable. Set `LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`. Logs are never stored in the platform database.
+The API and the worker write one JSON object per line to stdout through `log/slog` (`backend/internal/logging`). The CLI commands (`migrate`, `seed-*`) write the same format to stderr, so their normal output stays readable. Set `LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`. Logs are never stored in the platform database.
 
 | Event | Level | Written when |
 | --- | --- | --- |
@@ -75,6 +75,8 @@ The API writes one JSON object per line to stdout through `log/slog` (`backend/i
 | `sql.begin` / `sql.commit` / `sql.rollback` | info, error | Transaction control, each logged as its own event |
 | `migration.lock.acquired` / `.released` / `.failed` | info, warn, error | The per-database advisory lock, with `wait_ms` and `held_ms` |
 | `migration.execution.*` | info, error | Execution started, committed, succeeded, rolled back, failed, or uncertain |
+| `migration.job.claimed` / `.succeeded` / `.failed` / `.retry_scheduled` / `.idempotent` | info, warn, error | Worker job lifecycle; `claimed` includes `queue_wait_ms` |
+| `migration.batch.committed` / `.reverted` / `.reconciled` / `.uncertain` | info, error | Each batch, with `batch`, cursor range, rows, and duration |
 | `auth.login`, `auth.logout`, `admin.*`, `migration.draft.*`, `migration.review.*`, `migration.action.*`, `migration.plan.analyze`, `schema.compare` | info, warn | A state-changing action finished, with `outcome` (`succeeded`, `failed`, or `denied`), `status`, and the route IDs under `target` |
 | `auth.session.rejected`, `auth.csrf.rejected`, `access.denied` | info, warn | A missing or invalid session, a failed CSRF or origin check, or a missing database or administrator permission |
 
@@ -85,6 +87,7 @@ Correlation attributes are added automatically:
 - `actor_id` and `actor` once the session is authenticated.
 - `database_id` from the access check, or from the route for connection and grant administration.
 - `migration_id`, `execution_id`, `version`, and `attempt` during migration execution.
+- `job_id`, `worker_id`, and `batch` in the worker.
 
 `db` is `platform` or `target`, and `query_id` pairs each `sql.start` with its result. Platform pools, target pools (viewer, EXPLAIN, migrations, connection tests), schema comparison snapshots, and goose platform migrations are traced through a `pgx` query tracer.
 
@@ -98,22 +101,24 @@ Redaction:
 
 #### Tracing
 
-OpenTelemetry tracing (`backend/internal/tracing`) is always on. The chain within one trace is:
+OpenTelemetry tracing (`backend/internal/tracing`) is always on in the API and the worker. One queued migration produces one trace across both processes:
 
-1. An `HTTP <METHOD> <route>` server span, continuing an incoming W3C `traceparent` header.
-2. `migration.lock`, with `migration.lock.acquire` measuring the lock wait.
-3. `migration.execute`, recording migration and execution IDs, kind, direction, attempt, and the final status.
-4. A client span per SQL statement (`sql SELECT`, `sql BEGIN`, `sql DO`, `sql COMMIT`, …) with `db.query.text`, `db.response.rows`, and `db.response.status_code` (SQLSTATE).
+1. An `HTTP <METHOD> <route>` server span in the API, continuing an incoming W3C `traceparent` header.
+2. The enqueue handler stores that span's `traceparent` with the job (`Tracing.Inject`).
+3. The worker continues it (`Tracing.Extract`) with a consumer span `migration.job <action>`. It records `job_id`, `worker_id`, `attempt`, and `queue.wait_ms`.
+4. `migration.lock`, with `migration.lock.acquire` measuring the lock wait.
+5. `migration.execute`, recording migration and execution IDs, kind, direction, attempt, and the final status.
+6. One `migration.batch` span per batch, with batch number and cursor range.
+7. A client span per SQL statement (`sql SELECT`, `sql BEGIN`, `sql UPDATE`, `sql COMMIT`, …) with `db.query.text`, `db.response.rows`, and `db.response.status_code` (SQLSTATE).
 
 Failures set the span status to error with a safe message.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `OTEL_TRACES_EXPORTER` | `console` | `console` writes JSON spans to stderr, `otlp` sends OTLP/HTTP, `none` keeps trace IDs in logs without exporting spans (quieter local runs) |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Collector endpoint for `otlp` |
-| `OTEL_SERVICE_NAME` | `wbd-api` | `service.name` resource attribute |
-
-For the queue, `Tracing.Inject(ctx)` returns the `traceparent` of the current span to store with a job. `Tracing.Extract(ctx, traceparent)` continues that trace in the worker, so API → queue → worker → lock → batch/query spans share one trace ID.
+| `OTEL_LOGS_EXPORTER` | `none` | `otlp` also ships every log record (same redaction and level) to the Collector with its trace and span IDs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Collector endpoint for `otlp` traces and logs |
+| `OTEL_SERVICE_NAME` | `wbd-api` (API), `wbd-worker` (worker) | `service.name` resource attribute; leave unset so the two processes stay distinguishable |
 
 Sample log records captured from a local run, in time order: a forward migration (lock, execution, target SQL, commit, activity), then a failing EXPLAIN request. UUIDs are shortened and the request ID host is replaced.
 
@@ -232,19 +237,31 @@ Sample spans from the console exporter, trimmed to the main fields: a viewer req
 
 #### Central collection (Collector, Tempo, Loki)
 
-Start the monitoring stack (see [Grafana and OpenTelemetry Collector](#grafana-and-opentelemetry-collector)), then run the API with OTLP trace export while appending its logs to the file the Collector tails:
+Start the monitoring stack (see [Grafana and OpenTelemetry Collector](#grafana-and-opentelemetry-collector)). Then run the API and the worker with OTLP export for both traces and logs:
 
 ```sh
-make dev-api METRICS_ENABLED=true OTEL_TRACES_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 2>&1 | tee -a observability/logs/api.log
+make dev-api METRICS_ENABLED=true OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
 ```
 
-Traces go to Tempo and logs go to Loki. The Collector's `trace_parser` reads `trace_id` and `span_id` from each record, and its `attributes/logs` processor drops the `sql` attribute before storage. To correlate, copy a `trace_id` from any log line. Open the trace in Grafana Explore → Tempo, or run this LogQL query in Explore → Loki:
+```sh
+make dev-worker OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+Traces go to Tempo and logs go to Loki. Each record keeps the same redaction as stdout and arrives with its trace and span IDs. The Collector's `attributes/logs` processor drops the `sql` attribute before storage.
+
+The file-tailing receiver (`tee -a observability/logs/api.log`) still works on Linux. On macOS, Docker Desktop's bind mount can stop showing new data appended to the file, so prefer OTLP log export there. Do not enable both, or every record is stored twice.
+
+To correlate, copy a `trace_id` from any log line. Open it in Grafana Explore → Tempo, or run this query in Explore → Loki:
 
 ```logql
-{service_name="wbd-api"} | trace_id = "<trace_id>"
+{service_name=~"wbd-api|wbd-worker"} | trace_id = "<trace_id>"
 ```
 
-In a local check, one forward migration produced a 36-span trace in Tempo (`HTTP POST …/forward` → `migration.lock` → `migration.lock.acquire` / `migration.execute` → SQL spans). Loki returned 71 log records with the same `trace_id`: SQL start, finish, and commit events, lock acquired and released, execution started, committed, and succeeded, `migration.action.forward`, and `http.request`.
+Local check (batch migration, 12 rows, batch size 5, forwarded through the queue):
+
+- Tempo returned one trace of 85 spans across `wbd-api` (14) and `wbd-worker` (71). Its chain is `HTTP POST …/forward` → `migration.job forward` → `migration.lock` → `migration.execute` → `migration.batch` → `sql UPDATE`.
+- Loki returned 163 log records with the same `trace_id` (28 from the API, 135 from the worker): `http.request`, `migration.action.forward`, `migration.job.claimed` / `.succeeded`, `migration.lock.acquired` / `.released`, `migration.execution.started` / `.succeeded`, three `migration.batch.committed`, and the SQL events.
+- No `sql` or `password` attribute was stored.
 
 ### Prometheus Metrics
 
