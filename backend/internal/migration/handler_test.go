@@ -13,9 +13,10 @@ import (
 	Httptest "net/http/httptest"
 	Strings "strings"
 	Testing "testing"
+	Time "time"
 )
 
-func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Handler, *MockRepo, *Auth.Principal) {
+func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Handler, *MockRepo, *Auth.Principal, *Service) {
 	CurrentPrincipal := &Auth.Principal{ID: "user-editor", Username: "editor"}
 	Repo := NewMockRepo()
 	Service := &Service{
@@ -57,8 +58,11 @@ func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Han
 	}
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
+	Jobs := &Handler{Service: Service}
+	R.Get("/databases/{dbID}/jobs/{jobID}", Jobs.Job)
+	R.Get("/connections/{dbID}/jobs/{jobID}", Jobs.Job)
 
-	return R, Repo, CurrentPrincipal
+	return R, Repo, CurrentPrincipal, Service
 }
 
 func TestHandlerLifecycleAndAccess(T *Testing.T) {
@@ -74,7 +78,7 @@ func TestHandlerLifecycleAndAccess(T *Testing.T) {
 	ConnMock := &MockConn{Tx: TxMock}
 	DriverMock := &MockDriver{Conn: ConnMock}
 
-	Router, _, CurrentPrincipal := newTestHandler(Policy, DriverMock)
+	Router, Repo, CurrentPrincipal, Service := newTestHandler(Policy, DriverMock)
 
 	// 1. Create Migration as Editor -> 201 Created
 	CreatePayload := `{"title":"Add users table","sql_text":"CREATE TABLE users (id SERIAL);","down_sql":"DROP TABLE users;"}`
@@ -145,13 +149,33 @@ func TestHandlerLifecycleAndAccess(T *Testing.T) {
 		T.Fatalf("viewer execute should return 403 Forbidden, got %d: %s", Res.Code, Res.Body.String())
 	}
 
-	// 6. Switch back to Editor and Execute -> 200 OK
+	// 6. Switch back to Editor and enqueue Execute -> 202 Accepted
 	*CurrentPrincipal = Auth.Principal{ID: "user-editor", Username: "editor"}
 	Req = Httptest.NewRequest("POST", "/databases/db-1/migrations/"+Created.ID+"/execute", nil)
 	Res = Httptest.NewRecorder()
 	Router.ServeHTTP(Res, Req)
-	if Res.Code != 200 {
-		T.Fatalf("expected 200 OK for execute, got %d: %s", Res.Code, Res.Body.String())
+	if Res.Code != 202 {
+		T.Fatalf("expected 202 Accepted for execute, got %d: %s", Res.Code, Res.Body.String())
+	}
+	var Queued Job
+	if Err := Json.NewDecoder(Res.Body).Decode(&Queued); Err != nil || Queued.ID == "" || Queued.Status != JobQueued {
+		T.Fatalf("invalid enqueued job: %+v %v", Queued, Err)
+	}
+	Worker := &Worker{Repo: Repo, Service: Service, ID: "test-worker", Lease: Time.Minute}
+	Claimed, Err := Repo.ClaimJob(Context.Background(), "test-worker", Time.Minute)
+	if Err != nil || Claimed.ID != Queued.ID {
+		T.Fatalf("could not claim job: %+v %v", Claimed, Err)
+	}
+	Worker.Process(Context.Background(), Claimed)
+	JobResponse := Httptest.NewRecorder()
+	Router.ServeHTTP(JobResponse, Httptest.NewRequest("GET", "/databases/db-1/jobs/"+Queued.ID, nil))
+	if JobResponse.Code != 200 {
+		T.Fatalf("job status returned %d: %s", JobResponse.Code, JobResponse.Body.String())
+	}
+	var Finished Job
+	_ = Json.NewDecoder(JobResponse.Body).Decode(&Finished)
+	if Finished.Status != JobSucceeded || Finished.ExecutionID == nil {
+		T.Fatalf("job did not succeed: %+v", Finished)
 	}
 
 	// 7. Re-executing already committed migration -> 409 Conflict
@@ -195,7 +219,7 @@ func TestHandlerExecutionFailureResponse(T *Testing.T) {
 	ConnFail := &MockConn{Tx: TxFail}
 	DriverFail := &MockDriver{Conn: ConnFail}
 
-	Router, _, _ := newTestHandler(Policy, DriverFail)
+	Router, Repo, _, Service := newTestHandler(Policy, DriverFail)
 
 	// Create migration
 	CreatePayload := `{"title":"Broken SQL","sql_text":"INVALID SQL;","down_sql":"SELECT 1;"}`
@@ -207,16 +231,24 @@ func TestHandlerExecutionFailureResponse(T *Testing.T) {
 	var Created Migration
 	_ = Json.NewDecoder(Res.Body).Decode(&Created)
 
-	// Execute -> should return 422 execution_failed
+	// Execute enqueues a job; the worker records the failure.
 	Req = Httptest.NewRequest("POST", "/databases/db-1/migrations/"+Created.ID+"/execute", nil)
 	Res = Httptest.NewRecorder()
 	Router.ServeHTTP(Res, Req)
-
-	if Res.Code != 422 {
-		T.Fatalf("expected 422 execution_failed, got %d: %s", Res.Code, Res.Body.String())
+	if Res.Code != 202 {
+		T.Fatalf("expected 202 Accepted, got %d: %s", Res.Code, Res.Body.String())
 	}
-	if !Strings.Contains(Res.Body.String(), "execution_failed") {
-		T.Fatalf("response body should contain execution_failed: %s", Res.Body.String())
+	var Queued Job
+	_ = Json.NewDecoder(Res.Body).Decode(&Queued)
+	Worker := &Worker{Repo: Repo, Service: Service, ID: "test-worker", Lease: Time.Minute}
+	Claimed, _ := Repo.ClaimJob(Context.Background(), "test-worker", Time.Minute)
+	Worker.Process(Context.Background(), Claimed)
+	JobResponse := Httptest.NewRecorder()
+	Router.ServeHTTP(JobResponse, Httptest.NewRequest("GET", "/databases/db-1/jobs/"+Queued.ID, nil))
+	var Failed Job
+	_ = Json.NewDecoder(JobResponse.Body).Decode(&Failed)
+	if Failed.Status != JobFailed || Failed.LastError == nil || !Strings.Contains(*Failed.LastError, "target SQL execution failed") {
+		T.Fatalf("job failure was not recorded: %+v", Failed)
 	}
 }
 
@@ -224,7 +256,7 @@ func TestHandlerAnalyzeEndpoint(T *Testing.T) {
 	Policy := Access.StaticEvaluator{
 		DefaultLevel: Access.LevelViewOnly,
 	}
-	Router, _, _ := newTestHandler(Policy, nil)
+	Router, _, _, _ := newTestHandler(Policy, nil)
 
 	// Bad JSON -> 400
 	Req := Httptest.NewRequest("POST", "/databases/db-1/migrations/analyze", Bytes.NewBufferString("invalid json"))

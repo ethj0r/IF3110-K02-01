@@ -58,7 +58,7 @@ const reviewSubject = `WITH subject AS (
     SELECT M.id, M.database_id, M.revision, E.id AS previous_execution_id,
            CASE $3::text
                WHEN 'apply' THEN CASE WHEN M.status = 'draft' AND E.id IS NULL THEN M.sql_text END
-               WHEN 'rollback' THEN CASE WHEN M.status IN ('applied', 'committed') AND NOT M.irreversible THEN M.down_sql END
+               WHEN 'rollback' THEN CASE WHEN M.status IN ('applied', 'committed', 'partial') AND NOT M.irreversible THEN M.down_sql END
                WHEN 'forward' THEN CASE WHEN M.status = 'rolled_back' THEN M.sql_text END
                WHEN 'retry' THEN CASE WHEN E.status IN ('failed', 'partial', 'partially_reverted') THEN E.sql_text END
            END AS sql_text

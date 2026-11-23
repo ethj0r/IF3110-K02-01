@@ -69,7 +69,7 @@ Test('reviews differences and imports editable SQL without saving or executing a
   await User.click(Screen.getByRole('button', { name: 'Save Draft' }))
   await Screen.findByText('Migration draft saved successfully.')
   const Saved = Fetch.mock.calls.find(([Path, Options]) => Path.endsWith('/migrations') && Options?.method === 'POST')
-  Expect(JSON.parse(String(Saved?.[1]?.body))).toEqual({ title: 'Sync schema public', sql_text: 'SELECT 42;', down_sql: 'SELECT 1;', irreversible: false, irreversible_reason: '' })
+  Expect(JSON.parse(String(Saved?.[1]?.body))).toEqual({ title: 'Sync schema public', sql_text: 'SELECT 42;', down_sql: 'SELECT 1;', batch_mode: false, batch_column: '', batch_size: 0, irreversible: false, irreversible_reason: '' })
   Expect(Fetch.mock.calls.some(([Path]) => Path.endsWith('/execute'))).toBe(false)
 })
 

@@ -40,6 +40,16 @@ type MigrationRepository interface {
 	FinishExecution(Ctx Context.Context, ExecutionID string, Status ExecutionStatus, ExecutionErr *string) error
 	RefreshStatus(Ctx Context.Context, DatabaseID string, MigrationID string) (Migration, error)
 	ListHistory(Ctx Context.Context, DatabaseID string, HideRollback bool) ([]Execution, error)
+	EnqueueJob(Ctx Context.Context, DatabaseID string, MigrationID string, Action JobAction, RequestedBy *string, TraceParent *string) (Job, error)
+	GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error)
+	ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error)
+	FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error
+	ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error)
+	RequeueJob(Ctx Context.Context, JobID string, AvailableAt Time.Time, LastError string) error
+	SetExecutionRunning(Ctx Context.Context, DatabaseID string, ExecutionID string) (Execution, error)
+	RecordBatchUp(Ctx Context.Context, ExecutionID string, DatabaseID string, BatchNo int64, CursorFrom int64, CursorTo int64, RowCount int64) (Execution, error)
+	RecordBatchReverted(Ctx Context.Context, RollbackExecutionID string, UpExecutionID string, DatabaseID string, BatchNo int64) (Execution, error)
+	ListCommittedBatches(Ctx Context.Context, ExecutionID string) ([]Batch, error)
 }
 
 type Service struct {
@@ -249,23 +259,12 @@ func (Server *Service) withAction(Ctx Context.Context, User Auth.Principal, Data
 }
 
 func (Server *Service) applyLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
-	if Current.LockedAt != nil || !Current.Status.IsDraft() {
-		return Execution{}, ErrAlreadyExecuted
-	}
-	if _, Err := Repo.LatestExecution(Ctx, Current.DatabaseID, Current.ID); Err == nil {
-		return Execution{}, ErrAlreadyExecuted
-	} else if !Errors.Is(Err, ErrNotFound) {
-		return Execution{}, Err
-	}
 	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
 		return Execution{}, Err
 	}
-	if HasPending(History) {
-		return Execution{}, ErrPending
-	}
-	if !CanApplyNow(Items, Current.Version) {
-		return Execution{}, ErrOutOfOrder
+	if Err := ValidateApply(Current, Items, History); Err != nil {
+		return Execution{}, Err
 	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
 		Kind:        KindApply,
@@ -276,28 +275,13 @@ func (Server *Service) applyLocked(Ctx Context.Context, Repo MigrationRepository
 }
 
 func (Server *Service) rollbackLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
-	if Current.Irreversible || Current.DownSQL == nil {
-		return Execution{}, ErrIrreversible
-	}
-	Success, Err := Repo.LatestSuccessfulExecution(Ctx, Current.DatabaseID, Current.ID)
-	if Err != nil {
-		if Errors.Is(Err, ErrNotFound) {
-			return Execution{}, ErrNotApplied
-		}
-		return Execution{}, Err
-	}
-	if Success.Direction != DirectionUp {
-		return Execution{}, ErrNotApplied
-	}
 	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
 		return Execution{}, Err
 	}
-	if HasPending(History) {
-		return Execution{}, ErrPending
-	}
-	if Current.Version != MaxAppliedVersion(Items) {
-		return Execution{}, ErrRollbackOrder
+	Success, Err := ValidateRollback(Current, Items, History)
+	if Err != nil {
+		return Execution{}, Err
 	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
 		Kind:        KindRollback,
@@ -309,22 +293,12 @@ func (Server *Service) rollbackLocked(Ctx Context.Context, Repo MigrationReposit
 }
 
 func (Server *Service) forwardLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
-	Success, Err := Repo.LatestSuccessfulExecution(Ctx, Current.DatabaseID, Current.ID)
-	if Err != nil && !Errors.Is(Err, ErrNotFound) {
-		return Execution{}, Err
-	}
-	if Errors.Is(Err, ErrNotFound) || Success.Direction != DirectionDown {
-		return Execution{}, ErrNotRolledBack
-	}
 	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
 		return Execution{}, Err
 	}
-	if HasPending(History) {
-		return Execution{}, ErrPending
-	}
-	if Current.Version != NextVersionAfter(Items, MaxAppliedVersion(Items)) {
-		return Execution{}, ErrForwardOrder
+	if Err := ValidateForward(Current, Items, History); Err != nil {
+		return Execution{}, Err
 	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
 		Kind:        KindForward,
@@ -335,18 +309,15 @@ func (Server *Service) forwardLocked(Ctx Context.Context, Repo MigrationReposito
 }
 
 func (Server *Service) retryLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
-	if !Latest.Status.IsFailure() {
-		return Execution{}, ErrNoFailedAttempt
-	}
 	_, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
 		return Execution{}, Err
 	}
-	if HasPending(History) {
-		return Execution{}, ErrPending
+	if Err := ValidateRetry(Current, History); Err != nil {
+		return Execution{}, Err
 	}
-	if len(History) == 0 || History[len(History)-1].ID != Latest.ID {
-		return Execution{}, ErrOutOfOrder
+	if Latest.Mode == ModeBatch {
+		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
 	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
 		Kind:        KindRetry,
@@ -355,6 +326,113 @@ func (Server *Service) retryLocked(Ctx Context.Context, Repo MigrationRepository
 		RetryOf:     &Latest.ID,
 		RequestedBy: actorID(User),
 	})
+}
+
+func (Server *Service) Enqueue(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Action JobAction, TraceParent string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	ID = Strings.TrimSpace(ID)
+	if DatabaseID == "" || ID == "" {
+		return Job{}, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	Current, Err := Server.Repo.Get(Ctx, DatabaseID, ID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	Items, History, Err := Server.loadState(Ctx, Server.Repo, DatabaseID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	switch Action {
+	case JobApply:
+		Err = ValidateApply(Current, Items, History)
+	case JobRollback:
+		_, Err = ValidateRollback(Current, Items, History)
+	case JobForward:
+		Err = ValidateForward(Current, Items, History)
+	case JobRetry:
+		Err = ValidateRetry(Current, History)
+	default:
+		Err = ErrInvalidInput
+	}
+	if Err != nil {
+		return Job{}, Err
+	}
+	if Server.Reviews != nil && Server.Reviews.requireReview {
+		Kind := kindForJobAction(Action)
+		if Kind == "" {
+			return Job{}, ErrInvalidInput
+		}
+		Review, ReviewErr := Server.Reviews.getReview(Ctx, reviewKey{DatabaseID, ID, Kind}, User.ID)
+		if ReviewErr != nil || Review.Status != "approved" {
+			return Job{}, ErrApprovalRequired
+		}
+	}
+	return Server.Repo.EnqueueJob(Ctx, DatabaseID, ID, Action, actorID(User), &TraceParent)
+}
+
+func kindForJobAction(Action JobAction) ExecutionKind {
+	switch Action {
+	case JobApply:
+		return KindApply
+	case JobRollback:
+		return KindRollback
+	case JobForward:
+		return KindForward
+	case JobRetry:
+		return KindRetry
+	default:
+		return ""
+	}
+}
+
+func (Server *Service) EnqueueExecute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, TraceParent string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	ID = Strings.TrimSpace(ID)
+	if DatabaseID == "" || ID == "" {
+		return Job{}, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	_, History, Err := Server.loadState(Ctx, Server.Repo, DatabaseID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	Latest, Ok := LatestFor(History, ID)
+	if !Ok {
+		return Server.Enqueue(Ctx, User, DatabaseID, ID, JobApply, TraceParent)
+	}
+	switch {
+	case Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning:
+		return Job{}, ErrPending
+	case Latest.Status.IsFailure() || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted:
+		return Server.Enqueue(Ctx, User, DatabaseID, ID, JobRetry, TraceParent)
+	default:
+		return Job{}, ErrAlreadyExecuted
+	}
+}
+
+func (Server *Service) GetJob(Ctx Context.Context, User Auth.Principal, DatabaseID string, JobID string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	JobID = Strings.TrimSpace(JobID)
+	if DatabaseID == "" || JobID == "" {
+		return Job{}, ErrJobNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	return Server.Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
+	Running, Err := Repo.SetExecutionRunning(Ctx, Current.DatabaseID, Latest.ID)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	return Server.runExecution(Ctx, Repo, User, Current, Running)
 }
 
 func (Server *Service) loadState(Ctx Context.Context, Repo MigrationRepository, DatabaseID string) ([]Migration, []Execution, error) {
@@ -397,6 +475,12 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 
 	if Server.Resolver == nil {
 		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Driver.ErrUnavailable)
+	}
+	if Exec.Mode == ModeBatch {
+		if Exec.Direction == DirectionUp {
+			return Server.runBatchUp(Ctx, Repo, User, Current, Exec, Attempt)
+		}
+		return Server.runBatchDown(Ctx, Repo, User, Current, Exec, Attempt)
 	}
 	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, Current.DatabaseID)
 	if Err != nil {
@@ -500,6 +584,98 @@ func (Server *Service) finishFailure(Ctx Context.Context, Repo MigrationReposito
 	return Updated, Cause
 }
 
+func LatestFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		if History[Index].MigrationID == MigrationID {
+			return History[Index], true
+		}
+	}
+	return Execution{}, false
+}
+
+func LatestSuccessfulFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		if History[Index].MigrationID == MigrationID && History[Index].Status == ExecutionSucceeded {
+			return History[Index], true
+		}
+	}
+	return Execution{}, false
+}
+
+func ValidateApply(Current Migration, Items []Migration, History []Execution) error {
+	if Current.LockedAt != nil || !Current.Status.IsDraft() {
+		return ErrAlreadyExecuted
+	}
+	if _, Ok := LatestFor(History, Current.ID); Ok {
+		return ErrAlreadyExecuted
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if !CanApplyNow(Items, Current.Version) {
+		return ErrOutOfOrder
+	}
+	return nil
+}
+
+func ValidateRollback(Current Migration, Items []Migration, History []Execution) (Execution, error) {
+	if Current.Irreversible || Current.DownSQL == nil {
+		return Execution{}, ErrIrreversible
+	}
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionUp {
+		return Execution{}, ErrNotApplied
+	}
+	if Latest.Status != ExecutionSucceeded && Latest.Status != ExecutionPartial {
+		return Execution{}, ErrNotApplied
+	}
+	if HasPending(History) {
+		return Execution{}, ErrPending
+	}
+	if Current.Version != FrontierVersion(Items) {
+		return Execution{}, ErrRollbackOrder
+	}
+	return Latest, nil
+}
+
+func ValidateForward(Current Migration, Items []Migration, History []Execution) error {
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionDown || Latest.Status != ExecutionSucceeded {
+		return ErrNotRolledBack
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if Current.Version != NextVersionAfter(Items, MaxAppliedVersion(Items)) {
+		return ErrForwardOrder
+	}
+	return nil
+}
+
+func ValidateRetry(Current Migration, History []Execution) error {
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || (!Latest.Status.IsFailure() && Latest.Status != ExecutionPartial && Latest.Status != ExecutionPartiallyReverted) {
+		return ErrNoFailedAttempt
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if len(History) == 0 || History[len(History)-1].ID != Latest.ID {
+		return ErrOutOfOrder
+	}
+	return nil
+}
+
+func FrontierVersion(Items []Migration) int64 {
+	Result := MaxAppliedVersion(Items)
+	for _, Item := range Items {
+		if Item.Status == StatusPartial && Item.Version > Result {
+			Result = Item.Version
+		}
+	}
+	return Result
+}
+
 func HasPending(History []Execution) bool {
 	for _, Item := range History {
 		if Item.Status == ExecutionQueued || Item.Status == ExecutionRunning {
@@ -570,12 +746,15 @@ func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 		switch {
 		case Item.LockedAt == nil && Item.Status.IsDraft():
 			Item.CanApply = CanApplyNow(Result, Item.Version)
-		case Item.Status.IsApplied():
-			Item.CanRollback = Item.Version == MaxApplied && !Item.Irreversible && Item.DownSQL != nil
+		case Item.Status.IsApplied() || Item.Status == StatusPartial:
+			LatestItem, HasLatest := Latest[Item.ID]
+			Item.CanRollback = Item.Version == FrontierVersion(Result) && !Item.Irreversible && Item.DownSQL != nil &&
+				HasLatest && LatestItem.Direction == DirectionUp && (LatestItem.Status == ExecutionSucceeded || LatestItem.Status == ExecutionPartial)
 		case Item.Status.IsRolledBack():
-			Item.CanForward = Item.Version == Next
+			LatestItem, HasLatest := Latest[Item.ID]
+			Item.CanForward = Item.Version == Next && HasLatest && LatestItem.Direction == DirectionDown && LatestItem.Status == ExecutionSucceeded
 		}
-		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.Status.IsFailure() && LatestItem.ID == Last.ID {
+		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.ID == Last.ID && (LatestItem.Status.IsFailure() || LatestItem.Status == ExecutionPartial || LatestItem.Status == ExecutionPartiallyReverted) {
 			Item.CanRetry = true
 		}
 	}
