@@ -57,6 +57,46 @@ Client environment variables use the `VITE_` prefix. Never use that prefix for s
 
 API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must not contain raw database errors or credentials.
 
+### Structured Logging
+
+The API writes one JSON object per line to stdout through `log/slog` (`backend/internal/logging`). Set `LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`. Logs are not stored in the platform database.
+
+| Event | Level | Written when |
+| --- | --- | --- |
+| `http.request` | info, warn (4xx), error (5xx) | An `/api` request finishes, with method, route pattern, status, bytes, and duration |
+| `sql.start` | info | A statement is sent, with its SQL text and bound parameters |
+| `sql.finish` | info, error | A statement returns, with duration, affected or returned rows, command, and on failure SQLSTATE and message |
+| `sql.begin` / `sql.commit` / `sql.rollback` | info, error | Transaction control statements, logged as separate events |
+| `migration.execution.*` | info, error | Migration execution started, committed, succeeded, rolled back, failed, or uncertain |
+
+Correlation attributes are added automatically from the request context:
+
+- `request_id` on every record of one request.
+- `actor_id` and `actor` once the session is authenticated.
+- `database_id` for the first database checked by access control.
+- `migration_id`, `execution_id`, `version`, and `attempt` on migration execution records and their target SQL.
+
+`db` is `platform` or `target`, and `query_id` pairs each `sql.start` with its result. Statements on the platform pool, target pools (viewer, EXPLAIN, migrations), and schema comparison snapshots are all traced through a `pgx` query tracer.
+
+Redaction:
+
+- Attributes whose key mentions a password, secret, token, cookie, CSRF, session identifier, DSN, or ciphertext are replaced with `[REDACTED]`.
+- Credentials inside connection URLs, `password=` pairs, and SQL `PASSWORD '...'` literals are masked in every string value.
+- Every parameter is masked when the statement touches credentials or sessions. Binary values are logged only by length.
+- PostgreSQL error details, which can contain row values, are not logged.
+- SQL and parameters are truncated at 4 KiB and 256 bytes.
+
+Sample output captured from a local run: applying a migration, then a failing EXPLAIN request. UUIDs are shortened and the request ID host is replaced.
+
+```json
+{"time":"2026-11-23T16:25:47.813211+07:00","level":"INFO","msg":"migration execution started","event":"migration.execution.started","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"feb3110c-…","version":1,"revision":1,"kind":"apply","direction":"up","attempt":1,"sql":"CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)","request_id":"host/bAoxNLcEXe-000011"}
+{"time":"2026-11-23T16:25:47.826071+07:00","level":"INFO","msg":"sql transaction started","event":"sql.begin","db":"target","query_id":90,"duration_ms":0.315,"status":"ok","rows":0,"command":"BEGIN","request_id":"host/bAoxNLcEXe-000011","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"feb3110c-…","version":1,"attempt":1}
+{"time":"2026-11-23T16:25:47.831222+07:00","level":"INFO","msg":"sql statement finished","event":"sql.finish","db":"target","query_id":92,"duration_ms":3.795,"sql":"DO LANGUAGE plpgsql 'BEGIN EXECUTE ''CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)''; END'","status":"ok","rows":0,"command":"DO","request_id":"host/bAoxNLcEXe-000011","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"feb3110c-…","version":1,"attempt":1}
+{"time":"2026-11-23T16:25:47.832453+07:00","level":"INFO","msg":"sql transaction committed","event":"sql.commit","db":"target","query_id":93,"duration_ms":1.157,"status":"ok","rows":0,"command":"COMMIT","request_id":"host/bAoxNLcEXe-000011","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"feb3110c-…","version":1,"attempt":1}
+{"time":"2026-11-23T16:26:02.145395+07:00","level":"ERROR","msg":"sql statement failed","event":"sql.finish","db":"target","query_id":176,"duration_ms":0.706,"sql":"EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON) SELECT * FROM demo.missing_table","status":"error","sqlstate":"42P01","error":"relation \"demo.missing_table\" does not exist","request_id":"host/bAoxNLcEXe-000018","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+{"time":"2026-11-23T16:26:02.145968+07:00","level":"WARN","msg":"http request completed","event":"http.request","method":"POST","route":"/api/databases/{dbID}/migrations/analyze","status":422,"bytes":93,"duration_ms":14.464,"request_id":"host/bAoxNLcEXe-000018","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+```
+
 ### Prometheus Metrics
 
 Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
