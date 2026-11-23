@@ -6,11 +6,16 @@ receivers:
       http:
         endpoint: 0.0.0.0:4318
   file_log/wbd:
-    include: [/var/log/wbd/api.log]
+    include: [/var/log/wbd/api.log, /var/log/wbd/worker.log]
+    include_file_name: true
     start_at: end
     resource:
       service.name: wbd-api
     operators:
+      - type: add
+        if: 'attributes["log.file.name"] == "worker.log"'
+        field: resource["service.name"]
+        value: wbd-worker
       - type: json_parser
         on_error: drop_quiet
         timestamp:

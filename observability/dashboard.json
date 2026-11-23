@@ -31,7 +31,7 @@
       "id": 3,
       "type": "timeseries",
       "title": "Mean migration execution duration",
-      "description": "Mean across retained jobs with start and finish timestamps.",
+      "description": "Mean across retained executions with start and finish timestamps.",
       "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "s" } },
@@ -43,7 +43,7 @@
       "id": 4,
       "type": "timeseries",
       "title": "Mean queue wait",
-      "description": "Time from job creation to start for retained jobs with a recorded delay.",
+      "description": "Time from eligibility to the latest recorded worker claim.",
       "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "fieldConfig": { "defaults": { "unit": "s" } },
@@ -54,11 +54,12 @@
     {
       "id": 5,
       "type": "timeseries",
-      "title": "Retained retry jobs",
+      "title": "Migration retries",
       "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "refId": "A", "expr": "wbd_migration_retry_jobs", "legendFormat": "Retries" }
+        { "refId": "A", "expr": "wbd_migration_retry_jobs", "legendFormat": "Requested retry jobs" },
+        { "refId": "B", "expr": "wbd_migration_retry_attempts", "legendFormat": "Automatic retry attempts" }
       ]
     },
     {
@@ -75,6 +76,37 @@
           "expr": "rate(wbd_platform_pool_wait_seconds_total[5m]) / (rate(wbd_platform_pool_waited_acquires_total[5m]) > 0)",
           "legendFormat": "Pool wait"
         }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Longest current migration lock wait",
+      "gridPos": { "x": 0, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_lock_wait_max_seconds", "legendFormat": "Lock wait" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Processed migration batches",
+      "gridPos": { "x": 8, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_batches_processed", "legendFormat": "{{direction}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Processed migration rows",
+      "gridPos": { "x": 16, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_rows_processed", "legendFormat": "{{direction}}" }
       ]
     }
   ]

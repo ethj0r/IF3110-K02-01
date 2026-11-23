@@ -54,6 +54,8 @@ func (Repo *Repository) exec(Ctx Context.Context, SQL string, Args ...any) (Pgco
 	return Repo.Pool.Exec(Ctx, SQL, Args...)
 }
 
+const AdvisoryLockSQL = "SELECT pg_advisory_lock(hashtext('migration_' || $1::uuid::text))"
+
 // acquireLock takes the per-database advisory lock and records the wait as a
 // span and a migration.lock.acquired (or .failed) log event.
 func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pgxpool.Conn, Time.Time, error) {
@@ -62,7 +64,7 @@ func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pg
 	defer Span.End()
 	Conn, Err := Repo.Pool.Acquire(Ctx)
 	if Err == nil {
-		if _, Err = Conn.Exec(Ctx, "SELECT pg_advisory_lock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
+		if _, Err = Conn.Exec(Ctx, AdvisoryLockSQL, DatabaseID); Err != nil {
 			Conn.Release()
 		}
 	}
