@@ -12,9 +12,11 @@ import (
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Inspect "github.com/ethj0r/IF3110-K02-01/backend/internal/inspect"
 	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
+	Observability "github.com/ethj0r/IF3110-K02-01/backend/internal/observability"
 	Schemadiff "github.com/ethj0r/IF3110-K02-01/backend/internal/schemadiff"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
+	Chi "github.com/go-chi/chi/v5"
 	Slog "log/slog"
 	Http "net/http"
 	Os "os"
@@ -108,6 +110,11 @@ func Run() error {
 			AdminRoutes.Register,
 			MigrationRoutes.Register,
 			SchemaDiffRoutes.Register,
+			func(Api Chi.Router) {
+				if Os.Getenv("METRICS_ENABLED") == "true" {
+					Api.Get("/metrics", Observability.MetricsHandler{Pool: Pool}.ServeHTTP)
+				}
+			},
 		),
 		ReadHeaderTimeout: 5 * Time.Second,
 		ReadTimeout:       15 * Time.Second,

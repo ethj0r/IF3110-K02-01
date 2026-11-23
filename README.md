@@ -57,6 +57,23 @@ Client environment variables use the `VITE_` prefix. Never use that prefix for s
 
 API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must not contain raw database errors or credentials.
 
+### Prometheus Metrics
+
+Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
+With the default address, verify the response using `curl -fsS http://127.0.0.1:8080/api/metrics`.
+The endpoint is disabled by default. When enabled, restrict access to the monitoring network.
+
+| Metric | Meaning |
+| --- | --- |
+| `wbd_migration_jobs{status}` | Retained execution records by status, including queued, running, succeeded, and failed |
+| `wbd_migration_retry_jobs` | Retained retry execution records |
+| `wbd_migration_execution_mean_seconds` | Mean duration of retained executions with start and finish timestamps |
+| `wbd_platform_pool_connections{state}` | Active and idle PostgreSQL connections in the platform pool |
+| `wbd_platform_pool_wait_seconds_total` | Cumulative wait in seconds for successful acquisitions from the empty platform pool |
+| `wbd_platform_pool_waited_acquires_total` | Successful acquisitions that waited for the pool |
+
+Job counts are snapshots of the migration store and reflect record removal. Pool wait counters reset on API restart. Divide the rates of the two wait counters to graph mean wait per delayed acquisition.
+
 ## Local Databases
 
 | Service | Host Port | Database | Purpose |
