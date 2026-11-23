@@ -9,6 +9,7 @@ import (
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Config "github.com/ethj0r/IF3110-K02-01/backend/internal/config"
 	Connection "github.com/ethj0r/IF3110-K02-01/backend/internal/connection"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
@@ -21,6 +22,7 @@ import (
 const DevelopersGroup = "developers"
 
 func main() {
+	Slog.SetDefault(Logging.New(Os.Stderr, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
 		Slog.Error("development seed failed", "error", Err)
 		Os.Exit(1)
@@ -42,7 +44,7 @@ func Run() error {
 	}
 	Ctx, Cancel := Context.WithTimeout(Context.Background(), 30*Time.Second)
 	defer Cancel()
-	Pool, Err := Store.Open(Ctx, Cfg.DatabaseURL)
+	Pool, Err := Store.Open(Ctx, Cfg.DatabaseURL, Logging.SQLTracer{Database: "platform"})
 	if Err != nil {
 		return Err
 	}
