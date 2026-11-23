@@ -11,8 +11,13 @@ import (
 )
 
 type Repository struct {
-	Pool *Pgxpool.Pool
-	Conn *Pgxpool.Conn
+	Pool          *Pgxpool.Pool
+	Conn          *Pgxpool.Conn
+	requireReview bool
+}
+
+func NewReviewedRepository(Pool *Pgxpool.Pool) *Repository {
+	return &Repository{Pool: Pool, requireReview: true}
 }
 
 type ExecutionRequest struct {
@@ -70,7 +75,9 @@ func (Repo *Repository) WithDatabaseLock(Ctx Context.Context, DatabaseID string,
 		}
 		Conn.Release()
 	}()
-	return Run(&Repository{Pool: Repo.Pool, Conn: Conn})
+	Locked := *Repo
+	Locked.Conn = Conn
+	return Run(&Locked)
 }
 
 func (Repo *Repository) WithExecutionLock(Ctx Context.Context, DatabaseID string, Run func(MigrationRepository) (Execution, error)) (Execution, error) {
@@ -86,7 +93,9 @@ func (Repo *Repository) WithExecutionLock(Ctx Context.Context, DatabaseID string
 		}
 		Conn.Release()
 	}()
-	return Run(&Repository{Pool: Repo.Pool, Conn: Conn})
+	Locked := *Repo
+	Locked.Conn = Conn
+	return Run(&Locked)
 }
 
 const MigrationColumns = `M.id::text, M.database_id::text, M.version, M.revision, M.title, M.sql_text, M.down_sql,
@@ -373,10 +382,15 @@ func (Repo *Repository) CreateExecution(Ctx Context.Context, DatabaseID string, 
 		})
 	}
 	var ExecutionID string
-	Err := Repo.queryRow(Ctx, `WITH Locked AS (
+	Err := Repo.queryRow(Ctx, reviewGroups+`, Locked AS (
 UPDATE migrations
 SET locked_at = COALESCE(locked_at, CURRENT_TIMESTAMP), updated_at = CURRENT_TIMESTAMP
-WHERE database_id = $1 AND id = $2
+WHERE database_id = $1::text::uuid AND id = $2::text::uuid
+  AND (NOT $9::boolean OR EXISTS (
+      SELECT 1 FROM current_review R JOIN review_groups G ON G.review_id = R.id
+      WHERE R.sql_text = $5
+      GROUP BY R.id HAVING bool_and(G.approved)
+  ))
 RETURNING id, database_id, revision, sql_text, down_sql, batch_mode, batch_column, batch_size
 )
 INSERT INTO migration_executions
@@ -386,8 +400,11 @@ SELECT L.id, L.database_id, $3, $4, L.revision, 'running', $5, L.sql_text, L.dow
        CASE WHEN L.batch_mode THEN 'batch' ELSE 'normal' END, L.batch_column, L.batch_size,
        $6, $7, $8, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
 FROM Locked L
-RETURNING id::text`, DatabaseID, MigrationID, string(Request.Kind), string(Request.Direction), Request.SQLText, Request.RollbackOf, Request.RetryOf, Request.RequestedBy).Scan(&ExecutionID)
+RETURNING id::text`, DatabaseID, MigrationID, string(Request.Kind), string(Request.Direction), Request.SQLText, Request.RollbackOf, Request.RetryOf, Request.RequestedBy, Repo.requireReview).Scan(&ExecutionID)
 	if Errors.Is(Err, Pgx.ErrNoRows) {
+		if Repo.requireReview {
+			return Execution{}, ErrApprovalRequired
+		}
 		return Execution{}, ErrNotFound
 	}
 	if Err != nil {

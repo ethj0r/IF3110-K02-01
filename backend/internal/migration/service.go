@@ -54,6 +54,7 @@ type MigrationRepository interface {
 
 type Service struct {
 	Repo     MigrationRepository
+	Reviews  *Repository
 	Access   Access.Evaluator
 	Resolver DSNResolver
 	Driver   Driver.Driver
@@ -359,7 +360,32 @@ func (Server *Service) Enqueue(Ctx Context.Context, User Auth.Principal, Databas
 	if Err != nil {
 		return Job{}, Err
 	}
+	if Server.Reviews != nil && Server.Reviews.requireReview {
+		Kind := kindForJobAction(Action)
+		if Kind == "" {
+			return Job{}, ErrInvalidInput
+		}
+		Review, ReviewErr := Server.Reviews.getReview(Ctx, reviewKey{DatabaseID, ID, Kind}, User.ID)
+		if ReviewErr != nil || Review.Status != "approved" {
+			return Job{}, ErrApprovalRequired
+		}
+	}
 	return Server.Repo.EnqueueJob(Ctx, DatabaseID, ID, Action, actorID(User), &TraceParent)
+}
+
+func kindForJobAction(Action JobAction) ExecutionKind {
+	switch Action {
+	case JobApply:
+		return KindApply
+	case JobRollback:
+		return KindRollback
+	case JobForward:
+		return KindForward
+	case JobRetry:
+		return KindRetry
+	default:
+		return ""
+	}
 }
 
 func (Server *Service) EnqueueExecute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, TraceParent string) (Job, error) {

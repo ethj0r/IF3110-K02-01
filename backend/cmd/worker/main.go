@@ -51,9 +51,11 @@ func Run() error {
 	}
 	ConnectionService := &Connection.Service{Cipher: Cipher, Repo: &Connection.Repository{Pool: Pool}}
 	AccessRepo := &Access.Repository{Pool: Pool}
+	MigrationRepo := Migration.NewReviewedRepository(Pool)
 	Service := &Migration.Service{
-		Repo:   &Migration.Repository{Pool: Pool},
-		Access: AccessRepo,
+		Repo:    MigrationRepo,
+		Reviews: MigrationRepo,
+		Access:  AccessRepo,
 		Resolver: Migration.DSNResolverFunc(func(Ctx Context.Context, DatabaseID string) (string, error) {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err

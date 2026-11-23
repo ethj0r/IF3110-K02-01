@@ -18,11 +18,13 @@ const UserReturning = "id::text, username, is_platform_admin, is_active, created
 const GroupColumns = `G.id::text, G.name, G.description,
  (SELECT count(*) FROM user_groups M WHERE M.group_id = G.id),
  (SELECT count(*) FROM group_database_access A WHERE A.group_id = G.id),
+ (SELECT L.user_id::text FROM group_leaders L WHERE L.group_id = G.id),
  G.created_at, G.updated_at`
 
 const GroupReturning = `id::text, name, description,
  (SELECT count(*) FROM user_groups M WHERE M.group_id = groups.id),
  (SELECT count(*) FROM group_database_access A WHERE A.group_id = groups.id),
+ (SELECT L.user_id::text FROM group_leaders L WHERE L.group_id = groups.id),
  created_at, updated_at`
 
 func isConflict(Err error) bool {
@@ -61,7 +63,7 @@ func ReadUser(Row Pgx.Row) (User, error) {
 
 func ReadGroup(Row Pgx.Row) (Group, error) {
 	var Result Group
-	Err := Row.Scan(&Result.ID, &Result.Name, &Result.Description, &Result.MemberCount, &Result.AccessCount, &Result.CreatedAt, &Result.UpdatedAt)
+	Err := Row.Scan(&Result.ID, &Result.Name, &Result.Description, &Result.MemberCount, &Result.AccessCount, &Result.LeaderUserID, &Result.CreatedAt, &Result.UpdatedAt)
 	if Errors.Is(Err, Pgx.ErrNoRows) {
 		return Group{}, ErrNotFound
 	}
@@ -165,6 +167,30 @@ func (Repo *Repository) ListGroups(Ctx Context.Context) ([]Group, error) {
 
 func (Repo *Repository) GetGroup(Ctx Context.Context, ID string) (Group, error) {
 	return ReadGroup(Repo.Pool.QueryRow(Ctx, "SELECT "+GroupColumns+" FROM groups G WHERE G.id::text = $1", ID))
+}
+
+func (Repo *Repository) SetGroupLeader(Ctx Context.Context, GroupID, UserID string) error {
+	var GroupExists, Assigned bool
+	Err := Repo.Pool.QueryRow(Ctx, `WITH assignment AS (
+    INSERT INTO group_leaders (group_id, user_id)
+    SELECT M.group_id, M.user_id
+    FROM user_groups M JOIN users U ON U.id = M.user_id
+    WHERE M.group_id::text = $1 AND M.user_id::text = $2 AND U.is_active
+    FOR SHARE OF M, U
+    ON CONFLICT (group_id) DO UPDATE SET user_id = EXCLUDED.user_id
+    RETURNING group_id
+)
+SELECT EXISTS (SELECT 1 FROM groups WHERE id::text = $1), EXISTS (SELECT 1 FROM assignment)`, GroupID, UserID).Scan(&GroupExists, &Assigned)
+	if Err != nil {
+		return ErrUnavailable
+	}
+	if Assigned {
+		return nil
+	}
+	if !GroupExists {
+		return ErrNotFound
+	}
+	return ErrInvalidLeader
 }
 
 func (Repo *Repository) ListMembers(Ctx Context.Context, GroupID string) ([]Member, error) {

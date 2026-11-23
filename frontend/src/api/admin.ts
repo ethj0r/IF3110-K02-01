@@ -22,6 +22,7 @@ export interface AdminGroup {
   description: string
   member_count: number
   access_count: number
+  leader_user_id?: string
   created_at: string
   updated_at: string
 }
@@ -109,6 +110,13 @@ export function DeleteGroup(ID: string) {
 
 export function ListMembers(GroupID: string) {
   return ApiRequest<AdminMember[]>(`/api/admin/groups/${PathID(GroupID)}/members`)
+}
+
+export function SetGroupLeader(GroupID: string, UserID: string) {
+  return ApiRequest<void>(`/api/admin/groups/${PathID(GroupID)}/leader`, {
+    method: 'PUT',
+    body: JSON.stringify({ user_id: UserID }),
+  })
 }
 
 export function AddMember(GroupID: string, UserID: string) {

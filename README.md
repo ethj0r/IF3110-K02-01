@@ -63,6 +63,54 @@ Client environment variables use the `VITE_` prefix. Never use that prefix for s
 
 API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must not contain raw database errors or credentials.
 
+### Prometheus Metrics
+
+Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
+With the default address, verify the response using `curl -fsS http://127.0.0.1:8080/api/metrics`.
+The endpoint is disabled by default. When enabled, restrict access to the monitoring network.
+
+| Metric | Meaning |
+| --- | --- |
+| `wbd_migration_jobs{status}` | Retained execution records by status, including queued, running, succeeded, and failed |
+| `wbd_migration_retry_jobs` | Retained retry execution records |
+| `wbd_migration_execution_mean_seconds` | Mean duration of retained executions with start and finish timestamps |
+| `wbd_migration_queue_wait_mean_seconds` | Mean time from job creation to start for executions with a recorded delay |
+| `wbd_platform_pool_connections{state}` | Active and idle PostgreSQL connections in the platform pool |
+| `wbd_platform_pool_wait_seconds_total` | Cumulative wait in seconds for successful acquisitions from the empty platform pool |
+| `wbd_platform_pool_waited_acquires_total` | Successful acquisitions that waited for the pool |
+
+Job counts are snapshots of the migration store and reflect record removal. Pool wait counters reset on API restart. Divide the rates of the two wait counters to graph mean wait per delayed acquisition.
+
+### Grafana and OpenTelemetry Collector
+
+With the local PostgreSQL databases running, start the optional monitoring stack from the repository root.
+
+```sh
+mkdir -p observability/logs
+touch observability/logs/api.log
+docker compose -f docker-compose.observability.yml up -d --wait
+```
+
+Start the API in another terminal. The Collector tails new JSON log records, forwards them to Loki, and omits the SQL attributes from centralized logs.
+
+```sh
+make dev-api METRICS_ENABLED=true 2>&1 | tee -a observability/logs/api.log
+```
+
+On native Linux Docker, use `make dev-api METRICS_ENABLED=true HTTP_ADDR=0.0.0.0:8080` on a trusted development network so Prometheus can reach the host listener through the Docker bridge. If the API listens on another port, update the scrape target in `observability/prometheus.yml`.
+
+1. Check the `wbd-api` scrape target at [Prometheus Targets](http://127.0.0.1:9090/targets).
+2. Open [WBD Migration Observability](http://127.0.0.1:3000/d/wbd-migrations/wbd-migration-observability) with the local Grafana credentials `admin` / `admin`. Run an approved migration and check the jobs, duration, and pool panels. The queue wait panel needs an execution with a recorded delay between creation and start.
+3. Open Grafana Explore with Loki and run `{service_name="wbd-api"} | event = "migration.execution.succeeded"` to see the application event recorded at the same time as the metrics change.
+
+The Collector accepts OTLP/HTTP on port 4318 and OTLP/gRPC on port 4317. It sends traces to Tempo and logs to Loki. To verify correlation independently of application instrumentation, run the demo below and paste its Loki query into Explore. Open the log's trace link to view the matching `observability.demo` span in Tempo. The demo emits synthetic telemetry and leaves application metrics unchanged.
+
+```sh
+sh observability/demo.sh
+```
+
+Stop the monitoring stack with `docker compose -f docker-compose.observability.yml down`.
+
 ## Local Databases
 
 | Service | Host Port | Database | Purpose |

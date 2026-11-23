@@ -4,11 +4,26 @@ export interface User {
   is_platform_admin: boolean
 }
 
-export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed'
+export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed' | 'partial' | 'partially_reverted'
 
 export type ExecutionKind = 'apply' | 'rollback' | 'forward' | 'retry'
 export type ExecutionDirection = 'up' | 'down'
 export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'partially_reverted'
+
+export interface MigrationReview {
+  id: string
+  revision: number
+  action: ExecutionKind
+  sql_text: string
+  status: 'pending_review' | 'approved'
+  groups: {
+    id: string
+    name: string
+    leader_user_id?: string
+    approved: boolean
+    can_approve: boolean
+  }[]
+}
 
 export interface Migration {
   id: string
@@ -266,6 +281,28 @@ export function RetryMigration(DatabaseID: string, MigrationID: string): Promise
 
 export function GetMigrationJob(DatabaseID: string, JobID: string, Signal?: AbortSignal): Promise<MigrationJob> {
   return ApiRequest<MigrationJob>(`/api/databases/${encodeURIComponent(DatabaseID)}/jobs/${encodeURIComponent(JobID)}`, { signal: Signal })
+}
+
+function MigrationReviewPath(DatabaseID: string, MigrationID: string, Action: ExecutionKind) {
+  return `/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/reviews/${Action}`
+}
+
+export async function GetMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind, Signal?: AbortSignal): Promise<MigrationReview | null> {
+  try {
+    return await ApiRequest<MigrationReview>(MigrationReviewPath(DatabaseID, MigrationID, Action), { signal: Signal })
+  } catch (Error) {
+    if (Error instanceof ApiError && Error.Status === 404 && Error.Code === 'review_not_found') return null
+    throw Error
+  }
+}
+
+export function SubmitMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind) {
+  return ApiRequest<MigrationReview>(MigrationReviewPath(DatabaseID, MigrationID, Action), { method: 'POST' })
+}
+
+export function ApproveMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind, ReviewID: string, GroupID: string) {
+  const Path = MigrationReviewPath(DatabaseID, MigrationID, Action)
+  return ApiRequest<void>(`${Path}/${encodeURIComponent(ReviewID)}/approvals/${encodeURIComponent(GroupID)}`, { method: 'PUT' })
 }
 
 export async function ListMigrationHistory(DatabaseID: string, HideRollback: boolean, Signal?: AbortSignal): Promise<MigrationExecution[]> {

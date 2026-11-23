@@ -32,6 +32,7 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Get("/groups/{id}", Routes.GetGroup)
 		R.Patch("/groups/{id}", Routes.UpdateGroup)
 		R.Delete("/groups/{id}", Routes.DeleteGroup)
+		R.Put("/groups/{id}/leader", Routes.SetGroupLeader)
 		R.Get("/groups/{id}/members", Routes.ListMembers)
 		R.Put("/groups/{id}/members/{userId}", Routes.AddMember)
 		R.Delete("/groups/{id}/members/{userId}", Routes.RemoveMember)
@@ -63,6 +64,8 @@ func DecodeInput(W Http.ResponseWriter, R *Http.Request, Target any) bool {
 
 func WriteAdminError(W Http.ResponseWriter, Err error) {
 	switch {
+	case Errors.Is(Err, ErrInvalidLeader):
+		Httpx.Error(W, Http.StatusBadRequest, "invalid_group_leader", "Select an active group member as leader")
 	case Errors.Is(Err, ErrInvalidInput), Errors.Is(Err, Access.ErrInvalidLevel):
 		Httpx.Error(W, Http.StatusBadRequest, "invalid_request", "Invalid administration request")
 	case Errors.Is(Err, ErrNotFound), Errors.Is(Err, Access.ErrNotFound):
@@ -204,6 +207,20 @@ func (Routes *Handler) ListMembers(W Http.ResponseWriter, R *Http.Request) {
 		return
 	}
 	Httpx.JSON(W, Http.StatusOK, Result)
+}
+
+func (Routes *Handler) SetGroupLeader(W Http.ResponseWriter, R *Http.Request) {
+	var Input struct {
+		UserID string `json:"user_id"`
+	}
+	if !DecodeInput(W, R, &Input) {
+		return
+	}
+	if Err := Routes.Service.SetGroupLeader(R.Context(), Chi.URLParam(R, "id"), Input.UserID); Err != nil {
+		WriteAdminError(W, Err)
+		return
+	}
+	W.WriteHeader(Http.StatusNoContent)
 }
 
 func (Routes *Handler) AddMember(W Http.ResponseWriter, R *Http.Request) {
