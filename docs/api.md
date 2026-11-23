@@ -78,25 +78,33 @@ the definition (`locked_at`); later edits must be new migrations.
 | Method | Path | Access | Request Body | Success Response | Description |
 | --- | --- | --- | --- | --- | --- |
 | `GET` | `/databases/{dbId}/migrations` | View Only, View + Edit | None | `200` `[...]` | Lists definitions with derived status and action capabilities |
-| `POST` | `/databases/{dbId}/migrations` | View + Edit | `{"title":"...","sql_text":"...","down_sql":"...","irreversible":false,"irreversible_reason":""}` | `201` `{...}` | Creates a draft with the next sequential version |
+| `POST` | `/databases/{dbId}/migrations` | View + Edit | `{"title":"...","sql_text":"...","down_sql":"...","batch_mode":false,"batch_column":"","batch_size":0,"irreversible":false,"irreversible_reason":""}` | `201` `{...}` | Creates a draft with the next sequential version |
 | `GET` | `/databases/{dbId}/migrations/{id}` | View Only, View + Edit | None | `200` `{...}` | Retrieves a definition |
 | `PUT` | `/databases/{dbId}/migrations/{id}` | View + Edit | Same as create | `200` `{...}` | Updates a draft and increments its revision |
 | `DELETE` | `/databases/{dbId}/migrations/{id}` | View + Edit | None | `204 No Content` | Deletes an unexecuted draft |
 | `GET` | `/databases/{dbId}/migrations/history?hide_rollback=false` | View Only, View + Edit | None | `200` `[...]` | Lists executions and attempts; optionally hides successful rollback pairs |
-| `POST` | `/databases/{dbId}/migrations/{id}/execute` | View + Edit | None | `200` `{...}` | Applies a draft, or retries its latest failed execution |
-| `POST` | `/databases/{dbId}/migrations/{id}/apply` | View + Edit | None | `200` `{...}` | Applies an unexecuted draft |
-| `POST` | `/databases/{dbId}/migrations/{id}/rollback` | View + Edit | None | `200` `{...}` | Runs the original down SQL for the last active migration |
-| `POST` | `/databases/{dbId}/migrations/{id}/forward` | View + Edit | None | `200` `{...}` | Re-applies up SQL for a rolled-back migration in linear order |
-| `POST` | `/databases/{dbId}/migrations/{id}/retry` | View + Edit | None | `200` `{...}` | Retries the latest failed execution using its SQL snapshot |
+| `GET` | `/databases/{dbId}/jobs/{jobId}` | View Only, View + Edit | None | `200` `{...}` | Polls a queued/running/finished migration job |
+| `POST` | `/databases/{dbId}/migrations/{id}/execute` | View + Edit | None | `202` job | Enqueues apply or retry |
+| `POST` | `/databases/{dbId}/migrations/{id}/apply` | View + Edit | None | `202` job | Enqueues an apply |
+| `POST` | `/databases/{dbId}/migrations/{id}/rollback` | View + Edit | None | `202` job | Enqueues a rollback |
+| `POST` | `/databases/{dbId}/migrations/{id}/forward` | View + Edit | None | `202` job | Enqueues a forward |
+| `POST` | `/databases/{dbId}/migrations/{id}/retry` | View + Edit | None | `202` job | Enqueues a retry |
 | `POST` | `/databases/{dbId}/migrations/analyze` | View Only, View + Edit | `{"sql_text":"..."}` | `200` `{...}` | Runs EXPLAIN (ANALYZE) in a target rollback transaction |
 
-Successful actions return an execution object containing the execution ID,
+Action endpoints enqueue a migration job and return it immediately. A job contains
+`id`, `action`, `status` (`queued`, `running`, `succeeded`, `failed`, `cancelled`),
+attempt counters, lease metadata, optional `execution_id`, `last_error`, actor
+fields, and timestamps. The worker revalidates the action under a per-database lock,
+runs it, and fills `execution_id`. History executions contain the execution ID,
 migration/version/revision, `kind` (`apply`, `rollback`, `forward`, `retry`),
 `direction` (`up`, `down`), `status`, the exact SQL snapshot, optional
 `rollback_of_execution_id` / `retry_of_execution_id`, actor fields, timestamps,
-and an `attempts` array. Definitions return derived `status`, `revision`,
-`down_sql`, `irreversible`, `locked_at`, and `can_apply` / `can_rollback` /
-`can_forward` / `can_retry` hints.
+and an `attempts` array. Batch executions also expose `mode`, `batch_column`,
+`batch_size`, `committed_batches`, `committed_rows`, `reverted_batches`,
+`reverted_rows`, and `checkpoint_cursor`. Definitions return derived `status`,
+`revision`, `down_sql`, `batch_mode`, `batch_column`, `batch_size`,
+`irreversible`, `locked_at`, and `can_apply` / `can_rollback` / `can_forward` /
+`can_retry` hints.
 
 ### Migration Statuses
 
@@ -110,6 +118,25 @@ and an `attempts` array. Definitions return derived `status`, `revision`,
 
 Execution statuses are `queued`, `running`, `succeeded`, `failed`, `partial`, and
 `partially_reverted`. Attempt statuses are `running`, `succeeded`, and `failed`.
+Migration definitions surface `partial` and `partially_reverted` while a batch
+execution is incomplete.
+
+### Batch Mode
+
+A batch definition sets `batch_mode: true`, a cursor `batch_column`, and a positive
+`batch_size`. `sql_text` must be one statement that uses `$1` as the last cursor and
+`$2` as the batch size, and must return the cursor column. `down_sql` must be one
+statement that uses `$1` as `cursor_to` and `$2` as `cursor_from` to compensate one
+committed batch.
+
+The worker executes one target transaction per batch, commits it, and records the
+batch scope (`cursor_from`, `cursor_to`, `row_count`) plus the execution checkpoint.
+Previous batches stay committed when a later batch fails; the execution becomes
+`partial`. Retry resumes the same execution from the checkpoint without repeating
+committed batches. Rollback compensates committed batches in reverse order; a
+partial failure leaves `partially_reverted` and can be resumed. The target database
+receives a `platform_migration.batches` evidence row in the same transaction as each
+batch, allowing the worker to reconcile a commit whose platform record was lost.
 
 ### Execution Model
 
@@ -120,11 +147,13 @@ Execution statuses are `queued`, `running`, `succeeded`, `failed`, `partial`, an
 5. **Forward:** Forward is allowed only for a rolled-back migration that is the next version after the highest applied version. It runs the original up SQL as a new execution; it never automatically runs the next migration.
 6. **Retry:** Retry is allowed only for the latest failed execution on the database and repeats that execution's SQL snapshot and direction.
 7. **History integrity:** Executions and attempts are never overwritten or deleted. Failures remain visible. `hide_rollback=true` hides successful rollback executions together with the execution they cancelled, paired by execution ID. A failed rollback changes neither the hidden set nor the active position.
-8. **Atomicity:** SQL runs in an atomic PL/pgSQL `DO` block within the target transaction. Explicit transaction control, including nested `COMMIT`, is rejected by PostgreSQL.
-9. **Safe errors:** Confirmed SQL failures record a generic error in the platform. Raw PostgreSQL errors and credentials are not persisted or returned by the API.
-10. **Uncertain outcomes:** A lost commit response, rollback failure, or failed result write leaves the execution running/pending. Retry and later actions are blocked until the target outcome is verified and reconciled.
-11. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
-12. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
+8. **Queue and worker:** Actions are stored in `migration_jobs` and claimed with `FOR UPDATE SKIP LOCKED`. A partial unique index allows one queued/running job per database, while different databases run in parallel. A session advisory lock protects execution across workers and remains held between batch commits. Jobs, executions, and batch checkpoints survive restart.
+9. **Leases, retries, and duplicate delivery:** A claimed job has a lease. Transient store/target failures are requeued with exponential backoff while attempts remain below `max_attempts`. Expired running jobs are marked failed as uncertain instead of being blindly retried. Duplicate delivery is safe because a second run sees the existing execution and does not commit again. The per-database advisory lock is released when the worker's platform connection closes; the pending execution continues to block later actions until an operator reconciles it.
+10. **Atomicity:** SQL runs in an atomic PL/pgSQL `DO` block within the target transaction. Explicit transaction control, including nested `COMMIT`, is rejected by PostgreSQL.
+11. **Safe errors:** Confirmed SQL failures record a generic error in the platform. Raw PostgreSQL errors and credentials are not persisted or returned by the API.
+12. **Uncertain outcomes:** A lost commit response, rollback failure, or failed result write leaves the execution running/pending. Retry and later actions are blocked until the target outcome is verified and reconciled.
+13. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
+14. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
 
 ### Migration Review
 

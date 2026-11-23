@@ -8,7 +8,10 @@ import (
 	Fmt "fmt"
 	Sync "sync"
 	Testing "testing"
+	Time "time"
 
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
+	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Testutil "github.com/ethj0r/IF3110-K02-01/backend/internal/testutil"
 	Migrations "github.com/ethj0r/IF3110-K02-01/backend/migrations"
@@ -221,5 +224,81 @@ func TestConcurrentMigrationCreationLinearity(T *Testing.T) {
 		if List[i].Version != int64(i+1) {
 			T.Fatalf("index %d expected version %d, got %d", i, i+1, List[i].Version)
 		}
+	}
+}
+
+func TestJobQueueLifecycle(T *Testing.T) {
+	Pool := NewMigrationDatabase(T)
+	Repo := &Repository{Pool: Pool}
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Pool)
+	M1, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Job migration", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"}, &UserID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Job, Err := Repo.EnqueueJob(Ctx, DBID, M1.ID, JobApply, &UserID, nil)
+	if Err != nil || Job.Status != JobQueued || Job.Attempts != 0 {
+		T.Fatalf("enqueue failed: %+v %v", Job, Err)
+	}
+	if _, Err := Repo.EnqueueJob(Ctx, DBID, M1.ID, JobApply, &UserID, nil); !Errors.Is(Err, ErrJobConflict) {
+		T.Fatalf("second active job was accepted: %v", Err)
+	}
+	Claimed, Err := Repo.ClaimJob(Ctx, "worker-a", Time.Minute)
+	if Err != nil || Claimed.ID != Job.ID || Claimed.Status != JobRunning || Claimed.Attempts != 1 {
+		T.Fatalf("claim failed: %+v %v", Claimed, Err)
+	}
+	if _, Err := Repo.ClaimJob(Ctx, "worker-b", Time.Minute); !Errors.Is(Err, ErrJobNotFound) {
+		T.Fatalf("running job was claimed twice: %v", Err)
+	}
+	if Err := Repo.FinishJob(Ctx, Job.ID, JobSucceeded, nil, nil); Err != nil {
+		T.Fatal(Err)
+	}
+	Finished, Err := Repo.GetJob(Ctx, DBID, Job.ID)
+	if Err != nil || Finished.Status != JobSucceeded || Finished.FinishedAt == nil {
+		T.Fatalf("finish failed: %+v %v", Finished, Err)
+	}
+}
+
+func TestWorkerProcessesQueuedJob(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	Repo := &Repository{Pool: Platform}
+	Service := &Service{
+		Repo:   Repo,
+		Access: Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) {
+			return "target", nil
+		}),
+		Driver: testTargetDriver{Pool: Target},
+	}
+	Created, Err := Service.Create(Ctx, Auth.Principal{ID: UserID, Username: "test_migrator"}, DBID, MigrationInput{
+		Title: "Worker migration", SQLText: "CREATE TABLE worker_table (id int);", DownSQL: "DROP TABLE worker_table;",
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Job, Err := Service.Enqueue(Ctx, Auth.Principal{ID: UserID, Username: "test_migrator"}, DBID, Created.ID, JobApply, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Claimed, Err := Repo.ClaimJob(Ctx, "worker-test", Time.Minute)
+	if Err != nil || Claimed.ID != Job.ID {
+		T.Fatalf("claim failed: %+v %v", Claimed, Err)
+	}
+	Worker := &Worker{Repo: Repo, Service: Service, ID: "worker-test", Lease: Time.Minute}
+	Worker.Process(Ctx, Claimed)
+	Finished, Err := Repo.GetJob(Ctx, DBID, Job.ID)
+	if Err != nil || Finished.Status != JobSucceeded || Finished.ExecutionID == nil {
+		T.Fatalf("worker did not finish the job: %+v %v", Finished, Err)
+	}
+	Migration, Err := Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusApplied {
+		T.Fatalf("worker did not apply the migration: %+v %v", Migration, Err)
+	}
+	var Exists bool
+	if Err := Target.QueryRow(Ctx, "SELECT to_regclass('worker_table') IS NOT NULL").Scan(&Exists); Err != nil || !Exists {
+		T.Fatalf("target table was not created: %v", Err)
 	}
 }

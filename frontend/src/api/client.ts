@@ -4,7 +4,7 @@ export interface User {
   is_platform_admin: boolean
 }
 
-export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed'
+export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed' | 'partial' | 'partially_reverted'
 
 export type ExecutionKind = 'apply' | 'rollback' | 'forward' | 'retry'
 export type ExecutionDirection = 'up' | 'down'
@@ -33,6 +33,9 @@ export interface Migration {
   title: string
   sql_text: string
   down_sql?: string
+  batch_mode: boolean
+  batch_column?: string
+  batch_size?: number
   irreversible: boolean
   irreversible_reason?: string
   status: MigrationStatus
@@ -54,6 +57,9 @@ export interface MigrationInput {
   title: string
   sql_text: string
   down_sql: string
+  batch_mode: boolean
+  batch_column: string
+  batch_size: number
   irreversible: boolean
   irreversible_reason: string
 }
@@ -87,6 +93,14 @@ export interface MigrationExecution {
   sql_text: string
   up_sql: string
   down_sql?: string
+  mode: 'normal' | 'batch'
+  batch_column?: string
+  batch_size?: number
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
   rollback_of_execution_id?: string
   retry_of_execution_id?: string
   requested_by?: string
@@ -206,34 +220,67 @@ export async function DeleteMigrationDraft(DatabaseID: string, MigrationID: stri
   })
 }
 
-export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
-  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
+export type JobAction = 'apply' | 'rollback' | 'forward' | 'retry'
+export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface MigrationJob {
+  id: string
+  database_id: string
+  migration_id: string
+  version: number
+  title: string
+  action: JobAction
+  status: JobStatus
+  attempts: number
+  max_attempts: number
+  available_at: string
+  locked_by?: string
+  locked_at?: string
+  lease_expires_at?: string
+  last_error?: string
+  execution_id?: string
+  requested_by?: string
+  requested_by_username?: string
+  traceparent?: string
+  mode?: string
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
+  created_at: string
+  updated_at: string
+  finished_at?: string
+}
+
+function ActionRequest(DatabaseID: string, MigrationID: string, Action: JobAction | 'execute'): Promise<MigrationJob> {
+  return ApiRequest<MigrationJob>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/${Action}`, {
     method: 'POST',
   })
 }
 
-export async function ApplyMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
-  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/apply`, {
-    method: 'POST',
-  })
+export function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'execute')
 }
 
-export async function RollbackMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
-  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/rollback`, {
-    method: 'POST',
-  })
+export function ApplyMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'apply')
 }
 
-export async function ForwardMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
-  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/forward`, {
-    method: 'POST',
-  })
+export function RollbackMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'rollback')
 }
 
-export async function RetryMigration(DatabaseID: string, MigrationID: string): Promise<MigrationExecution> {
-  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/retry`, {
-    method: 'POST',
-  })
+export function ForwardMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'forward')
+}
+
+export function RetryMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'retry')
+}
+
+export function GetMigrationJob(DatabaseID: string, JobID: string, Signal?: AbortSignal): Promise<MigrationJob> {
+  return ApiRequest<MigrationJob>(`/api/databases/${encodeURIComponent(DatabaseID)}/jobs/${encodeURIComponent(JobID)}`, { signal: Signal })
 }
 
 function MigrationReviewPath(DatabaseID: string, MigrationID: string, Action: ExecutionKind) {

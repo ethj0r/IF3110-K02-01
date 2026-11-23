@@ -11,6 +11,7 @@ import {
   CreateMigration,
   DeleteMigrationDraft,
   ForwardMigration,
+  GetMigrationJob,
   GetMigrationReview,
   ListMigrationHistory,
   ListMigrations,
@@ -58,9 +59,13 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const [EditorDownSQL, SetEditorDownSQL] = useState('')
   const [EditorIrreversible, SetEditorIrreversible] = useState(false)
   const [EditorReason, SetEditorReason] = useState('')
+  const [EditorBatchMode, SetEditorBatchMode] = useState(false)
+  const [EditorBatchColumn, SetEditorBatchColumn] = useState('id')
+  const [EditorBatchSize, SetEditorBatchSize] = useState(1000)
   const [HideRollback, SetHideRollback] = useState(false)
   const [ExecutionError, SetExecutionError] = useState<string | null>(null)
   const [SuccessMessage, SetSuccessMessage] = useState<string | null>(null)
+  const [ActiveJobID, SetActiveJobID] = useState<string | null>(null)
   const [Confirmation, SetConfirmation] = useState<PendingConfirmation | null>(null)
 
   const MigrationsQuery = useQuery({
@@ -92,6 +97,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         title: EditorTitle,
         sql_text: EditorSQL,
         down_sql: EditorIrreversible ? '' : EditorDownSQL,
+        batch_mode: EditorBatchMode,
+        batch_column: EditorBatchMode ? EditorBatchColumn : '',
+        batch_size: EditorBatchMode ? Number(EditorBatchSize) : 0,
         irreversible: EditorIrreversible,
         irreversible_reason: EditorIrreversible ? EditorReason : '',
       }
@@ -116,19 +124,39 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
         default: return ApplyMigration(ActiveDatabase, ID)
       }
     },
-    onSuccess: Executed => {
+    onSuccess: Job => {
       SetReviewSelection(null)
       SetExecutionError(null)
       SetConfirmation(null)
-      SetSuccessMessage(`${ActionLabel(Executed.kind)} v${Executed.version} finished with status ${Executed.status}.`)
-      Refresh()
+      SetSuccessMessage(null)
+      SetActiveJobID(Job.id)
     },
     onError: Error => {
       SetConfirmation(null)
-      SetExecutionError(ErrorMessage(Error, 'Unable to complete the migration action.'))
+      SetExecutionError(ErrorMessage(Error, 'Unable to queue the migration action.'))
       Refresh()
     },
   })
+
+  const JobQuery = useQuery({
+    queryKey: ['migration-job', ActiveDatabase, ActiveJobID],
+    queryFn: ({ signal }) => GetMigrationJob(ActiveDatabase, ActiveJobID!, signal),
+    enabled: Boolean(Database && ActiveJobID),
+    refetchInterval: Query => {
+      const Status = Query.state.data?.status
+      return Status === 'succeeded' || Status === 'failed' || Status === 'cancelled' ? false : 1000
+    },
+  })
+
+  const Job = JobQuery.data
+  const JobFinished = Boolean(Job && (Job.status === 'succeeded' || Job.status === 'failed' || Job.status === 'cancelled'))
+  const JobActive = Boolean(ActiveJobID) && !JobFinished
+
+  useEffect(() => {
+    if (!JobFinished) return
+    void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
+    void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
+  }, [JobFinished, QueryCache, ActiveDatabase])
 
   const DeleteMutation = useMutation({
     mutationFn: (ID: string) => DeleteMigrationDraft(ActiveDatabase, ID),
@@ -143,7 +171,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
 
   const DetailsAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
   const EditorAnalyze = useMutation({ mutationFn: (SQLText: string) => AnalyzeQueryPlan(ActiveDatabase, SQLText) })
-  const Busy = SaveMutation.isPending || ActionMutation.isPending || DeleteMutation.isPending
+  const Busy = SaveMutation.isPending || ActionMutation.isPending || DeleteMutation.isPending || JobActive
 
   function ResetEditor() {
     SetEditorTitle('')
@@ -151,6 +179,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     SetEditorDownSQL('')
     SetEditorIrreversible(false)
     SetEditorReason('')
+    SetEditorBatchMode(false)
+    SetEditorBatchColumn('id')
+    SetEditorBatchSize(1000)
   }
 
   function OpenCreateEditor() {
@@ -168,6 +199,9 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     SetEditorDownSQL(Item.down_sql ?? '')
     SetEditorIrreversible(Item.irreversible)
     SetEditorReason(Item.irreversible_reason ?? '')
+    SetEditorBatchMode(Item.batch_mode)
+    SetEditorBatchColumn(Item.batch_column ?? 'id')
+    SetEditorBatchSize(Item.batch_size ?? 1000)
     SetIsEditorOpen(true)
     SetExecutionError(null)
     EditorAnalyze.reset()
@@ -234,6 +268,23 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
               <label htmlFor="migration-title">Title</label>
               <input id="migration-title" className="input" value={EditorTitle} onChange={Event => SetEditorTitle(Event.target.value)} placeholder="e.g. Create users table" required maxLength={128} />
             </div>
+            <label className="check">
+              <input type="checkbox" checked={EditorBatchMode} onChange={Event => SetEditorBatchMode(Event.target.checked)} />
+              Batch mode
+            </label>
+            {EditorBatchMode && (
+              <div className="form-grid">
+                <div className="field">
+                  <label htmlFor="migration-batch-column">Cursor column</label>
+                  <input id="migration-batch-column" className="input" value={EditorBatchColumn} onChange={Event => SetEditorBatchColumn(Event.target.value)} required maxLength={63} />
+                </div>
+                <div className="field">
+                  <label htmlFor="migration-batch-size">Batch size</label>
+                  <input id="migration-batch-size" className="input" type="number" min={1} max={1000000} value={EditorBatchSize} onChange={Event => SetEditorBatchSize(Number(Event.target.value))} required />
+                </div>
+              </div>
+            )}
+            {EditorBatchMode && <p className="muted">Use one statement per up/down script. Up SQL receives <code>$1</code> as the cursor and <code>$2</code> as the batch size, and must return the cursor column. Down SQL receives <code>$1</code> as cursor_to and <code>$2</code> as cursor_from for each committed batch.</p>}
             <SQLInput Label="Up SQL" Value={EditorSQL} OnChange={Value => { SetEditorSQL(Value); if (EditorAnalyze.data || EditorAnalyze.error) EditorAnalyze.reset() }} OnAnalyze={() => EditorAnalyze.mutate(EditorSQL)} Pending={EditorAnalyze.isPending} />
             <label className="check">
               <input type="checkbox" checked={EditorIrreversible} onChange={Event => SetEditorIrreversible(Event.target.checked)} />
@@ -256,6 +307,18 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
             </div>
           </form>
         </Card>
+      )}
+      {ActiveJobID && Job && (
+        <Notice Tone={Job.status === 'failed' ? 'danger' : Job.status === 'succeeded' ? 'success' : 'warning'} Role={Job.status === 'failed' ? 'alert' : 'status'}>
+          <strong>{ActionLabel(Job.action)} job:</strong> {Job.status} (attempt {Job.attempts}/{Job.max_attempts})
+          {Job.execution_id && <> · execution <code>{Job.execution_id.slice(0, 8)}</code></>}
+          {Job.mode === 'batch' && <> · {Job.committed_batches} batch(es) / {Job.committed_rows} row(s) committed{Job.reverted_batches > 0 ? `, ${Job.reverted_batches} batch(es) / ${Job.reverted_rows} row(s) reverted` : ''}</>}
+          {Job.last_error && <div>{Job.last_error}</div>}
+          {JobFinished && <button type="button" className="btn btn-ghost btn-sm" onClick={() => SetActiveJobID(null)}>Dismiss</button>}
+        </Notice>
+      )}
+      {ActiveJobID && JobQuery.isError && (
+        <Notice Tone="danger" Role="alert">Unable to read migration job status.</Notice>
       )}
 
       {Database && (
@@ -285,6 +348,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
                       <td className="mono cell-nowrap">v{Item.version}</td>
                       <td>
                         {Item.title}
+                        {Item.batch_mode && <> <Badge Tone="outline">batch {Item.batch_column} × {Item.batch_size}</Badge></>}
                         {Item.irreversible && <> <Badge Tone="outline">irreversible</Badge></>}
                       </td>
                       <td><StateBadge Status={Item.status} /></td>
@@ -555,6 +619,15 @@ function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
         {Execution.rollback_of_execution_id && <div><dt>Rollback of</dt><dd><code>{Execution.rollback_of_execution_id}</code></dd></div>}
         {Execution.retry_of_execution_id && <div><dt>Retry of</dt><dd><code>{Execution.retry_of_execution_id}</code></dd></div>}
       </dl>
+      {Execution.mode === 'batch' && (
+        <dl className="meta-grid">
+          <div><dt>Batch cursor</dt><dd className="mono">{Execution.batch_column ?? '—'}</dd></div>
+          <div><dt>Batch size</dt><dd className="mono">{Execution.batch_size ?? '—'}</dd></div>
+          <div><dt>Committed</dt><dd className="mono">{Execution.committed_batches} batch(es) / {Execution.committed_rows} row(s)</dd></div>
+          <div><dt>Reverted</dt><dd className="mono">{Execution.reverted_batches} batch(es) / {Execution.reverted_rows} row(s)</dd></div>
+          <div><dt>Checkpoint</dt><dd className="mono">{Execution.checkpoint_cursor}</dd></div>
+        </dl>
+      )}
       <SQLBlock Label="Executed SQL snapshot" SQL={Execution.sql_text} />
       {Execution.error_message && <Notice Tone="danger" Role="alert">{Execution.error_message}</Notice>}
       <div className="table-scroll inset-table">

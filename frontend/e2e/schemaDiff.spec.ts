@@ -69,14 +69,24 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     return Response.status() === 204 ? undefined as Value : await Response.json() as Value
   }
 
+  async function WaitJob(Database: RecordID, JobID: string) {
+    for (let Attempt = 0; Attempt < 60; Attempt++) {
+      const Job = await EditorAPI<{ id: string; status: string; last_error?: string }>(`/api/databases/${Database.id}/jobs/${JobID}`)
+      if (Job.status === 'succeeded') return
+      if (Job.status === 'failed' || Job.status === 'cancelled') throw new Error(`Migration job ${JobID} ended ${Job.status}: ${Job.last_error ?? ''}`)
+      await new Promise(Resolve => setTimeout(Resolve, 500))
+    }
+    throw new Error(`Migration job ${JobID} did not finish`)
+  }
+
   async function ExecuteSQL(Database: RecordID, SQL: string) {
     const Base = `/api/databases/${Database.id}/migrations`
     const Draft = await EditorAPI<RecordID>(Base, 'POST', { title: 'Schema diff fixture', sql_text: SQL, down_sql: 'SELECT 1;' })
     const Path = `${Base}/${Draft.id}/reviews/apply`
     const Review = await EditorAPI<RecordID>(Path, 'POST')
     await EditorAPI(`${Path}/${Review.id}/approvals/${Group!.id}`, 'PUT')
-    const Done = await EditorAPI<Migration>(`${Base}/${Draft.id}/execute`, 'POST')
-    Expect(Done.status).toBe('succeeded')
+    const Job = await EditorAPI<{ id: string }>(`${Base}/${Draft.id}/execute`, 'POST')
+    await WaitJob(Database, Job.id)
   }
 
   async function ReviewAndApply(Page: Page, Row: Locator) {

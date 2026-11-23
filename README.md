@@ -34,7 +34,7 @@ make seed-data
 
 ### Run the Application
 
-Start the API and frontend in separate terminals:
+Start the API, frontend, and migration worker in separate terminals:
 
 ```sh
 make dev-api
@@ -43,6 +43,12 @@ make dev-api
 ```sh
 make dev-web
 ```
+
+```sh
+make dev-worker
+```
+
+Every apply, rollback, forward, and retry is published to a durable PostgreSQL queue and processed by the worker. The API returns a job ID immediately; the SPA polls `/api/databases/{dbId}/jobs/{jobId}` for queued/running/final status. Without a running worker, jobs remain queued. One database has at most one active migration job, while different databases can run in parallel.
 
 Open `http://127.0.0.1:5173`. Vite proxies `/api` to `HTTP_ADDR`, which defaults to `127.0.0.1:8080`, keeping browser requests on the same origin.
 
@@ -332,6 +338,24 @@ Target connections currently force `sslmode=disable`; a target that only accepts
 
 `make seed-large` creates `batch_demo.movies` in `target-db-large` (`TARGET_DATABASE_URL_3`): a generated movie catalog with `SEED_LARGE_ROWS` rows (default 2,000,000), then times one unbatched `UPDATE batch_demo.movies SET views = views + 1`. Re-running skips the insert unless `SEED_LARGE_FORCE=true`, which truncates and reseeds. All seeds are idempotent and use `ON CONFLICT (id) DO NOTHING` for the curated lists.
 
+### Batch Dataset Measurement
+
+The required large-dataset check was run on the local Compose target with
+`SEED_LARGE_ROWS=2000000` and a batch size of 10,000:
+
+| Operation | Rows | Duration |
+| --- | --- | --- |
+| Unbatched `UPDATE batch_demo.movies SET views = views + 1` | 2,000,000 | 11.808s |
+| Batched apply (200 batches, each in its own transaction) | 2,000,000 | 23.522s |
+| Batched rollback in reverse batch order | 2,000,000 | 15.105s |
+
+This satisfies the requirement that one unbatched full-table update takes longer
+than one second in the test environment. The batch run uses the same table and
+dataset and reports 200 committed batches / 2,000,000 rows, then 200 reverted
+batches / 2,000,000 rows. Reproduce with `make seed-large` (and optionally
+`SEED_LARGE_ROWS`/`SEED_LARGE_FORCE`) plus a batch migration using the SQL form
+described above.
+
 ## Validation
 
 ```sh
@@ -350,7 +374,7 @@ Install Chromium once, start the API and frontend in separate terminals, and run
 make test-e2e
 ```
 
-The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
+The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. Run `make dev-worker` alongside the API and frontend so queued migration actions finish. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
 
 Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, logout, and schema comparison through editable generated SQL and execution. Traces and video are disabled; screenshots of the viewer and schema comparison are saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
 
@@ -433,24 +457,43 @@ status, and error category. Application logs are separate and go to stdout/stder
 | `PUT` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `GET` | `/api/databases/{dbId}/migrations/history?hide_rollback=false` | View Only / View + Edit |
+| `GET` | `/api/databases/{dbId}/jobs/{jobId}` | View Only / View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/apply` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/rollback` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/forward` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/retry` | View + Edit |
 
-Migration mutations and execution are serialized per target database using session
-advisory locks. Only the last active reversible migration can be rolled back.
-Forward is limited to the next version after the highest applied version and never
-runs subsequent migrations automatically. Retry repeats the latest failed execution
-snapshot. Hide rollback removes a successful rollback execution and the execution it
-cancelled, paired by execution ID; failed attempts remain visible.
+Action endpoints return `202 Accepted` with a migration job. The worker claims one
+job at a time per database, revalidates the action under a cross-worker advisory
+lock, executes it, and records the execution ID and final job status. Only the last
+active reversible migration can be rolled back. Forward is limited to the next
+version after the highest applied version and never runs subsequent migrations
+automatically. Retry repeats the latest failed execution snapshot. Hide rollback
+removes a successful rollback execution and the execution it cancelled, paired by
+execution ID; failed attempts remain visible.
+
+Batch mode executes a cursor-based statement once per batch, each in its own target
+transaction. The up script receives `$1` as the cursor and `$2` as the batch size and
+must return the cursor column; `down_sql` receives `$1` as `cursor_to` and `$2` as
+`cursor_from`. Committed batches and rows are recorded, a later failure leaves the
+execution `partial`, retry resumes from the checkpoint, and rollback compensates
+committed batches in reverse order. The worker writes a target-side evidence row in
+each batch transaction so a lost platform record can be reconciled. See the sample
+large dataset from `make seed-large`.
 
 SQL runs atomically inside a target transaction. Confirmed failure records a generic
-error and preserves history. If commit or result recording is uncertain, the
-execution stays running/pending and blocks retry until the target outcome is
-verified. See [`docs/api.md`](docs/api.md) for the full execution model and error
-specifications.
+error and preserves history. Jobs and executions survive restarts. A worker that
+loses its lease before recording a result leaves the job failed as uncertain; the
+execution remains running/pending and blocks further actions until the target
+outcome is verified. Duplicate delivery cannot commit twice because the execution
+gate rejects a second run once an execution exists. See [`docs/api.md`](docs/api.md)
+for the full execution model and error specifications.
+
+Worker configuration: `WORKER_ID` overrides the generated worker identity,
+`WORKER_LEASE` controls the claim lease (default `2m`), and `WORKER_POLL` controls
+idle polling (default `2s`). The production build creates both `bin/server` and
+`bin/worker`.
 
 ## Query Execution Plan Analysis
 
