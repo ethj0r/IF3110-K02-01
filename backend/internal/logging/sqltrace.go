@@ -10,6 +10,10 @@ import (
 
 	Pgx "github.com/jackc/pgx/v5"
 	Pgconn "github.com/jackc/pgx/v5/pgconn"
+	Otel "go.opentelemetry.io/otel"
+	Attribute "go.opentelemetry.io/otel/attribute"
+	Codes "go.opentelemetry.io/otel/codes"
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 // SQLTracer logs every statement sent through a pgx connection: one record when it
@@ -29,6 +33,23 @@ type traceState struct {
 	Started Time.Time
 	SQL     string
 	Event   string
+	Span    Trace.Span
+}
+
+// SpanInstrumentation names the tracer used for SQL spans.
+const SpanInstrumentation = "github.com/ethj0r/IF3110-K02-01/backend/sql"
+
+// Operation returns the upper-case leading SQL keyword, used as the span name.
+func Operation(SQL string) string {
+	Fields := Strings.Fields(SQL)
+	if len(Fields) == 0 {
+		return "SQL"
+	}
+	Word := Strings.ToUpper(Strings.TrimSuffix(Fields[0], ";"))
+	if len(Word) > 24 {
+		return "SQL"
+	}
+	return Word
 }
 
 var traceSequence Atomic.Uint64
@@ -64,6 +85,16 @@ func StatementEvent(SQL string) string {
 
 func (Tracer SQLTracer) TraceQueryStart(Ctx Context.Context, _ *Pgx.Conn, Data Pgx.TraceQueryStartData) Context.Context {
 	State := &traceState{ID: traceSequence.Add(1), Started: Time.Now(), SQL: Data.SQL, Event: StatementEvent(Data.SQL)}
+	Ctx, State.Span = Otel.Tracer(SpanInstrumentation).Start(Ctx, "sql "+Operation(Data.SQL),
+		Trace.WithSpanKind(Trace.SpanKindClient),
+		Trace.WithAttributes(
+			Attribute.String("db.system.name", "postgresql"),
+			Attribute.String("db.namespace", Tracer.Database),
+			Attribute.String("db.operation.name", Operation(Data.SQL)),
+			Attribute.String("db.query.text", Truncate(RedactString(Data.SQL), sqlLimit)),
+			Attribute.Int64("query_id", int64(State.ID)),
+		),
+	)
 	Logger := Tracer.logger()
 	if Logger.Enabled(Ctx, Slog.LevelInfo) {
 		Attrs := []Slog.Attr{
@@ -117,6 +148,22 @@ func (Tracer SQLTracer) TraceQueryEnd(Ctx Context.Context, _ *Pgx.Conn, Data Pgx
 		}
 	}
 	Tracer.logger().LogAttrs(Ctx, Level, Message, Attrs...)
+	if State.Span != nil {
+		if Data.Err != nil {
+			Safe := "sql statement failed"
+			for _, Attr := range ErrorAttrs(Data.Err) {
+				if Attr.Key == "sqlstate" {
+					State.Span.SetAttributes(Attribute.String("db.response.status_code", Attr.Value.String()))
+					Safe = "SQLSTATE " + Attr.Value.String()
+				}
+			}
+			State.Span.RecordError(Errors.New(Safe))
+			State.Span.SetStatus(Codes.Error, Safe)
+		} else {
+			State.Span.SetAttributes(Attribute.Int64("db.response.rows", Data.CommandTag.RowsAffected()))
+		}
+		State.Span.End()
+	}
 }
 
 // BoundArgs drops pgx query options (result formats, exec mode, rewriters) that

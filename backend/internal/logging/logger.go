@@ -5,6 +5,8 @@ import (
 	Io "io"
 	Slog "log/slog"
 	Strings "strings"
+
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 // New returns a JSON logger that adds request/migration context attributes to
@@ -40,6 +42,9 @@ func (Handler *ContextHandler) Enabled(Ctx Context.Context, Level Slog.Level) bo
 
 func (Handler *ContextHandler) Handle(Ctx Context.Context, Record Slog.Record) error {
 	if Ctx != nil {
+		if Span := Trace.SpanContextFromContext(Ctx); Span.IsValid() {
+			Record.AddAttrs(Slog.String("trace_id", Span.TraceID().String()), Slog.String("span_id", Span.SpanID().String()))
+		}
 		if Attrs := Attrs(Ctx); len(Attrs) > 0 {
 			Present := map[string]bool{}
 			Record.Attrs(func(Attr Slog.Attr) bool {

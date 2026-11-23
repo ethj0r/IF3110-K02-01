@@ -11,6 +11,9 @@ import (
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
+	Attribute "go.opentelemetry.io/otel/attribute"
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 type DSNResolver interface {
@@ -240,13 +243,18 @@ func (Server *Service) withAction(Ctx Context.Context, User Auth.Principal, Data
 	if Server.Resolver == nil {
 		return Execution{}, ErrUnavailable
 	}
-	return Server.Repo.WithExecutionLock(Ctx, DatabaseID, func(Repo MigrationRepository) (Execution, error) {
+	Ctx = Logging.With(Ctx, "migration_id", ID)
+	Ctx, Span := Tracing.Start(Ctx, "migration.lock", Attribute.String("database_id", DatabaseID), Attribute.String("migration_id", ID))
+	defer Span.End()
+	Result, Err := Server.Repo.WithExecutionLock(Ctx, DatabaseID, func(Repo MigrationRepository) (Execution, error) {
 		Current, Err := Repo.Get(Ctx, DatabaseID, ID)
 		if Err != nil {
 			return Execution{}, Err
 		}
 		return Run(Ctx, Repo, User, Current)
 	})
+	Tracing.Fail(Span, Err, "migration action failed")
+	return Result, Err
 }
 
 func (Server *Service) applyLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
@@ -384,11 +392,24 @@ func (Server *Service) startExecution(Ctx Context.Context, Repo MigrationReposit
 }
 
 func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Exec Execution) (Execution, error) {
+	Ctx, Span := Tracing.Start(Ctx, "migration.execute",
+		Attribute.String("migration_id", Current.ID), Attribute.String("execution_id", Exec.ID),
+		Attribute.Int64("migration.version", Current.Version), Attribute.String("migration.kind", string(Exec.Kind)),
+		Attribute.String("migration.direction", string(Exec.Direction)))
+	defer Span.End()
+	Result, Err := Server.runAttempt(Ctx, Repo, User, Current, Exec)
+	Span.SetAttributes(Attribute.String("execution.status", string(Result.Status)))
+	Tracing.Fail(Span, Err, "migration execution failed")
+	return Result, Err
+}
+
+func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Exec Execution) (Execution, error) {
 	Attempt, Err := Repo.CreateAttempt(Ctx, Exec.ID, actorID(User), Exec.SQLText)
 	if Err != nil {
 		return Exec, ErrUnavailable
 	}
 	Ctx = Logging.With(Ctx, "migration_id", Current.ID, "execution_id", Exec.ID, "version", Current.Version, "attempt", Attempt.AttemptNo)
+	Trace.SpanFromContext(Ctx).SetAttributes(Attribute.Int("attempt", Attempt.AttemptNo))
 	Server.logger().InfoContext(Ctx, "migration execution started",
 		"event", "migration.execution.started",
 		"actor_id", User.ID, "actor", User.Username,

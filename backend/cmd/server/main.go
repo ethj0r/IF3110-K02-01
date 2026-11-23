@@ -16,6 +16,7 @@ import (
 	Observability "github.com/ethj0r/IF3110-K02-01/backend/internal/observability"
 	Schemadiff "github.com/ethj0r/IF3110-K02-01/backend/internal/schemadiff"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Webui "github.com/ethj0r/IF3110-K02-01/backend/internal/webui"
 	Chi "github.com/go-chi/chi/v5"
 	Slog "log/slog"
@@ -45,6 +46,17 @@ func Run() error {
 	}
 	Ctx, Stop := Signal.NotifyContext(Context.Background(), Os.Interrupt, Syscall.SIGTERM)
 	defer Stop()
+	ShutdownTracing, Err := Tracing.Setup(Ctx, Tracing.OptionsFromEnv("wbd-api"))
+	if Err != nil {
+		return Err
+	}
+	defer func() {
+		Flush, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		defer Cancel()
+		if Err := ShutdownTracing(Flush); Err != nil {
+			Slog.Warn("trace exporter shutdown failed", "event", "tracing.shutdown_failed", "error", Err)
+		}
+	}()
 	Startup, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
 	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL, Logging.SQLTracer{Database: "platform"})
 	TargetDriver := Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}}
