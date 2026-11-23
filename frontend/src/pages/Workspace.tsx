@@ -2,8 +2,9 @@ import { useQuery } from '@tanstack/react-query'
 import { Link } from 'react-router-dom'
 import { AccessQueryKeys, ListAccessibleDatabases } from '../api/access'
 import { SessionQuery } from '../auth/query'
-import { SignOutButton } from '../auth/SignOutButton'
-import { LevelBadge, RequestError } from '../components/Feedback'
+import { PageHeader } from '../ui/Card'
+import { EmptyState, LevelBadge, Loading, RequestError } from '../ui/Feedback'
+import { Icon } from '../ui/Icon'
 
 export function Workspace() {
   const Session = useQuery(SessionQuery)
@@ -11,75 +12,43 @@ export function Workspace() {
   const IsAdmin = Session.data?.user.is_platform_admin === true
 
   return (
-    <div className="workspace-shell">
-      <header className="app-header">
-        <Link to="/" className="app-brand">
-          <strong>Database Platform</strong>
-          <small>Workspace</small>
-        </Link>
-        <div className="app-header-actions">
-          <Link to="/migrations" className="back-link">Migrations</Link>
-          {IsAdmin && <Link to="/admin" className="back-link">Administration</Link>}
-          <span className="muted">Signed in as {Session.data?.user.username}</span>
-          <SignOutButton />
-        </div>
-      </header>
+    <>
+      <PageHeader Title="Database Workspace" />
 
-      <main className="workspace-main">
-        <header className="workspace-heading">
-          <h1>Database Workspace</h1>
-          <p className="muted">
-            Databases appear here when a group gives you access. Your highest level across all groups is shown.
-          </p>
-        </header>
+      <section className="stack" aria-label="Databases">
 
-        <section className="panel">
-          <header className="panel-header">
-            <div>
-              <h2>Available databases</h2>
-              <p>Connections granted through your groups.</p>
-            </div>
-            <span className="count-badge">{Databases.data?.length ?? 0}</span>
-          </header>
+        {Databases.isPending && <Loading>Loading databases…</Loading>}
+        <RequestError error={Databases.error} />
 
-          {Databases.isPending && <p className="state" role="status">Loading databases…</p>}
-          <RequestError error={Databases.error} />
+        {Databases.data?.length === 0 && (
+          <div className="card">
+            <EmptyState Title="No databases assigned">
+              {IsAdmin && <Link to="/admin/access" className="btn btn-secondary btn-sm">Manage database access<Icon Name="arrow-right" Size={14} /></Link>}
+            </EmptyState>
+          </div>
+        )}
 
-          {Databases.data?.length === 0 && (
-            <div className="empty-state">
-              <h3>No databases assigned</h3>
-              <p>Ask an administrator to add you to a group with database access.</p>
-              {IsAdmin && <Link to="/admin/access" className="link-button">Manage database access →</Link>}
-            </div>
-          )}
-
-          {Databases.data && Databases.data.length > 0 && (
-            <div className="table-wrap">
-              <table className="data-table">
-                <thead>
-                  <tr>
-                    <th>Database</th>
-                    <th>Schema</th>
-                    <th>Access</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {Databases.data.map(Database => (
-                    <tr key={Database.id}>
-                      <td>
-                        <Link to={`/databases/${Database.id}`}><strong>{Database.name}</strong></Link>
-                        <span className="table-subtext">{Database.host}</span>
-                      </td>
-                      <td><code>{Database.dbname}</code></td>
-                      <td><LevelBadge level={Database.level} /></td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-      </main>
-    </div>
+        {Databases.data && Databases.data.length > 0 && (
+          <ul className="db-grid">
+            {Databases.data.map(Database => (
+              <li key={Database.id} className="db-card">
+                <div className="db-card-top">
+                  <span className="db-card-icon"><Icon Name="database" Size={18} /></span>
+                  <LevelBadge level={Database.level} />
+                </div>
+                <div className="db-card-name">
+                  <Link to={`/databases/${Database.id}`} className="db-card-link"><strong>{Database.name}</strong></Link>
+                  <span className="cell-sub">{Database.host}</span>
+                </div>
+                <div className="db-card-foot">
+                  <code className="inline-code">{Database.dbname}</code>
+                  <Icon Name="arrow-right" Size={14} />
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+    </>
   )
 }

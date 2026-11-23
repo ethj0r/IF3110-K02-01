@@ -132,8 +132,9 @@ Test('loads and displays migration definitions and views details', async () => {
   await User.click(Screen.getByRole('button', { name: 'View' }))
   Expect(await Screen.findByText('CREATE TABLE sample (id INT);')).toBeTruthy()
   Expect(Screen.getByText('DROP TABLE sample;')).toBeTruthy()
-  Expect(Screen.getByText('Status:').closest('p')?.textContent).toContain('applied')
-  Expect(Screen.getByText('Status:').closest('p')?.textContent).toContain('Revision:')
+  const Details = Screen.getByRole('region', { name: 'Migration details' })
+  Expect(Details.textContent).toContain('applied')
+  Expect(Details.textContent).toContain('Revision')
 })
 
 Test('creates and applies a draft migration', async () => {
@@ -149,7 +150,6 @@ Test('creates and applies a draft migration', async () => {
     }),
   ]
 
-  Vi.stubGlobal('confirm', () => true)
   let ReviewRequested = false
   let ReviewApproved = false
 
@@ -200,10 +200,10 @@ Test('creates and applies a draft migration', async () => {
   await Screen.findByRole('heading', { name: 'Database Migrations' })
   Expect(await Screen.findByText('Draft Migration')).toBeTruthy()
 
-  await User.click(Screen.getByRole('button', { name: '+ Create Migration' }))
-  await User.type(Screen.getByLabelText(/Title:/), 'Second Migration')
-  await User.type(Screen.getByLabelText(/Up SQL:/), 'CREATE TABLE t2 (id INT);')
-  await User.type(Screen.getByLabelText(/Down SQL:/), 'DROP TABLE t2;')
+  await User.click(Screen.getByRole('button', { name: 'New migration' }))
+  await User.type(Screen.getByLabelText('Title'), 'Second Migration')
+  await User.type(Screen.getByLabelText('Up SQL'), 'CREATE TABLE t2 (id INT);')
+  await User.type(Screen.getByLabelText('Down SQL'), 'DROP TABLE t2;')
   await User.click(Screen.getByRole('button', { name: 'Save Draft' }))
   Expect(await Screen.findByText('Migration draft saved successfully.')).toBeTruthy()
 
@@ -217,6 +217,7 @@ Test('creates and applies a draft migration', async () => {
   await User.click(Approve)
   await Screen.findByText(/All groups approved/)
   await User.click(Apply)
+  await User.click(await Screen.findByRole('button', { name: 'Run apply' }))
   Expect(await Screen.findByText(/Apply job:/)).toBeTruthy()
   Expect(Screen.getByText(/succeeded/)).toBeTruthy()
   Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true)
@@ -245,7 +246,7 @@ Test('view-only users can inspect history without mutation controls', async () =
   Mount()
   const User = UserEvent.setup()
   await Screen.findByText('First migration')
-  for (const Name of ['+ Create Migration', 'Edit', 'Apply', 'Rollback', 'Forward', 'Retry', 'Delete']) {
+  for (const Name of ['New migration', 'Edit', 'Apply', 'Rollback', 'Forward', 'Retry', 'Delete']) {
     Expect(Screen.queryByRole('button', { name: Name })).toBeNull()
   }
   await User.click(Screen.getAllByRole('button', { name: 'View' })[0])
@@ -262,12 +263,12 @@ Test('viewer opens its migrations and switching database clears the editor', asy
   Expect((Apply[0] as HTMLButtonElement).disabled).toBe(false)
   Expect((Apply[1] as HTMLButtonElement).disabled).toBe(true)
   await User.click(Screen.getAllByRole('button', { name: 'View' })[0])
-  await User.click(Screen.getByRole('button', { name: '+ Create Migration' }))
-  await User.type(Screen.getByLabelText(/Up SQL:/), 'CREATE TABLE old_database_only (id int);')
-  await User.type(Screen.getByLabelText(/Down SQL:/), 'DROP TABLE old_database_only;')
-  await User.selectOptions(Screen.getByLabelText('Database:'), 'db-2')
+  await User.click(Screen.getByRole('button', { name: 'New migration' }))
+  await User.type(Screen.getByLabelText('Up SQL'), 'CREATE TABLE old_database_only (id int);')
+  await User.type(Screen.getByLabelText('Down SQL'), 'DROP TABLE old_database_only;')
+  await User.selectOptions(Screen.getByLabelText('Database'), 'db-2')
   await Screen.findByText('Analytics history')
-  Expect(Screen.queryByLabelText('Up SQL:')).toBeNull()
+  Expect(Screen.queryByLabelText('Up SQL')).toBeNull()
 })
 
 Test('pending execution disables actions and explains recovery', async () => {
@@ -323,9 +324,9 @@ Test('analyzes execution plan in editor and details view', async () => {
   Expect(Screen.getByText('14.50')).toBeTruthy()
   await User.click(Screen.getByRole('button', { name: 'Close' }))
 
-  await User.click(Screen.getByRole('button', { name: '+ Create Migration' }))
-  await User.type(Screen.getByLabelText(/Up SQL:/), 'SELECT 1;')
-  await User.type(Screen.getByLabelText(/Down SQL:/), 'SELECT 1;')
+  await User.click(Screen.getByRole('button', { name: 'New migration' }))
+  await User.type(Screen.getByLabelText('Up SQL'), 'SELECT 1;')
+  await User.type(Screen.getByLabelText('Down SQL'), 'SELECT 1;')
   await User.click(Screen.getByRole('button', { name: 'Analyze Plan (EXPLAIN)' }))
   Expect(await Screen.findByText('1.234 ms')).toBeTruthy()
 })
@@ -334,7 +335,6 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   let Definitions = [MigrationFixture({ status: 'applied', can_rollback: true })]
   const History = [ExecutionFixture()]
   const Calls: string[] = []
-  Vi.stubGlobal('confirm', () => true)
   Vi.stubGlobal('fetch', Vi.fn(async (Path: string, Options?: RequestInit) => {
     Calls.push(Path)
     if (Path === '/api/databases') return Response.json(Databases)
@@ -366,10 +366,12 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   await User.click(Screen.getByRole('button', { name: /^Review rollback$/ }))
   await Screen.findByText(/All groups approved/)
   await User.click(Screen.getByRole('button', { name: /^Rollback$/ }))
+  await User.click(await Screen.findByRole('button', { name: 'Run rollback' }))
   Expect(await Screen.findByText(/Rollback job:/)).toBeTruthy()
   await User.click(await Screen.findByRole('button', { name: /^Review forward$/ }))
   await Screen.findByText(/All groups approved/)
   await User.click(Screen.getByRole('button', { name: /^Forward$/ }))
+  await User.click(await Screen.findByRole('button', { name: 'Run forward' }))
   Expect(await Screen.findByText(/Forward job:/)).toBeTruthy()
   await User.click(Screen.getByRole('checkbox', { name: 'Hide rollback' }))
   await Screen.findByText('No execution attempts recorded.')

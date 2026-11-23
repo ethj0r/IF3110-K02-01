@@ -80,10 +80,10 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
   }
 
   async function SaveDraft(Page: Page, Title: string, SQL: string, DownSQL = 'SELECT 1;') {
-    await Page.getByRole('button', { name: '+ Create Migration', exact: true }).click()
-    await Page.getByLabel('Title:', { exact: true }).fill(Title)
-    await Page.getByLabel('Up SQL:', { exact: true }).fill(SQL)
-    await Page.getByLabel('Down SQL:', { exact: true }).fill(DownSQL)
+    await Page.getByRole('button', { name: 'New migration', exact: true }).click()
+    await Page.getByLabel('Title', { exact: true }).fill(Title)
+    await Page.getByLabel('Up SQL', { exact: true }).fill(SQL)
+    await Page.getByLabel('Down SQL', { exact: true }).fill(DownSQL)
     await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Row = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: Title, exact: true }) })
     await Expect(Row).toBeVisible()
@@ -108,6 +108,7 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     await Expect(Viewer.getByRole('button', { name: 'Apply', exact: true })).toHaveCount(0)
     await Viewer.getByRole('button', { name: `Approve for ${Prefix}_viewer`, exact: true }).click()
     await Apply.click()
+    await Editor.getByRole('dialog').getByRole('button', { name: 'Run apply', exact: true }).click()
   }
 
   async function CleanupFixtures() {
@@ -197,7 +198,7 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     await Editor.getByRole('link', { name: 'Migrations', exact: true }).click()
     const First = await SaveDraft(Editor, 'Browser create draft', FirstSQL, `DROP SCHEMA IF EXISTS ${QuotedSchema} CASCADE`)
     await First.getByRole('button', { name: 'Edit', exact: true }).click()
-    await Editor.getByLabel('Title:', { exact: true }).fill('Browser create committed')
+    await Editor.getByLabel('Title', { exact: true }).fill('Browser create committed')
     await Editor.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Committed = Editor.getByRole('row').filter({ has: Editor.getByRole('cell', { name: 'Browser create committed', exact: true }) })
     await ReviewAndApply(Editor, Viewer, Committed)
@@ -216,7 +217,7 @@ Test('real browser enforces group access, commits SQL, preserves rollback, and r
     await Viewer.getByRole('combobox', { name: 'Table', exact: true }).selectOption('order items 表')
     await Expect(Viewer.getByRole('cell', { name: 'browser value', exact: true })).toBeVisible()
     await Viewer.getByRole('link', { name: 'Migrations', exact: true }).click()
-    await Expect(Viewer.getByRole('button', { name: '+ Create Migration', exact: true })).toHaveCount(0)
+    await Expect(Viewer.getByRole('button', { name: 'New migration', exact: true })).toHaveCount(0)
     await Expect(Viewer.getByRole('button', { name: 'Apply', exact: true })).toHaveCount(0)
     await Viewer.getByRole('button', { name: 'View', exact: true }).click()
     await Expect(Viewer.getByText(FirstSQL, { exact: true })).toBeVisible()

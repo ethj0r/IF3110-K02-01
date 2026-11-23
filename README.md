@@ -195,6 +195,22 @@ The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`,
 
 Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, logout, and schema comparison through editable generated SQL and execution. Traces and video are disabled; screenshots of the viewer and schema comparison are saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
 
+`e2e/responsive.spec.ts` signs in as the administrator at 360 px, 820 px, and 1440 px widths. It checks that no page scrolls horizontally, that the navigation drawer opens, closes with Escape, and navigates below 1024 px, and that the workspace, viewer, migration, and administration pages render without page errors. It only reads data.
+
+## Frontend
+
+The SPA is React with TanStack Query and React Router. All pages, including sign-in and administration, share one shell: a fixed sidebar on wide screens that becomes a slide-in drawer at 1024 px and below. Wide tables, SQL editors, and plans scroll inside their own containers, so the page itself never scrolls horizontally.
+
+| Path | Purpose |
+| --- | --- |
+| `frontend/src/styles/tokens.css` | Color, radius, shadow, and spacing tokens |
+| `frontend/src/styles/components.css` | Buttons, form controls, cards, tables, badges, notices, tabs, dialogs |
+| `frontend/src/styles/layout.css` | App shell, drawer, page header, sign-in, database cards |
+| `frontend/src/ui/` | Shared components: icons, cards, feedback, confirmation dialog |
+| `frontend/src/layout/` | App shell and database section tabs |
+
+Fonts (Inter and Geist Mono, OFL) are self-hosted through `@fontsource-variable` packages and embedded in the binary; the app makes no external font requests. Migration actions and destructive admin actions ask for confirmation in an in-app dialog.
+
 ## Production Build
 
 ```sh
