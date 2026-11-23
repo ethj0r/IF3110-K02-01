@@ -3,7 +3,9 @@ package Access
 import (
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
+	Slog "log/slog"
 	Http "net/http"
 )
 
@@ -15,6 +17,7 @@ func RequireAdmin(Next Http.Handler) Http.Handler {
 			return
 		}
 		if !User.IsPlatformAdmin {
+			Logging.Record(R.Context(), Slog.LevelWarn, "access.denied", "action", "admin", "actor_id", User.ID, "actor", User.Username)
 			Httpx.Error(W, Http.StatusForbidden, "forbidden", "Platform administrator access required")
 			return
 		}

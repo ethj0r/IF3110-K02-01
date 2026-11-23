@@ -1,6 +1,7 @@
 package Logging
 
 import (
+	Context "context"
 	Slog "log/slog"
 	Http "net/http"
 	Time "time"
@@ -55,6 +56,66 @@ func RequestLogger(Logger *Slog.Logger) func(Http.Handler) Http.Handler {
 			}()
 			Next.ServeHTTP(Writer, Request)
 			Panicked = false
+		})
+	}
+}
+
+// Activity records a named audit-style event after the wrapped route runs:
+// outcome "succeeded" (status < 400), "denied" (401/403), or "failed", plus the
+// HTTP status and the route's URL parameters (resource IDs) under "target".
+// Actor, request, database, and trace attributes come from the request scope.
+func Activity(Event string) func(Http.Handler) Http.Handler {
+	return func(Next Http.Handler) Http.Handler {
+		return Http.HandlerFunc(func(W Http.ResponseWriter, R *Http.Request) {
+			Writer, Ok := W.(Middleware.WrapResponseWriter)
+			if !Ok {
+				Writer = Middleware.NewWrapResponseWriter(W, R.ProtoMajor)
+			}
+			defer func() {
+				Status := Writer.Status()
+				if Status == 0 {
+					Status = Http.StatusOK
+				}
+				Outcome, Level := "succeeded", Slog.LevelInfo
+				switch {
+				case Status == Http.StatusUnauthorized || Status == Http.StatusForbidden:
+					Outcome, Level = "denied", Slog.LevelWarn
+				case Status >= 400:
+					Outcome, Level = "failed", Slog.LevelWarn
+				}
+				Attrs := []any{"event", Event, "outcome", Outcome, "status", Status}
+				if Route := Chi.RouteContext(R.Context()); Route != nil && len(Route.URLParams.Keys) > 0 {
+					Target := make([]any, 0, len(Route.URLParams.Keys)*2)
+					for Index, Key := range Route.URLParams.Keys {
+						if Key != "*" && Index < len(Route.URLParams.Values) {
+							Target = append(Target, Slog.String(Key, Route.URLParams.Values[Index]))
+						}
+					}
+					if len(Target) > 0 {
+						Attrs = append(Attrs, Slog.Group("target", Target...))
+					}
+				}
+				Slog.Default().Log(R.Context(), Level, Event, Attrs...)
+			}()
+			Next.ServeHTTP(Writer, R)
+		})
+	}
+}
+
+// Record writes a named event using the default logger and the context scope.
+func Record(Ctx Context.Context, Level Slog.Level, Event string, Args ...any) {
+	Slog.Default().Log(Ctx, Level, Event, append([]any{"event", Event}, Args...)...)
+}
+
+// DatabaseParam adds the named URL parameter as database_id to the request
+// scope, for routes that act on a database without an access-control check.
+func DatabaseParam(Name string) func(Http.Handler) Http.Handler {
+	return func(Next Http.Handler) Http.Handler {
+		return Http.HandlerFunc(func(W Http.ResponseWriter, R *Http.Request) {
+			if Value := Chi.URLParam(R, Name); Value != "" {
+				AnnotateOnce(R.Context(), "database_id", Value)
+			}
+			Next.ServeHTTP(W, R)
 		})
 	}
 }

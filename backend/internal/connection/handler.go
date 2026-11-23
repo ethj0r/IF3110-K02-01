@@ -7,6 +7,7 @@ import (
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Http "net/http"
@@ -23,12 +24,12 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Use(Auth.NoStore)
 		R.Use(Routes.Auth.RequireSession)
 		R.Use(Access.RequireAdmin)
-		R.Post("/connections", Routes.Create)
+		R.With(Logging.Activity("admin.connection.create")).Post("/connections", Routes.Create)
 		R.Get("/connections", Routes.List)
-		R.Get("/connections/{id}", Routes.Show)
-		R.Put("/connections/{id}", Routes.Update)
-		R.Delete("/connections/{id}", Routes.Delete)
-		R.Post("/connections/{id}/test", Routes.Test)
+		R.With(Logging.DatabaseParam("id")).Get("/connections/{id}", Routes.Show)
+		R.With(Logging.DatabaseParam("id"), Logging.Activity("admin.connection.update")).Put("/connections/{id}", Routes.Update)
+		R.With(Logging.DatabaseParam("id"), Logging.Activity("admin.connection.delete")).Delete("/connections/{id}", Routes.Delete)
+		R.With(Logging.DatabaseParam("id"), Logging.Activity("admin.connection.test")).Post("/connections/{id}/test", Routes.Test)
 	})
 }
 

@@ -9,6 +9,7 @@ import (
 	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
+	Slog "log/slog"
 	Mime "mime"
 	Http "net/http"
 	Time "time"
@@ -19,12 +20,12 @@ type Handler struct{ Service *Service }
 func (Routes *Handler) Register(Api Chi.Router) {
 	Api.Route("/auth", func(R Chi.Router) {
 		R.Use(NoStore)
-		R.Post("/login", Routes.Login)
+		R.With(Logging.Activity("auth.login")).Post("/login", Routes.Login)
 		R.Group(func(Protected Chi.Router) {
 			Protected.Use(Routes.RequireSession)
 			Protected.Get("/me", Routes.Me)
 			Protected.Get("/csrf", Routes.CSRF)
-			Protected.Post("/logout", Routes.Logout)
+			Protected.With(Logging.Activity("auth.logout")).Post("/logout", Routes.Logout)
 		})
 	})
 }
@@ -75,6 +76,7 @@ func (Routes *Handler) Login(W Http.ResponseWriter, R *Http.Request) {
 		WriteAuthError(W, Err)
 		return
 	}
+	Logging.Annotate(R.Context(), "actor_id", State.Principal.ID, "actor", State.Principal.Username)
 	Routes.SetCookie(W, State)
 	Httpx.JSON(W, 200, map[string]any{"user": State.Principal, "csrf_token": State.CSRFToken, "expires_at": State.AbsoluteExpiresAt})
 }
@@ -95,17 +97,20 @@ func (Routes *Handler) RequireSession(Next Http.Handler) Http.Handler {
 	return NoStore(Http.HandlerFunc(func(W Http.ResponseWriter, R *Http.Request) {
 		Unsafe := R.Method != Http.MethodGet && R.Method != Http.MethodHead && R.Method != Http.MethodOptions
 		if Unsafe && !Routes.ValidOrigin(R) {
+			Logging.Record(R.Context(), Slog.LevelWarn, "auth.csrf.rejected", "reason", "origin")
 			WriteAuthError(W, ErrCSRF)
 			return
 		}
 		Identifier, Ok := SessionCookie(R)
 		if !Ok {
+			Logging.Record(R.Context(), Slog.LevelInfo, "auth.session.rejected", "reason", "missing")
 			Routes.ClearCookie(W)
 			WriteAuthError(W, ErrUnauthorized)
 			return
 		}
 		State, Err := Routes.Service.Authenticate(R.Context(), Identifier)
 		if Err != nil {
+			Logging.Record(R.Context(), Slog.LevelWarn, "auth.session.rejected", "reason", SessionRejection(Err))
 			if Errors.Is(Err, ErrUnauthorized) {
 				Routes.ClearCookie(W)
 			}
@@ -115,6 +120,8 @@ func (Routes *Handler) RequireSession(Next Http.Handler) Http.Handler {
 		if Unsafe {
 			Tokens := R.Header.Values("X-CSRF-Token")
 			if len(Tokens) != 1 || !ValidToken(Tokens[0]) || Subtle.ConstantTimeCompare([]byte(Tokens[0]), []byte(State.CSRFToken)) != 1 {
+				Logging.Annotate(R.Context(), "actor_id", State.Principal.ID, "actor", State.Principal.Username)
+				Logging.Record(R.Context(), Slog.LevelWarn, "auth.csrf.rejected", "reason", "token")
 				WriteAuthError(W, ErrCSRF)
 				return
 			}
@@ -169,6 +176,20 @@ func (Routes *Handler) SetCookie(W Http.ResponseWriter, State Authenticated) {
 
 func (Routes *Handler) ClearCookie(W Http.ResponseWriter) {
 	Http.SetCookie(W, &Http.Cookie{Name: CookieName, Value: "", Path: "/", HttpOnly: true, Secure: Routes.Service.Settings.CookieSecure, SameSite: Http.SameSiteLaxMode, Expires: Time.Unix(1, 0), MaxAge: -1})
+}
+
+// SessionRejection maps an authentication error to a log-safe reason.
+func SessionRejection(Err error) string {
+	switch {
+	case Errors.Is(Err, ErrUnauthorized):
+		return "invalid_or_expired"
+	case Errors.Is(Err, ErrBusy):
+		return "busy"
+	case Errors.Is(Err, ErrUnavailable):
+		return "unavailable"
+	default:
+		return "error"
+	}
 }
 
 func WriteAuthError(W Http.ResponseWriter, Err error) {

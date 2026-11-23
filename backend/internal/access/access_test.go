@@ -1,10 +1,13 @@
 package Access
 
 import (
+	Bytes "bytes"
 	Context "context"
 	Errors "errors"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Slog "log/slog"
+	Strings "strings"
 	Testing "testing"
 )
 
@@ -94,5 +97,20 @@ func TestCanAnnotatesRequestScopeWithFirstDatabase(T *Testing.T) {
 	}
 	if Allowed, _ := Can(Ctx, nil, Viewer, ActionView, "db-1"); Allowed {
 		T.Fatal("missing policy must deny access")
+	}
+}
+
+func TestCanLogsDeniedAccess(T *Testing.T) {
+	Buffer := &Bytes.Buffer{}
+	Previous := Slog.Default()
+	Slog.SetDefault(Logging.New(Buffer, Slog.LevelInfo))
+	T.Cleanup(func() { Slog.SetDefault(Previous) })
+	Viewer := Auth.Principal{ID: "user-1", Username: "viewer"}
+	Policy := StaticEvaluator{Grants: map[string]map[string]Level{"user-1": {"db-1": LevelViewOnly}}}
+	_, _ = Can(Context.Background(), Policy, Viewer, ActionView, "db-1")
+	_, _ = Can(Context.Background(), Policy, Viewer, ActionEdit, "db-1")
+	Output := Buffer.String()
+	if Strings.Count(Output, `"event":"access.denied"`) != 1 || !Strings.Contains(Output, `"action":"edit"`) || !Strings.Contains(Output, `"actor":"viewer"`) {
+		T.Fatalf("expected exactly one access.denied record for the edit attempt: %s", Output)
 	}
 }
