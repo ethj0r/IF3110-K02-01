@@ -2,6 +2,7 @@ package Httpx
 
 import (
 	Context "context"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Middleware "github.com/go-chi/chi/v5/middleware"
 	Http "net/http"
@@ -15,6 +16,7 @@ func NewRouter(Ping func(Context.Context) error, Frontend Http.Handler, Configur
 	R.NotFound(NotFound)
 	R.MethodNotAllowed(MethodNotAllowed)
 	R.Route("/api", func(Api Chi.Router) {
+		Api.Use(Logging.RequestLogger(nil))
 		Api.NotFound(NotFound)
 		Api.MethodNotAllowed(MethodNotAllowed)
 		Api.Get("/health", func(W Http.ResponseWriter, R *Http.Request) {

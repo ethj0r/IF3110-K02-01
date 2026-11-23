@@ -11,6 +11,7 @@ import (
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
 	Inspect "github.com/ethj0r/IF3110-K02-01/backend/internal/inspect"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Migration "github.com/ethj0r/IF3110-K02-01/backend/internal/migration"
 	Observability "github.com/ethj0r/IF3110-K02-01/backend/internal/observability"
 	Schemadiff "github.com/ethj0r/IF3110-K02-01/backend/internal/schemadiff"
@@ -26,9 +27,9 @@ import (
 )
 
 func main() {
-	Slog.SetDefault(Slog.New(Slog.NewJSONHandler(Os.Stdout, &Slog.HandlerOptions{Level: Slog.LevelInfo})))
+	Slog.SetDefault(Logging.New(Os.Stdout, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
-		Slog.Error("server stopped", "error", Err)
+		Slog.Error("server stopped", "event", "server.stopped", "error", Err)
 		Os.Exit(1)
 	}
 }
@@ -45,7 +46,8 @@ func Run() error {
 	Ctx, Stop := Signal.NotifyContext(Context.Background(), Os.Interrupt, Syscall.SIGTERM)
 	defer Stop()
 	Startup, Cancel := Context.WithTimeout(Ctx, 10*Time.Second)
-	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL)
+	Pool, Err := Store.Open(Startup, Cfg.DatabaseURL, Logging.SQLTracer{Database: "platform"})
+	TargetDriver := Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}}
 	if Err != nil {
 		Cancel()
 		return Err
@@ -75,13 +77,13 @@ func Run() error {
 			Connection.SeedTarget{URL: Os.Getenv("TARGET_DATABASE_URL_3")},
 		)
 		if SeedErr != nil {
-			Slog.Warn("target connections were not seeded", "error", SeedErr)
+			Slog.Warn("target connections were not seeded", "event", "connection.seed_failed", "error", SeedErr)
 		}
 	}
 	SeedCancel()
-	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: Driver.PostgresDriver{}}
+	ConnRoutes := &Connection.Handler{Auth: AuthRoutes, Service: ConnectionService, Driver: TargetDriver}
 	AccessRepo := &Access.Repository{Pool: Pool}
-	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: Driver.PostgresDriver{}}
+	InspectService := &Inspect.Service{Connections: ConnectionService, Driver: TargetDriver}
 	InspectRoutes := &Inspect.Handler{Auth: AuthRoutes, Policy: AccessRepo, Service: InspectService}
 	AccessRoutes := &Access.Handler{Auth: AuthRoutes, Repo: AccessRepo}
 	AdminRoutes := &Admin.Handler{Auth: AuthRoutes, Service: Admin.NewService(&Admin.Repository{Pool: Pool})}
@@ -94,10 +96,10 @@ func Run() error {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err
 		}),
-		Driver: Driver.PostgresDriver{},
+		Driver: TargetDriver,
 	}
 	MigrationRoutes := &Migration.Handler{Auth: AuthRoutes, Service: MigrationService}
-	SchemaDiffRoutes := &Schemadiff.Handler{Auth: AuthRoutes, Service: &Schemadiff.Service{Policy: AccessRepo, Connections: ConnectionService, Generator: Schemadiff.PostgresGenerator{}}}
+	SchemaDiffRoutes := &Schemadiff.Handler{Auth: AuthRoutes, Service: &Schemadiff.Service{Policy: AccessRepo, Connections: ConnectionService, Generator: Schemadiff.PostgresGenerator{Tracer: Logging.SQLTracer{Database: "target"}}}}
 	Server := &Http.Server{
 		Addr: Cfg.HTTPAddr,
 		Handler: Httpx.NewRouter(
@@ -123,7 +125,7 @@ func Run() error {
 	}
 	Done := make(chan error, 1)
 	go func() { Done <- Server.ListenAndServe() }()
-	Slog.Info("server listening", "address", Cfg.HTTPAddr)
+	Slog.Info("server listening", "event", "server.listening", "address", Cfg.HTTPAddr)
 	select {
 	case Err := <-Done:
 		if Errors.Is(Err, Http.ErrServerClosed) {

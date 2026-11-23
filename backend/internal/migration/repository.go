@@ -61,7 +61,7 @@ func (Repo *Repository) WithDatabaseLock(Ctx Context.Context, DatabaseID string,
 		return Migration{}, Err
 	}
 	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer Cancel()
 		if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
 			_ = Conn.Hijack().Close(Cleanup)
@@ -79,7 +79,7 @@ func (Repo *Repository) WithExecutionLock(Ctx Context.Context, DatabaseID string
 		return Execution{}, Err
 	}
 	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer Cancel()
 		if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
 			_ = Conn.Hijack().Close(Cleanup)

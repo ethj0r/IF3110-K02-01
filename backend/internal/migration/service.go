@@ -10,6 +10,7 @@ import (
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 )
 
 type DSNResolver interface {
@@ -387,7 +388,8 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 	if Err != nil {
 		return Exec, ErrUnavailable
 	}
-	Server.logger().Info("migration execution started",
+	Ctx = Logging.With(Ctx, "migration_id", Current.ID, "execution_id", Exec.ID, "version", Current.Version, "attempt", Attempt.AttemptNo)
+	Server.logger().InfoContext(Ctx, "migration execution started",
 		"event", "migration.execution.started",
 		"actor_id", User.ID, "actor", User.Username,
 		"database_id", Current.DatabaseID, "migration_id", Current.ID,
@@ -417,21 +419,21 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 		if Closed {
 			return
 		}
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer Cancel()
 		_ = TargetTx.Rollback(Cleanup)
 	}()
 
 	if Err := TargetTx.ExecScript(Ctx, Exec.SQLText); Err != nil {
 		if RollbackErr := TargetTx.Rollback(Ctx); RollbackErr != nil {
-			Server.logger().Error("migration execution outcome is uncertain after rollback failure",
+			Server.logger().ErrorContext(Ctx, "migration execution outcome is uncertain after rollback failure",
 				"event", "migration.execution.uncertain",
 				"database_id", Current.DatabaseID, "migration_id", Current.ID,
 				"execution_id", Exec.ID, "sql", Exec.SQLText)
 			return Exec, ErrUnavailable
 		}
 		Closed = true
-		Server.logger().Error("migration SQL failed; target transaction rolled back",
+		Server.logger().ErrorContext(Ctx, "migration SQL failed; target transaction rolled back",
 			"event", "migration.execution.rolled_back",
 			"database_id", Current.DatabaseID, "migration_id", Current.ID,
 			"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText)
@@ -439,14 +441,14 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 	}
 
 	if Err := TargetTx.Commit(Ctx); Err != nil {
-		Server.logger().Error("migration commit response is uncertain",
+		Server.logger().ErrorContext(Ctx, "migration commit response is uncertain",
 			"event", "migration.execution.uncertain",
 			"database_id", Current.DatabaseID, "migration_id", Current.ID,
 			"execution_id", Exec.ID, "sql", Exec.SQLText)
 		return Exec, ErrUnavailable
 	}
 	Closed = true
-	Server.logger().Info("migration target transaction committed",
+	Server.logger().InfoContext(Ctx, "migration target transaction committed",
 		"event", "migration.execution.committed",
 		"database_id", Current.DatabaseID, "migration_id", Current.ID,
 		"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText)
@@ -466,7 +468,7 @@ func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepositor
 	if Err != nil {
 		return Exec, ErrUnavailable
 	}
-	Server.logger().Info("migration execution succeeded",
+	Server.logger().InfoContext(Ctx, "migration execution succeeded",
 		"event", "migration.execution.succeeded",
 		"actor_id", User.ID, "actor", User.Username,
 		"database_id", Current.DatabaseID, "migration_id", Current.ID,
@@ -492,7 +494,7 @@ func (Server *Service) finishFailure(Ctx Context.Context, Repo MigrationReposito
 	if Err != nil {
 		return Exec, Cause
 	}
-	Server.logger().Error("migration execution failed",
+	Server.logger().ErrorContext(Ctx, "migration execution failed",
 		"event", "migration.execution.failed",
 		"database_id", Exec.DatabaseID, "migration_id", Exec.MigrationID,
 		"execution_id", Exec.ID, "attempt", Attempt.AttemptNo,
@@ -614,7 +616,7 @@ func (Server *Service) AnalyzePlan(Ctx Context.Context, User Auth.Principal, Dat
 		return QueryPlanAnalysis{}, ErrUnavailable
 	}
 	defer func() {
-		Cleanup, CleanupCancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, CleanupCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer CleanupCancel()
 		_ = TargetTx.Rollback(Cleanup)
 	}()

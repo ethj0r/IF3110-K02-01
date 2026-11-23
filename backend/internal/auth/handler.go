@@ -6,6 +6,7 @@ import (
 	Json "encoding/json"
 	Errors "errors"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Mime "mime"
@@ -121,6 +122,7 @@ func (Routes *Handler) RequireSession(Next Http.Handler) Http.Handler {
 		if State.SetCookie {
 			Routes.SetCookie(W, State)
 		}
+		Logging.Annotate(R.Context(), "actor_id", State.Principal.ID, "actor", State.Principal.Username)
 		Next.ServeHTTP(W, R.WithContext(Context.WithValue(R.Context(), SessionContext, State)))
 	}))
 }

@@ -4,6 +4,7 @@ import (
 	Context "context"
 	Errors "errors"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Strings "strings"
 )
 
@@ -130,6 +131,7 @@ func (Policy StaticEvaluator) Can(Ctx Context.Context, User Auth.Principal, Act 
 }
 
 func Can(Ctx Context.Context, Policy Evaluator, User Auth.Principal, Act Action, DatabaseID string) (bool, error) {
+	Logging.AnnotateOnce(Ctx, "database_id", DatabaseID)
 	if Policy == nil {
 		return false, nil
 	}

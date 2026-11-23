@@ -18,16 +18,25 @@ var EnumAddition = Regexp.MustCompile(`^ALTER TYPE "(?:""|[^"])*"\."(?:""|[^"])*
 
 var TypeRemoval = Regexp.MustCompile(`^DROP TYPE "(?:""|[^"])*"\."(?:""|[^"])*"$`)
 
-type PostgresGenerator struct{}
+// PostgresGenerator compares schemas. Tracer, when set, receives every snapshot statement.
+type PostgresGenerator struct{ Tracer Pgx.QueryTracer }
 type SilentLogger struct{}
 
 func (SilentLogger) Errorf(string, ...any) {}
 func (SilentLogger) Warnf(string, ...any)  {}
 
 func OpenSnapshot(Ctx Context.Context, DSN string) (*Sql.DB, *Sql.Tx, error) {
+	return OpenTracedSnapshot(Ctx, DSN, nil)
+}
+
+// OpenTracedSnapshot opens a read-only repeatable-read snapshot whose statements go to Tracer.
+func OpenTracedSnapshot(Ctx Context.Context, DSN string, Tracer Pgx.QueryTracer) (*Sql.DB, *Sql.Tx, error) {
 	Cfg, Err := Pgx.ParseConfig(DSN)
 	if Err != nil {
 		return nil, nil, ErrUnavailable
+	}
+	if Tracer != nil {
+		Cfg.Tracer = Tracer
 	}
 	Cfg.ConnectTimeout = 3 * Time.Second
 	DB := Stdlib.OpenDB(*Cfg)
@@ -69,14 +78,14 @@ WHERE N.nspname=$1 ORDER BY T.typname,E.enumsortorder`, Schema)
 	return Labels, nil
 }
 
-func (PostgresGenerator) Generate(Ctx Context.Context, CurrentDSN, ReferenceDSN, Schema string) (Result, error) {
-	CurrentDB, Current, Err := OpenSnapshot(Ctx, CurrentDSN)
+func (Generator PostgresGenerator) Generate(Ctx Context.Context, CurrentDSN, ReferenceDSN, Schema string) (Result, error) {
+	CurrentDB, Current, Err := OpenTracedSnapshot(Ctx, CurrentDSN, Generator.Tracer)
 	if Err != nil {
 		return Result{}, Err
 	}
 	defer CurrentDB.Close()
 	defer Current.Rollback()
-	ReferenceDB, Reference, Err := OpenSnapshot(Ctx, ReferenceDSN)
+	ReferenceDB, Reference, Err := OpenTracedSnapshot(Ctx, ReferenceDSN, Generator.Tracer)
 	if Err != nil {
 		return Result{}, Err
 	}
