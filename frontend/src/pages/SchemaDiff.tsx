@@ -1,10 +1,13 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router-dom'
 import { AccessQueryKeys, ListAccessibleDatabases } from '../api/access'
 import { ListSchemas } from '../api/databases'
 import { CompareSchemas } from '../api/schemaDiff'
-import { RequestError } from '../components/Feedback'
+import { DatabaseTabs } from '../layout/DatabaseTabs'
+import { Card, PageHeader } from '../ui/Card'
+import { Badge, Loading, Notice, RequestError } from '../ui/Feedback'
+import { Icon } from '../ui/Icon'
 
 export function SchemaDiffPage() {
   const { dbId: DatabaseID = '' } = useParams<{ dbId: string }>()
@@ -25,64 +28,107 @@ function Comparison({ DatabaseID }: { DatabaseID: string }) {
   const Names = Schemas.data?.schemas ?? []
   const ActiveSchema = Names.includes(Schema) ? Schema : Names.includes('public') ? 'public' : Names[0] ?? ''
   const Compare = useMutation({ mutationFn: () => CompareSchemas(DatabaseID, ReferenceID, ActiveSchema) })
+  const Result = Compare.data && !Compare.isPending ? Compare.data : null
+
+  function UseInEditor() {
+    if (!Result) return
+    void NavigateTo(`/databases/${DatabaseID}/migrations`, {
+      state: {
+        GeneratedMigration: {
+          DatabaseID,
+          Title: `${Result.requires_recomparison ? 'Prepare enums in' : 'Sync schema'} ${Result.schema}`,
+          SQLText: Result.sql_text,
+        },
+      },
+    })
+  }
 
   return (
-    <main className="workspace-main">
-      <nav aria-label="Main navigation">
-        <Link to={`/databases/${DatabaseID}`}>Browse database</Link>{' '}
-        <Link to={`/databases/${DatabaseID}/migrations`}>Migrations</Link>
-      </nav>
-      <h1>Schema comparison</h1>
+    <>
+      <PageHeader
+        Crumbs={Database ? [{ Label: 'Databases', To: '/' }, { Label: Database.name, To: `/databases/${DatabaseID}` }] : undefined}
+        Title="Schema comparison"
+      />
+      {Database && <DatabaseTabs Database={Database} />}
+
       <RequestError error={Databases.error} />
-      {Databases.isPending && <p role="status">Loading databases…</p>}
-      {!Databases.isPending && !Databases.isError && !Database && <p role="alert">No access to this database.</p>}
-      {Database && Database.level !== 'view_edit' && <p role="alert">View and edit access is required to generate a migration.</p>}
+      {Databases.isPending && <Loading>Loading databases…</Loading>}
+      {!Databases.isPending && !Databases.isError && !Database && <Notice Tone="danger" Role="alert">No access to this database.</Notice>}
+      {Database && Database.level !== 'view_edit' && <Notice Tone="warning" Role="alert">View and edit access is required to generate a migration.</Notice>}
+
       {Database?.level === 'view_edit' && (
-        <>
-          <p>Compare <strong>{Database.name}</strong> with a reference database to generate SQL for the same named schema.</p>
-          <p>Generation reads both databases. Review the SQL in the migration editor before saving or executing it.</p>
-          <form className="panel stack" onSubmit={Event => { Event.preventDefault(); Compare.mutate() }}>
-            <label htmlFor="reference-database">Reference database</label>
-            <select id="reference-database" value={ReferenceID} disabled={Compare.isPending} onChange={Event => { SetReferenceID(Event.target.value); SetSchema(''); Compare.reset() }} required>
-              <option value="">Choose a reference…</option>
-              {Databases.data?.map(Item => <option key={Item.id} value={Item.id}>{Item.name}</option>)}
-            </select>
-            <label htmlFor="comparison-schema">Schema</label>
-            <select id="comparison-schema" value={ActiveSchema} disabled={!ReferenceID || Schemas.isPending || Schemas.isError || Compare.isPending} onChange={Event => { SetSchema(Event.target.value); Compare.reset() }} required>
-              <option value="">Choose a schema…</option>
-              {Names.map(Name => <option key={Name} value={Name}>{Name}</option>)}
-            </select>
-            <RequestError error={Schemas.error} />
-            <button type="submit" disabled={!ReferenceID || !ActiveSchema || Schemas.isPending || Schemas.isError || Compare.isPending}>{Compare.isPending ? 'Comparing…' : 'Compare schemas'}</button>
-          </form>
+        <div className="stack-lg">
+          <Card>
+            <form className="stack" onSubmit={Event => { Event.preventDefault(); Compare.mutate() }}>
+              <div className="form-grid">
+                <div className="field">
+                  <label htmlFor="reference-database">Reference database</label>
+                  <select id="reference-database" className="select" value={ReferenceID} disabled={Compare.isPending} onChange={Event => { SetReferenceID(Event.target.value); SetSchema(''); Compare.reset() }} required>
+                    <option value="">Choose a reference…</option>
+                    {Databases.data?.map(Item => <option key={Item.id} value={Item.id}>{Item.name}</option>)}
+                  </select>
+                </div>
+                <div className="field">
+                  <label htmlFor="comparison-schema">Schema</label>
+                  <select id="comparison-schema" className="select" value={ActiveSchema} disabled={!ReferenceID || Schemas.isPending || Schemas.isError || Compare.isPending} onChange={Event => { SetSchema(Event.target.value); Compare.reset() }} required>
+                    <option value="">Choose a schema…</option>
+                    {Names.map(Name => <option key={Name} value={Name}>{Name}</option>)}
+                  </select>
+                </div>
+              </div>
+              <RequestError error={Schemas.error} />
+              <div className="form-actions">
+                <button className="btn" type="submit" disabled={!ReferenceID || !ActiveSchema || Schemas.isPending || Schemas.isError || Compare.isPending}>
+                  <Icon Name="diff" Size={14} />
+                  {Compare.isPending ? 'Comparing…' : 'Compare schemas'}
+                </button>
+              </div>
+            </form>
+          </Card>
+
           <RequestError error={Compare.error} />
-          {Compare.data && !Compare.isPending && (
-            <section className="panel stack" aria-label="Schema comparison results">
-              <h2>Schema differences</h2>
-              {Compare.data.statements.length === 0 ? <p role="status">No schema differences found.</p> : (
+
+          {Result && (
+            <Card
+              Label="Schema comparison results"
+              Title="Schema differences"
+              Actions={Result.statements.length > 0 ? <Badge Tone="info">{Result.statements.length} statements</Badge> : undefined}
+            >
+              {Result.statements.length === 0 ? (
+                <Notice Tone="success" Role="status">No schema differences found.</Notice>
+              ) : (
                 <>
-                  <p>{Compare.data.statements.length} schema change statements found. Neither database has been changed.</p>
-                  {Compare.data.requires_recomparison && <p role="status">This migration only adds enum values. Save and execute it first, then compare again to generate the remaining changes. New enum values must be committed before they can be used.</p>}
-                  <ol>
-                    {Compare.data.statements.map((Change, Index) => (
-                      <li key={Index}>
-                        <pre>{Change.sql}</pre>
-                        {Change.hazards.length > 0 && <ul>{Change.hazards.map((Risk, RiskIndex) => <li key={RiskIndex}><strong>{Risk.type}</strong>: {Risk.message}</li>)}</ul>}
+                  {Result.requires_recomparison && (
+                    <Notice Tone="warning" Role="status">This migration only adds enum values. Save and execute it first, then compare again to generate the remaining changes. New enum values must be committed before they can be used.</Notice>
+                  )}
+                  <ol className="list">
+                    {Result.statements.map((Change, Index) => (
+                      <li key={Index} className="list-item statement">
+                        <pre className="code-pre">{Change.sql}</pre>
+                        {Change.hazards.length > 0 && (
+                          <ul className="hazards">
+                            {Change.hazards.map((Risk, RiskIndex) => (
+                              <li key={RiskIndex}><Notice Tone="warning"><strong>{Risk.type}</strong>: {Risk.message}</Notice></li>
+                            ))}
+                          </ul>
+                        )}
                       </li>
                     ))}
                   </ol>
                   <div className="field">
                     <label htmlFor="generated-sql">Generated SQL</label>
-                    <textarea id="generated-sql" value={Compare.data.sql_text} readOnly rows={12} />
+                    <textarea id="generated-sql" className="textarea code-input" value={Result.sql_text} readOnly rows={12} />
                   </div>
-                  <button type="button" onClick={() => NavigateTo(`/databases/${DatabaseID}/migrations`, { state: { GeneratedMigration: { DatabaseID, Title: `${Compare.data.requires_recomparison ? 'Prepare enums in' : 'Sync schema'} ${Compare.data.schema}`, SQLText: Compare.data.sql_text } } })}>Use SQL in migration editor</button>
-                  <p>Run comparison again if either schema changes before execution.</p>
+                  <div className="form-actions">
+                    <button className="btn" type="button" onClick={UseInEditor}>Use SQL in migration editor<Icon Name="arrow-right" Size={14} /></button>
+                  </div>
                 </>
               )}
-            </section>
+            </Card>
           )}
-        </>
+
+        </div>
       )}
-    </main>
+    </>
   )
 }

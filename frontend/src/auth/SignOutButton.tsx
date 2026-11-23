@@ -1,8 +1,9 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { useNavigate } from 'react-router-dom'
 import { ApiError, Logout } from '../api/client'
+import { Icon } from '../ui/Icon'
 
-export function SignOutButton({ className = 'ghost' }: { className?: string }) {
+export function SignOutButton() {
   const QueryCache = useQueryClient()
   const NavigateTo = useNavigate()
   const ExitSession = useMutation({
@@ -20,10 +21,11 @@ export function SignOutButton({ className = 'ghost' }: { className?: string }) {
   })
   return (
     <>
-      <button className={className} type="button" onClick={() => ExitSession.mutate()} disabled={ExitSession.isPending}>
+      <button className="btn btn-secondary btn-sm btn-block" type="button" onClick={() => ExitSession.mutate()} disabled={ExitSession.isPending}>
+        <Icon Name="logout" Size={14} />
         {ExitSession.isPending ? 'Signing out…' : 'Sign out'}
       </button>
-      {ExitSession.isError && <span className="alert-inline" role="alert">Unable to sign out. Try again.</span>}
+      {ExitSession.isError && <span className="field-hint" role="alert">Unable to sign out. Try again.</span>}
     </>
   )
 }
