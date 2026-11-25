@@ -1,0 +1,117 @@
+name: CodeQL SAST
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+      - feat/codeql
+  pull_request:
+    branches:
+      - main
+      - dev
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  security-events: write
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: manual
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: backend/go.mod
+          cache-dependency-path: backend/go.sum
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          queries: +security-extended
+          config: |
+            paths-ignore:
+              - backend/internal/webui/dist
+              - frontend/dist
+              - frontend/node_modules
+
+      - name: Build Go backend
+        if: matrix.language == 'go'
+        working-directory: backend
+        run: go build ./...
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: sarif-results
+
+      - name: Print SARIF summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, json, os
+
+          files = sorted(glob.glob("sarif-results/*.sarif"))
+          if not files:
+              print("No SARIF files generated.")
+              raise SystemExit(0)
+
+          total = 0
+          for path in files:
+              with open(path, "r", encoding="utf-8") as f:
+                  data = json.load(f)
+              for run in data.get("runs", []):
+                  tool = run.get("tool", {}).get("driver", {})
+                  rules = {r["id"]: r for r in tool.get("rules", []) if "id" in r}
+                  for ext in run.get("tool", {}).get("extensions", []):
+                      for r in ext.get("rules", []):
+                          if "id" in r:
+                              rules[r["id"]] = r
+                  results = run.get("results", [])
+                  print(f"=== {os.path.basename(path)} ({len(results)} findings) ===")
+                  total += len(results)
+                  for res in results:
+                      rule_id = res.get("ruleId", "unknown")
+                      rule = rules.get(rule_id, {})
+                      props = rule.get("properties", {})
+                      severity = props.get("security-severity", res.get("level", "unknown"))
+                      level = res.get("level", "warning")
+                      msg = res.get("message", {}).get("text", "").replace("\n", " ")
+                      locs = res.get("locations", [])
+                      loc_str = "unknown"
+                      if locs:
+                          phys = locs[0].get("physicalLocation", {})
+                          uri = phys.get("artifactLocation", {}).get("uri", "unknown")
+                          line = phys.get("region", {}).get("startLine", "?")
+                          loc_str = f"{uri}:{line}"
+                      print(f"- [{level} | score={severity}] {rule_id} @ {loc_str} :: {msg}")
+          print(f"\nTotal findings: {total}")
+          EOF
+
+      - name: Upload SARIF artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codeql-sarif-${{ matrix.language }}
+          path: sarif-results/
+          if-no-files-found: ignore
