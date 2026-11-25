@@ -106,25 +106,23 @@ func Activity(Event string) func(Http.Handler) Http.Handler {
 // Record writes a named event using the default logger and the context scope.
 func Record(Ctx Context.Context, Level Slog.Level, Event string, Args ...any) {
 	SafeEvent := SanitizeLogValue(Event)
-	SafeArgs := make([]any, 0, len(Args)+2)
-	SafeArgs = append(SafeArgs, "event", SafeEvent)
-	for _, Arg := range Args {
-		switch Value := Arg.(type) {
-		case string:
-			SafeArgs = append(SafeArgs, SanitizeLogValue(Value))
-		case Slog.Attr:
-			if Value.Value.Kind() == Slog.KindString {
-				SafeArgs = append(SafeArgs, Slog.String(SanitizeLogValue(Value.Key), SanitizeLogValue(Value.Value.String())))
-			} else {
-				SafeArgs = append(SafeArgs, Value)
-			}
-		case int, int64, uint64, float64, bool:
-			SafeArgs = append(SafeArgs, Value)
-		default:
-			SafeArgs = append(SafeArgs, SanitizeLogValue(Fmt.Sprint(Value)))
+	Attrs := make([]Slog.Attr, 0, len(Args)/2+1)
+	Attrs = append(Attrs, Slog.String("event", SafeEvent))
+	for I := 0; I < len(Args); {
+		if Attr, Ok := Args[I].(Slog.Attr); Ok {
+			Attrs = append(Attrs, Slog.String(SanitizeLogValue(Attr.Key), SanitizeLogValue(Attr.Value.String())))
+			I++
+			continue
 		}
+		if Key, Ok := Args[I].(string); Ok && I+1 < len(Args) {
+			Attrs = append(Attrs, Slog.String(SanitizeLogValue(Key), SanitizeLogValue(Fmt.Sprint(Args[I+1]))))
+			I += 2
+			continue
+		}
+		Attrs = append(Attrs, Slog.String("!BADKEY", SanitizeLogValue(Fmt.Sprint(Args[I]))))
+		I++
 	}
-	Slog.Default().Log(Ctx, Level, SafeEvent, SafeArgs...)
+	Slog.Default().LogAttrs(Ctx, Level, SafeEvent, Attrs...)
 }
 
 // DatabaseParam adds the named URL parameter as database_id to the request
