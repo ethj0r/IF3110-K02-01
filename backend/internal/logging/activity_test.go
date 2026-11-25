@@ -72,3 +72,18 @@ func TestRecordUsesDefaultLoggerAndScope(T *Testing.T) {
 		T.Fatalf("unexpected record: %v", Lines)
 	}
 }
+
+func TestRecordAndRequestLoggerSanitizeLogInjection(T *Testing.T) {
+	Logger, Buffer := capture(Slog.LevelInfo)
+	useDefault(T, Logger)
+
+	Record(Context.Background(), Slog.LevelWarn, "access.denied", "target_database_id", "db-1\r\nforged=true")
+	Lines := records(T, Buffer)
+	if len(Lines) != 1 || Lines[0]["target_database_id"] != "db-1forged=true" {
+		T.Fatalf("expected CR/LF stripped in Record, got %v", Lines)
+	}
+
+	if Got := SanitizeLogValue("/api/test\r\nfake"); Got != "/api/testfake" {
+		T.Fatalf("expected CR/LF stripped in SanitizeLogValue, got %q", Got)
+	}
+}

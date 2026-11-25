@@ -33,6 +33,13 @@ func SensitiveKey(Key string) bool {
 	return false
 }
 
+// SanitizeLogValue strips CR and LF characters from log fields to prevent log
+// forging / log injection (CWE-117).
+func SanitizeLogValue(Value string) string {
+	Value = Strings.ReplaceAll(Value, "\r", "")
+	return Strings.ReplaceAll(Value, "\n", "")
+}
+
 // RedactString masks credentials embedded in connection URLs and key=value strings.
 func RedactString(Value string) string {
 	Value = urlCredentials.ReplaceAllString(Value, "$1:"+Redacted+"@")

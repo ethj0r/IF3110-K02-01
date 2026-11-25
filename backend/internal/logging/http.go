@@ -2,6 +2,7 @@ package Logging
 
 import (
 	Context "context"
+	Fmt "fmt"
 	Slog "log/slog"
 	Http "net/http"
 	Time "time"
@@ -48,7 +49,7 @@ func RequestLogger(Logger *Slog.Logger) func(Http.Handler) Http.Handler {
 				Logger.LogAttrs(Ctx, Level, "http request completed",
 					Slog.String("event", "http.request"),
 					Slog.String("method", R.Method),
-					Slog.String("route", Route),
+					Slog.String("route", SanitizeLogValue(Route)),
 					Slog.Int("status", Status),
 					Slog.Int("bytes", Writer.BytesWritten()),
 					Slog.Float64("duration_ms", float64(Time.Since(Started).Microseconds())/1000),
@@ -104,7 +105,26 @@ func Activity(Event string) func(Http.Handler) Http.Handler {
 
 // Record writes a named event using the default logger and the context scope.
 func Record(Ctx Context.Context, Level Slog.Level, Event string, Args ...any) {
-	Slog.Default().Log(Ctx, Level, Event, append([]any{"event", Event}, Args...)...)
+	SafeEvent := SanitizeLogValue(Event)
+	SafeArgs := make([]any, 0, len(Args)+2)
+	SafeArgs = append(SafeArgs, "event", SafeEvent)
+	for _, Arg := range Args {
+		switch Value := Arg.(type) {
+		case string:
+			SafeArgs = append(SafeArgs, SanitizeLogValue(Value))
+		case Slog.Attr:
+			if Value.Value.Kind() == Slog.KindString {
+				SafeArgs = append(SafeArgs, Slog.String(SanitizeLogValue(Value.Key), SanitizeLogValue(Value.Value.String())))
+			} else {
+				SafeArgs = append(SafeArgs, Value)
+			}
+		case int, int64, uint64, float64, bool:
+			SafeArgs = append(SafeArgs, Value)
+		default:
+			SafeArgs = append(SafeArgs, SanitizeLogValue(Fmt.Sprint(Value)))
+		}
+	}
+	Slog.Default().Log(Ctx, Level, SafeEvent, SafeArgs...)
 }
 
 // DatabaseParam adds the named URL parameter as database_id to the request
