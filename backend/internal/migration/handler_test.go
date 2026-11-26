@@ -59,6 +59,7 @@ func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Han
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
 	Jobs := &Handler{Service: Service}
+	R.Get("/databases/{dbID}/jobs", Jobs.Jobs)
 	R.Get("/databases/{dbID}/jobs/{jobID}", Jobs.Job)
 	R.Get("/connections/{dbID}/jobs/{jobID}", Jobs.Job)
 
@@ -177,6 +178,29 @@ func TestHandlerLifecycleAndAccess(T *Testing.T) {
 	if Finished.Status != JobSucceeded || Finished.ExecutionID == nil {
 		T.Fatalf("job did not succeed: %+v", Finished)
 	}
+
+	// 6b. Recent jobs: viewers can list them, bad limits and ungranted users are rejected.
+	*CurrentPrincipal = Auth.Principal{ID: "user-viewer", Username: "viewer"}
+	ListResponse := Httptest.NewRecorder()
+	Router.ServeHTTP(ListResponse, Httptest.NewRequest("GET", "/databases/db-1/jobs?limit=5", nil))
+	var Recent []Job
+	if ListResponse.Code != 200 || Json.NewDecoder(ListResponse.Body).Decode(&Recent) != nil || len(Recent) != 1 || Recent[0].ID != Queued.ID || Recent[0].Status != JobSucceeded {
+		T.Fatalf("job list returned %d: %+v", ListResponse.Code, Recent)
+	}
+	for _, Query := range []string{"?limit=0", "?limit=51", "?limit=many"} {
+		BadLimit := Httptest.NewRecorder()
+		Router.ServeHTTP(BadLimit, Httptest.NewRequest("GET", "/databases/db-1/jobs"+Query, nil))
+		if BadLimit.Code != 400 {
+			T.Fatalf("job list %s returned %d", Query, BadLimit.Code)
+		}
+	}
+	*CurrentPrincipal = Auth.Principal{ID: "user-blocked", Username: "blocked"}
+	Denied := Httptest.NewRecorder()
+	Router.ServeHTTP(Denied, Httptest.NewRequest("GET", "/databases/db-1/jobs", nil))
+	if Denied.Code != 403 {
+		T.Fatalf("ungranted job list returned %d", Denied.Code)
+	}
+	*CurrentPrincipal = Auth.Principal{ID: "user-editor", Username: "editor"}
 
 	// 7. Re-executing already committed migration -> 409 Conflict
 	Req = Httptest.NewRequest("POST", "/databases/db-1/migrations/"+Created.ID+"/execute", nil)

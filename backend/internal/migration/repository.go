@@ -665,11 +665,23 @@ ORDER BY E.created_at ASC, E.id ASC`, DatabaseID, HideRollback)
 
 const JobColumns = `J.id::text, J.database_id::text, J.migration_id::text, M.version, M.title,
 J.action, J.status, J.attempts, J.max_attempts, J.available_at, J.locked_by, J.locked_at,
-J.lease_expires_at, J.last_error, J.execution_id::text, J.requested_by::text,
+J.lease_expires_at, J.last_error, COALESCE(J.execution_id, E.id)::text, J.requested_by::text,
 (SELECT U.username FROM users U WHERE U.id = J.requested_by), J.traceparent,
-E.mode, COALESCE(E.committed_batches, 0), COALESCE(E.committed_rows, 0),
+E.status, E.mode, COALESCE(E.committed_batches, 0), COALESCE(E.committed_rows, 0),
 COALESCE(E.reverted_batches, 0), COALESCE(E.reverted_rows, 0), COALESCE(E.checkpoint_cursor, 0),
 J.created_at, J.updated_at, J.finished_at`
+
+// JobSource joins each job with its execution. The worker records execution_id
+// only when a job finishes, so a running job falls back to the migration's
+// in-flight execution; the per-database job lock makes that execution the job's own.
+const JobSource = ` FROM migration_jobs J
+JOIN migrations M ON M.id = J.migration_id
+LEFT JOIN migration_executions E ON E.id = COALESCE(J.execution_id, CASE WHEN J.status = 'running' THEN (
+SELECT Running.id FROM migration_executions Running
+WHERE Running.migration_id = J.migration_id AND Running.status IN ('queued', 'running')
+ORDER BY Running.created_at DESC, Running.id DESC
+LIMIT 1
+) END)`
 
 func scanJob(Row rowScanner) (Job, error) {
 	var Item Job
@@ -693,6 +705,7 @@ func scanJob(Row rowScanner) (Job, error) {
 		&Item.RequestedBy,
 		&Item.RequestedByUsername,
 		&Item.TraceParent,
+		&Item.ExecutionStatus,
 		&Item.Mode,
 		&Item.CommittedBatches,
 		&Item.CommittedRows,
@@ -734,11 +747,33 @@ RETURNING id::text`, DatabaseID, MigrationID, string(Action), RequestedBy, Trace
 }
 
 func (Repo *Repository) GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error) {
-	Row := Repo.queryRow(Ctx, "SELECT "+JobColumns+` FROM migration_jobs J
-JOIN migrations M ON M.id = J.migration_id
-LEFT JOIN migration_executions E ON E.id = J.execution_id
+	Row := Repo.queryRow(Ctx, "SELECT "+JobColumns+JobSource+`
 WHERE J.database_id::text = $1 AND J.id::text = $2`, DatabaseID, JobID)
 	return scanJob(Row)
+}
+
+// ListJobs returns the most recent jobs of one database, newest first.
+func (Repo *Repository) ListJobs(Ctx Context.Context, DatabaseID string, Limit int) ([]Job, error) {
+	Rows, Err := Repo.query(Ctx, "SELECT "+JobColumns+JobSource+`
+WHERE J.database_id::text = $1
+ORDER BY J.created_at DESC, J.id DESC
+LIMIT $2`, DatabaseID, Limit)
+	if Err != nil {
+		return nil, ErrJobUnavailable
+	}
+	defer Rows.Close()
+	Result := []Job{}
+	for Rows.Next() {
+		Item, Err := scanJob(Rows)
+		if Err != nil {
+			return nil, ErrJobUnavailable
+		}
+		Result = append(Result, Item)
+	}
+	if Rows.Err() != nil {
+		return nil, ErrJobUnavailable
+	}
+	return Result, nil
 }
 
 func (Repo *Repository) ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error) {

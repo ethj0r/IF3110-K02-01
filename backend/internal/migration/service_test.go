@@ -203,6 +203,20 @@ func (M *MockRepo) GetJob(_ Context.Context, DatabaseID string, JobID string) (J
 	return Item, nil
 }
 
+func (M *MockRepo) ListJobs(_ Context.Context, DatabaseID string, Limit int) ([]Job, error) {
+	Result := []Job{}
+	for _, Item := range M.Jobs {
+		if Item.DatabaseID == DatabaseID {
+			Result = append(Result, Item)
+		}
+	}
+	Sort.Slice(Result, func(I, J int) bool { return Result[I].ID > Result[J].ID })
+	if len(Result) > Limit {
+		Result = Result[:Limit]
+	}
+	return Result, nil
+}
+
 func (M *MockRepo) ClaimJob(_ Context.Context, WorkerID string, _ Time.Duration) (Job, error) {
 	for ID, Item := range M.Jobs {
 		if Item.Status != JobQueued {

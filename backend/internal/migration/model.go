@@ -282,6 +282,7 @@ type Job struct {
 	RequestedBy         *string    `json:"requested_by,omitempty"`
 	RequestedByUsername *string    `json:"requested_by_username,omitempty"`
 	TraceParent         *string    `json:"traceparent,omitempty"`
+	ExecutionStatus     *string    `json:"execution_status,omitempty"`
 	Mode                *string    `json:"mode,omitempty"`
 	CommittedBatches    int64      `json:"committed_batches"`
 	CommittedRows       int64      `json:"committed_rows"`

@@ -46,6 +46,7 @@ type MigrationRepository interface {
 	ListHistory(Ctx Context.Context, DatabaseID string, HideRollback bool) ([]Execution, error)
 	EnqueueJob(Ctx Context.Context, DatabaseID string, MigrationID string, Action JobAction, RequestedBy *string, TraceParent *string) (Job, error)
 	GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error)
+	ListJobs(Ctx Context.Context, DatabaseID string, Limit int) ([]Job, error)
 	ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error)
 	FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error
 	ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error)
@@ -482,6 +483,27 @@ func (Server *Service) GetJob(Ctx Context.Context, User Auth.Principal, Database
 		return Job{}, Err
 	}
 	return Server.Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+const (
+	DefaultJobLimit = 10
+	MaxJobLimit     = 50
+)
+
+// ListJobs returns the latest jobs of a database so the SPA can recover the
+// active job after navigation or reload.
+func (Server *Service) ListJobs(Ctx Context.Context, User Auth.Principal, DatabaseID string, Limit int) ([]Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	if DatabaseID == "" {
+		return nil, ErrNotFound
+	}
+	if Limit < 1 || Limit > MaxJobLimit {
+		return nil, ErrInvalidInput
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return nil, Err
+	}
+	return Server.Repo.ListJobs(Ctx, DatabaseID, Limit)
 }
 
 func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {

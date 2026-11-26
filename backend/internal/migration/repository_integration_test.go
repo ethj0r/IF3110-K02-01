@@ -250,12 +250,44 @@ func TestJobQueueLifecycle(T *Testing.T) {
 	if _, Err := Repo.ClaimJob(Ctx, "worker-b", Time.Minute); !Errors.Is(Err, ErrJobNotFound) {
 		T.Fatalf("running job was claimed twice: %v", Err)
 	}
+	Running, Err := Repo.CreateExecution(Ctx, DBID, M1.ID, ExecutionRequest{Kind: KindApply, Direction: DirectionUp, SQLText: "SELECT 1;", RequestedBy: &UserID})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Repo.RecordBatchUp(Ctx, Running.ID, DBID, 1, 0, 100, 100); Err != nil {
+		T.Fatal(Err)
+	}
+	Live, Err := Repo.GetJob(Ctx, DBID, Job.ID)
+	if Err != nil || Live.ExecutionID == nil || *Live.ExecutionID != Running.ID || Live.ExecutionStatus == nil || *Live.ExecutionStatus != string(ExecutionRunning) || Live.CommittedBatches != 1 || Live.CommittedRows != 100 || Live.CheckpointCursor != 100 {
+		T.Fatalf("running job does not expose live execution progress: %+v %v", Live, Err)
+	}
 	if Err := Repo.FinishJob(Ctx, Job.ID, JobSucceeded, nil, nil); Err != nil {
 		T.Fatal(Err)
 	}
 	Finished, Err := Repo.GetJob(Ctx, DBID, Job.ID)
 	if Err != nil || Finished.Status != JobSucceeded || Finished.FinishedAt == nil {
 		T.Fatalf("finish failed: %+v %v", Finished, Err)
+	}
+	if Finished.ExecutionID != nil {
+		T.Fatalf("finished job without a recorded execution borrowed one: %+v", Finished)
+	}
+	M2, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Second job migration", SQLText: "SELECT 2;", DownSQL: "SELECT 2;"}, &UserID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Second, Err := Repo.EnqueueJob(Ctx, DBID, M2.ID, JobApply, &UserID, nil)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Recent, Err := Repo.ListJobs(Ctx, DBID, 10)
+	if Err != nil || len(Recent) != 2 || Recent[0].ID != Second.ID || Recent[1].ID != Job.ID {
+		T.Fatalf("recent jobs are not newest first: %+v %v", Recent, Err)
+	}
+	if Limited, Err := Repo.ListJobs(Ctx, DBID, 1); Err != nil || len(Limited) != 1 || Limited[0].ID != Second.ID {
+		T.Fatalf("job limit ignored: %+v %v", Limited, Err)
+	}
+	if Other, Err := Repo.ListJobs(Ctx, "00000000-0000-0000-0000-000000000000", 10); Err != nil || len(Other) != 0 {
+		T.Fatalf("jobs leaked across databases: %+v %v", Other, Err)
 	}
 }
 
