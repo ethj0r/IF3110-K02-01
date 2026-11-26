@@ -41,6 +41,25 @@ func TestOpenAndReadiness(T *Testing.T) {
 	}
 }
 
+func TestOpenSetsSessionKeepalives(T *Testing.T) {
+	Ctx, Cancel := Context.WithTimeout(Context.Background(), 10*Time.Second)
+	defer Cancel()
+	Pool, Err := Store.Open(Ctx, Os.Getenv("TEST_DATABASE_URL"))
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	defer Pool.Close()
+	for Name, Want := range Store.KeepaliveParams {
+		var Got string
+		if Err := Pool.QueryRow(Ctx, "SELECT current_setting($1)", Name).Scan(&Got); Err != nil {
+			T.Fatal(Err)
+		}
+		if Got != Want {
+			T.Fatalf("%s = %s, want %s", Name, Got, Want)
+		}
+	}
+}
+
 func TestOpenFailureDoesNotExposeCredentials(T *Testing.T) {
 	Ctx, Cancel := Context.WithTimeout(Context.Background(), Time.Second)
 	defer Cancel()
