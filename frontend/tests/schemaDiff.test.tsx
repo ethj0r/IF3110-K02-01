@@ -35,6 +35,7 @@ function InstallAPI(Level = 'view_edit', Changes = true, Fail = false, Phased = 
     if (Path.endsWith('/migrations') && Options?.method === 'POST') {
       return Response.json({ ...JSON.parse(String(Options.body)) as object, id: 'draft', version: 1, status: 'draft', created_at: '2026-01-01T00:00:00Z' }, { status: 201 })
     }
+    if (Path.includes('/migrations/history')) return Response.json([])
     if (Path.endsWith('/migrations')) return Response.json([])
     return new Response(null, { status: 404 })
   })
@@ -58,16 +59,17 @@ Test('reviews differences and imports editable SQL without saving or executing a
   Expect(Fetch.mock.calls.find(([Path]) => Path.endsWith('/schema-diff'))?.[1]?.body).toBe(JSON.stringify({ reference_database_id: 'reference', schema: 'public' }))
   Expect((Screen.getByLabelText('Generated SQL') as HTMLTextAreaElement).readOnly).toBe(true)
   await User.click(Screen.getByRole('button', { name: 'Use SQL in migration editor' }))
-  const Editor = await Screen.findByLabelText('SQL Query (Transactional):')
+  const Editor = await Screen.findByLabelText('Up SQL')
   Expect((Editor as HTMLTextAreaElement).value).toBe(SQL)
-  Expect((Screen.getByLabelText('Title:') as HTMLInputElement).value).toBe('Sync schema public')
+  Expect((Screen.getByLabelText('Title') as HTMLInputElement).value).toBe('Sync schema public')
   Expect(Fetch.mock.calls.some(([Path, Options]) => Path.endsWith('/execute') || Path.endsWith('/migrations') && Options?.method === 'POST')).toBe(false)
   await User.clear(Editor)
   await User.type(Editor, 'SELECT 42;')
+  await User.type(Screen.getByLabelText('Down SQL'), 'SELECT 1;')
   await User.click(Screen.getByRole('button', { name: 'Save Draft' }))
   await Screen.findByText('Migration draft saved successfully.')
   const Saved = Fetch.mock.calls.find(([Path, Options]) => Path.endsWith('/migrations') && Options?.method === 'POST')
-  Expect(JSON.parse(String(Saved?.[1]?.body))).toEqual({ title: 'Sync schema public', sql_text: 'SELECT 42;' })
+  Expect(JSON.parse(String(Saved?.[1]?.body))).toEqual({ title: 'Sync schema public', sql_text: 'SELECT 42;', down_sql: 'SELECT 1;', batch_mode: false, batch_column: '', batch_size: 0, irreversible: false, irreversible_reason: '' })
   Expect(Fetch.mock.calls.some(([Path]) => Path.endsWith('/execute'))).toBe(false)
 })
 
@@ -118,8 +120,8 @@ Test('explains staged enum generation and imports only the first transactional p
   await Screen.findByText(/This migration only adds enum values/)
   Expect((Screen.getByLabelText('Generated SQL') as HTMLTextAreaElement).value).toBe("ALTER TYPE public.state ADD VALUE 'done';")
   await User.click(Screen.getByRole('button', { name: 'Use SQL in migration editor' }))
-  Expect((await Screen.findByLabelText('SQL Query (Transactional):') as HTMLTextAreaElement).value).not.toContain('ALTER TABLE')
-  Expect((Screen.getByLabelText('Title:') as HTMLInputElement).value).toBe('Prepare enums in public')
+  Expect((await Screen.findByLabelText('Up SQL') as HTMLTextAreaElement).value).not.toContain('ALTER TABLE')
+  Expect((Screen.getByLabelText('Title') as HTMLInputElement).value).toBe('Prepare enums in public')
 })
 
 Test('removes an earlier candidate after a failed comparison and can recover', async () => {

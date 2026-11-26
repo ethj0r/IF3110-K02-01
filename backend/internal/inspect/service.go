@@ -291,7 +291,7 @@ func (Server *Service) Rows(Ctx Context.Context, DBID, Schema, Table string, Pag
 		return TablePage{}, ErrUnavailable
 	}
 	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer Cancel()
 		_ = Snapshot.Rollback(Cleanup)
 	}()

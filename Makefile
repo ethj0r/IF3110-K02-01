@@ -1,13 +1,14 @@
 -include .env
 export
 
-.PHONY: help setup db-up db-down db-test-up dev-api dev-web fmt check-fmt vet test test-integration test-web test-e2e lint typecheck check build bootstrap migrate-up migrate-status seed-admin seed-dev seed-sample seed-large seed-data clean
+.PHONY: help setup db-up db-down db-test-up dev-api dev-web dev-worker fmt check-fmt vet test test-integration test-web test-e2e lint typecheck check build bootstrap migrate-up migrate-status seed-admin seed-dev seed-sample seed-large seed-data clean
 
 help:
 	@echo "setup           Copy local env if absent and install dependencies"
 	@echo "db-up/db-down   Start/stop local PostgreSQL services (preserve volumes)"
 	@echo "db-test-up      Start disposable integration-test PostgreSQL"
 	@echo "dev-api/dev-web Run Go API / Vite (separate terminals)"
+	@echo "dev-worker      Run the asynchronous migration worker"
 	@echo "check           Check formatting, vet, unit tests, lint, and TypeScript"
 	@echo "test-integration Run real PostgreSQL tests (requires TEST_DATABASE_URL)"
 	@echo "test-e2e        Test running local app in Chromium with temporary fixtures"
@@ -53,6 +54,9 @@ dev-api:
 dev-web:
 	npm --prefix frontend run dev
 
+dev-worker:
+	cd backend && go run ./cmd/worker
+
 fmt:
 	cd backend && go fmt ./...
 
@@ -87,6 +91,7 @@ build:
 	npm --prefix frontend run build
 	mkdir -p bin
 	cd backend && go build -trimpath -o ../bin/server ./cmd/server
+	cd backend && go build -trimpath -o ../bin/worker ./cmd/worker
 
 bootstrap: migrate-up seed-admin
 

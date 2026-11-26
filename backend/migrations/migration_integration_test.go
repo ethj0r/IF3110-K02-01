@@ -38,23 +38,23 @@ func TestMigrationSchema(T *Testing.T) {
 	}
 
 	var MigID string
-	if Err := Pool.QueryRow(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, status, created_by) VALUES ($1, 1, 'init schema', 'CREATE TABLE t1 (id INT);', 'committed', $2) RETURNING id", DB1ID, UserID).Scan(&MigID); Err != nil || MigID == "" {
+	if Err := Pool.QueryRow(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, down_sql, status, created_by) VALUES ($1, 1, 'init schema', 'CREATE TABLE t1 (id INT);', 'DROP TABLE t1;', 'applied', $2) RETURNING id", DB1ID, UserID).Scan(&MigID); Err != nil || MigID == "" {
 		T.Fatalf("failed to insert migration: %v", Err)
 	}
 
-	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, status, created_by) VALUES ($1, 1, 'duplicate version', 'CREATE TABLE t2 (id INT);', 'committed', $2)", DB1ID, UserID); Err == nil {
+	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, down_sql, status, created_by) VALUES ($1, 1, 'duplicate version', 'CREATE TABLE t2 (id INT);', 'DROP TABLE t2;', 'applied', $2)", DB1ID, UserID); Err == nil {
 		T.Fatal("duplicate version on same database was accepted")
 	}
 
-	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, status, created_by) VALUES ($1, 1, 'db2 init schema', 'CREATE TABLE t1 (id INT);', 'committed', $2)", DB2ID, UserID); Err != nil {
+	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, down_sql, status, created_by) VALUES ($1, 1, 'db2 init schema', 'CREATE TABLE t1 (id INT);', 'DROP TABLE t1;', 'applied', $2)", DB2ID, UserID); Err != nil {
 		T.Fatalf("same version on different database should be allowed: %v", Err)
 	}
 
-	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, status, created_by) VALUES ($1, 0, 'invalid version', 'SELECT 1;', 'draft', $2)", DB1ID, UserID); Err == nil {
+	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, down_sql, status, created_by) VALUES ($1, 0, 'invalid version', 'SELECT 1;', 'SELECT 1;', 'draft', $2)", DB1ID, UserID); Err == nil {
 		T.Fatal("version 0 was accepted")
 	}
 
-	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, status, created_by) VALUES ($1, 2, 'invalid status', 'SELECT 1;', 'unknown_status', $2)", DB1ID, UserID); Err == nil {
+	if _, Err := Pool.Exec(Ctx, "INSERT INTO migrations (database_id, version, title, sql_text, down_sql, status, created_by) VALUES ($1, 2, 'invalid status', 'SELECT 1;', 'SELECT 1;', 'unknown_status', $2)", DB1ID, UserID); Err == nil {
 		T.Fatal("invalid status was accepted")
 	}
 
@@ -63,7 +63,7 @@ func TestMigrationSchema(T *Testing.T) {
 	}
 
 	var Removed bool
-	if Err := Pool.QueryRow(Ctx, "SELECT to_regclass('migrations') IS NULL AND to_regclass('db_connections') IS NULL AND to_regclass('users') IS NULL").Scan(&Removed); Err != nil || !Removed {
+	if Err := Pool.QueryRow(Ctx, "SELECT to_regclass('migrations') IS NULL AND to_regclass('migration_executions') IS NULL AND to_regclass('db_connections') IS NULL AND to_regclass('users') IS NULL").Scan(&Removed); Err != nil || !Removed {
 		T.Fatal("migrations schema rollback did not drop all tables")
 	}
 

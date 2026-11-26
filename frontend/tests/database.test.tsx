@@ -72,11 +72,11 @@ Test('viewer preserves target text values, displays definitions, and paginates',
   for (const Value of ['9223372036854775807', '12345678901234567890.12', '01234567-89ab-cdef-0123-456789abcdef', 'NaN', 'NULL']) {
     Expect((await Screen.findAllByText(Value)).length).toBe(25)
   }
-  await User.click(Screen.getByRole('button', { name: 'Next →' }))
+  await User.click(Screen.getByRole('button', { name: 'Next' }))
   Expect(await Screen.findByText('-Infinity')).toBeTruthy()
   Expect(Fetch.mock.calls.some(([Path]) => Path.includes('schema=public&page=2&page_size=25'))).toBe(true)
-  Expect((Screen.getByRole('button', { name: 'Next →' }) as HTMLButtonElement).disabled).toBe(true)
+  Expect((Screen.getByRole('button', { name: 'Next' }) as HTMLButtonElement).disabled).toBe(true)
   await User.selectOptions(Screen.getByLabelText('Table'), 'empty')
   Expect(await Screen.findByText('No rows')).toBeTruthy()
-  Expect((Screen.getByRole('button', { name: '← Previous' }) as HTMLButtonElement).disabled).toBe(true)
+  Expect((Screen.getByRole('button', { name: 'Previous' }) as HTMLButtonElement).disabled).toBe(true)
 })

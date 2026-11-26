@@ -8,6 +8,8 @@ The repository includes a Go server, configuration loading, PostgreSQL pooling, 
 
 Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, schema comparison with editable migration generation, and query execution plan analysis are available.
 
+Milestone 2 adds immutable up/down definitions, rollback/forward and complete execution history, per-group leader approvals, a durable asynchronous migration job queue with a worker, batch mode with checkpoints and partial/reverted progress, target-side execution evidence and administrator reconciliation, structured JSON logging, OpenTelemetry tracing, and observability metrics/dashboards.
+
 ## Requirements
 
 - Go matching `backend/go.mod`.
@@ -34,7 +36,7 @@ make seed-data
 
 ### Run the Application
 
-Start the API and frontend in separate terminals:
+Start the API, frontend, and migration worker in separate terminals:
 
 ```sh
 make dev-api
@@ -43,6 +45,12 @@ make dev-api
 ```sh
 make dev-web
 ```
+
+```sh
+make dev-worker
+```
+
+Every apply, rollback, forward, and retry is published to a durable PostgreSQL queue and processed by the worker. The API returns a job ID immediately; the SPA polls `/api/databases/{dbId}/jobs/{jobId}` for queued/running/final status. Without a running worker, jobs remain queued. One database has at most one active migration job, while different databases can run in parallel.
 
 Open `http://127.0.0.1:5173`. Vite proxies `/api` to `HTTP_ADDR`, which defaults to `127.0.0.1:8080`, keeping browser requests on the same origin.
 
@@ -56,6 +64,301 @@ Client environment variables use the `VITE_` prefix. Never use that prefix for s
 | GET | `/api/ready` | Platform database readiness |
 
 API errors use `{"error":{"code":"...","message":"..."}}`. Error messages must not contain raw database errors or credentials.
+
+### Logging and Tracing
+
+The API and the worker write one JSON object per line to stdout through `log/slog` (`backend/internal/logging`). The CLI commands (`migrate`, `seed-*`) write the same format to stderr, so their normal output stays readable. Set `LOG_LEVEL` to `debug`, `info` (default), `warn`, or `error`. Logs are never stored in the platform database.
+
+| Event | Level | Written when |
+| --- | --- | --- |
+| `http.request` | info, warn (4xx), error (5xx) | An `/api` request finishes: method, route pattern, status, bytes, duration |
+| `sql.start` | info | A statement is sent: SQL text and bound parameters |
+| `sql.finish` | info, error | A statement returns: duration, rows, command, and SQLSTATE and message on failure |
+| `sql.begin` / `sql.commit` / `sql.rollback` | info, error | Transaction control, each logged as its own event |
+| `migration.lock.acquired` / `.released` / `.failed` | info, warn, error | The per-database advisory lock, with `wait_ms` and `held_ms` |
+| `migration.execution.*` | info, error | Execution started, committed, succeeded, rolled back, failed, or uncertain |
+| `migration.job.claimed` / `.succeeded` / `.failed` / `.retry_scheduled` / `.idempotent` | info, warn, error | Worker job lifecycle; `claimed` includes `queue_wait_ms` |
+| `migration.batch.committed` / `.reverted` / `.reconciled` / `.uncertain` | info, error | Each batch, with `batch`, cursor range, rows, and duration |
+| `auth.login`, `auth.logout`, `admin.*`, `migration.draft.*`, `migration.review.*`, `migration.action.*`, `migration.plan.analyze`, `schema.compare` | info, warn | A state-changing action finished, with `outcome` (`succeeded`, `failed`, or `denied`), `status`, and the route IDs under `target` |
+| `auth.session.rejected`, `auth.csrf.rejected`, `access.denied` | info, warn | A missing or invalid session, a failed CSRF or origin check, or a missing database or administrator permission |
+
+Correlation attributes are added automatically:
+
+- `request_id` on every record of one request.
+- `trace_id` and `span_id` of the active span.
+- `actor_id` and `actor` once the session is authenticated.
+- `database_id` from the access check, or from the route for connection and grant administration.
+- `migration_id`, `execution_id`, `version`, and `attempt` during migration execution.
+- `job_id`, `worker_id`, and `batch` in the worker.
+
+`db` is `platform` or `target`, and `query_id` pairs each `sql.start` with its result. Platform pools, target pools (viewer, EXPLAIN, migrations, connection tests), schema comparison snapshots, and goose platform migrations are traced through a `pgx` query tracer.
+
+Redaction:
+
+- Attributes whose key mentions a password, secret, token, cookie, CSRF, session identifier, DSN, or ciphertext become `[REDACTED]`.
+- Connection URL credentials, `password=` pairs, and SQL `PASSWORD '...'` literals are masked in every value and in span query text.
+- All parameters are masked when a statement touches credentials or sessions. Binary values are logged only by length.
+- PostgreSQL detail lines, which can contain row values, are never logged.
+- SQL is truncated at 4 KiB and each parameter at 256 bytes.
+
+#### Tracing
+
+OpenTelemetry tracing (`backend/internal/tracing`) is always on in the API and the worker. One queued migration produces one trace across both processes:
+
+1. An `HTTP <METHOD> <route>` server span in the API, continuing an incoming W3C `traceparent` header.
+2. The enqueue handler stores that span's `traceparent` with the job (`Tracing.Inject`).
+3. The worker continues it (`Tracing.Extract`) with a consumer span `migration.job <action>`. It records `job_id`, `worker_id`, `attempt`, and `queue.wait_ms`.
+4. `migration.lock`, with `migration.lock.acquire` measuring the lock wait.
+5. `migration.execute`, recording migration and execution IDs, kind, direction, attempt, and the final status.
+6. One `migration.batch` span per batch, with batch number and cursor range.
+7. A client span per SQL statement (`sql SELECT`, `sql BEGIN`, `sql UPDATE`, `sql COMMIT`, …) with `db.query.text`, `db.response.rows`, and `db.response.status_code` (SQLSTATE).
+
+Failures set the span status to error with a safe message.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `OTEL_TRACES_EXPORTER` | `console` | `console` writes JSON spans to stderr, `otlp` sends OTLP/HTTP, `none` keeps trace IDs in logs without exporting spans (quieter local runs) |
+| `OTEL_LOGS_EXPORTER` | `none` | `otlp` also ships every log record (same redaction and level) to the Collector with its trace and span IDs |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4318` | Collector endpoint for `otlp` traces and logs |
+| `OTEL_SERVICE_NAME` | `wbd-api` (API), `wbd-worker` (worker) | `service.name` resource attribute; leave unset so the two processes stay distinguishable |
+
+Sample log records captured from a local run, in time order: a forward migration (lock, execution, target SQL, commit, activity), then a failing EXPLAIN request. UUIDs are shortened and the request ID host is replaced.
+
+```json
+{"time":"2026-11-23T18:15:47.415395+07:00","level":"INFO","msg":"migration lock acquired","event":"migration.lock.acquired","database_id":"7288ccc1-…","wait_ms":0.323,"trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"5f8abd93b9a2edb5","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","migration_id":"193909ec-…"}
+{"time":"2026-11-23T18:15:47.427082+07:00","level":"INFO","msg":"migration execution started","event":"migration.execution.started","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"revision":1,"kind":"forward","direction":"up","attempt":1,"sql":"CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"85b0c50f3d04e8d4","request_id":"host/etZhqJPnIk-000021"}
+{"time":"2026-11-23T18:15:47.442016+07:00","level":"INFO","msg":"sql statement finished","event":"sql.finish","db":"target","query_id":148,"duration_ms":5.249,"sql":"DO LANGUAGE plpgsql 'BEGIN EXECUTE ''CREATE TABLE demo.logging_demo (id integer PRIMARY KEY)''; END'","status":"ok","rows":0,"command":"DO","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"518ad095620387d2","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"attempt":1}
+{"time":"2026-11-23T18:15:47.442565+07:00","level":"INFO","msg":"sql transaction committed","event":"sql.commit","db":"target","query_id":149,"duration_ms":0.483,"status":"ok","rows":0,"command":"COMMIT","trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"4dd7f52af5e037f9","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…","migration_id":"193909ec-…","execution_id":"b0e19c7c-…","version":1,"attempt":1}
+{"time":"2026-11-23T18:15:47.448188+07:00","level":"INFO","msg":"migration.action.forward","event":"migration.action.forward","outcome":"succeeded","status":200,"target":{"dbID":"7288ccc1-…","migrationID":"193909ec-…"},"trace_id":"89c2c8edd9f1a3acb46f4a0907180a4c","span_id":"e9f2af90ad0cf833","request_id":"host/etZhqJPnIk-000021","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+{"time":"2026-11-23T18:17:41.921575+07:00","level":"ERROR","msg":"sql statement failed","event":"sql.finish","db":"target","query_id":51,"duration_ms":0.678,"sql":"EXPLAIN (ANALYZE, COSTS, VERBOSE, BUFFERS, FORMAT JSON) SELECT * FROM demo.missing_table","status":"error","sqlstate":"42P01","error":"relation \"demo.missing_table\" does not exist","trace_id":"dfe14e609b85b4bc3bb33f9fa853d4aa","span_id":"157079a1fa300720","request_id":"host/MiE29545E9-000012","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+{"time":"2026-11-23T18:17:41.922058+07:00","level":"WARN","msg":"http request completed","event":"http.request","method":"POST","route":"/api/databases/{dbID}/migrations/analyze","status":422,"bytes":93,"duration_ms":12.436,"trace_id":"dfe14e609b85b4bc3bb33f9fa853d4aa","span_id":"3c5a960783f5f892","request_id":"host/MiE29545E9-000012","actor_id":"1706297c-…","actor":"admin","database_id":"7288ccc1-…"}
+```
+
+Sample spans from the console exporter, trimmed to the main fields: a viewer request and its row query. `SpanKind` 2 is server and 3 is client. The SQL span's `Parent.SpanID` is the HTTP span.
+
+```json
+[
+  {
+    "Name": "HTTP GET /api/databases/{id}/tables/{table}/rows",
+    "SpanContext": {
+      "TraceID": "9fae9c7bd6a878dbf886cabcc2b24518",
+      "SpanID": "04f640a8bc964308"
+    },
+    "Parent": {
+      "SpanID": "0000000000000000"
+    },
+    "SpanKind": 2,
+    "StartTime": "2026-11-23T18:17:10.814532+07:00",
+    "EndTime": "2026-11-23T18:17:10.842979791+07:00",
+    "Attributes": [
+      {
+        "Key": "http.request.method",
+        "Value": "GET"
+      },
+      {
+        "Key": "url.path",
+        "Value": "/api/databases/7288ccc1-1ca1-419e-882a-8d1c885f031c/tables/movies/rows"
+      },
+      {
+        "Key": "http.route",
+        "Value": "/api/databases/{id}/tables/{table}/rows"
+      },
+      {
+        "Key": "http.response.status_code",
+        "Value": 200
+      }
+    ],
+    "Status": {
+      "Code": "Unset",
+      "Description": ""
+    },
+    "Resource": [
+      {
+        "Key": "service.name",
+        "Value": {
+          "Type": "STRING",
+          "Value": "wbd-api"
+        }
+      }
+    ]
+  },
+  {
+    "Name": "sql SELECT",
+    "SpanContext": {
+      "TraceID": "9fae9c7bd6a878dbf886cabcc2b24518",
+      "SpanID": "2325ebab4d6c9cf9"
+    },
+    "Parent": {
+      "SpanID": "04f640a8bc964308"
+    },
+    "SpanKind": 3,
+    "StartTime": "2026-11-23T18:17:10.841588+07:00",
+    "EndTime": "2026-11-23T18:17:10.842579958+07:00",
+    "Attributes": [
+      {
+        "Key": "db.system.name",
+        "Value": "postgresql"
+      },
+      {
+        "Key": "db.namespace",
+        "Value": "target"
+      },
+      {
+        "Key": "db.operation.name",
+        "Value": "SELECT"
+      },
+      {
+        "Key": "db.query.text",
+        "Value": "SELECT browse_row.* FROM \"demo\".\"movies\" AS browse_row ORDER BY \"browse_row\".\"id\", ROW(browse_row.*)::text COLLATE \"C\" LIMIT $1 OFFSET $2"
+      },
+      {
+        "Key": "query_id",
+        "Value": 28
+      },
+      {
+        "Key": "db.response.rows",
+        "Value": 2
+      }
+    ],
+    "Status": {
+      "Code": "Unset",
+      "Description": ""
+    },
+    "Resource": [
+      {
+        "Key": "service.name",
+        "Value": {
+          "Type": "STRING",
+          "Value": "wbd-api"
+        }
+      }
+    ]
+  }
+]
+```
+
+#### Central collection (Collector, Tempo, Loki)
+
+Follow [Grafana and OpenTelemetry Collector](#grafana-and-opentelemetry-collector) to run the API and worker with OTLP export. Traces go to Tempo and logs go to Loki. Each record keeps the same redaction as stdout and arrives with its trace and span IDs. The Collector removes SQL attributes before storage.
+
+To correlate, copy a `trace_id` from any log line. Open it in Grafana Explore → Tempo, or run this query in Explore → Loki:
+
+```logql
+{service_name=~"wbd-api|wbd-worker"} | trace_id = "<trace_id>"
+```
+
+Filter by service or event to find the enqueue or completion record when the trace has many log entries.
+
+Local check (batch migration, 12 rows, batch size 5, forwarded through the queue):
+
+- Tempo returned one trace of 85 spans across `wbd-api` (14) and `wbd-worker` (71). Its chain is `HTTP POST …/forward` → `migration.job forward` → `migration.lock` → `migration.execute` → `migration.batch` → `sql UPDATE`.
+- Loki returned 163 log records with the same `trace_id` (28 from the API, 135 from the worker): `http.request`, `migration.action.forward`, `migration.job.claimed` / `.succeeded`, `migration.lock.acquired` / `.released`, `migration.execution.started` / `.succeeded`, three `migration.batch.committed`, and the SQL events.
+- No `sql` or `password` attribute was stored.
+
+### Prometheus Metrics
+
+Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
+With the default address, verify the response using `curl -fsS http://127.0.0.1:8080/api/metrics`.
+The metrics endpoint is unauthenticated; bind the API to a trusted internal interface or
+place it behind an authenticated reverse proxy when exposing it beyond localhost.
+The endpoint is disabled by default. When enabled, restrict access to the monitoring network.
+
+| Metric | Meaning |
+| --- | --- |
+| `wbd_migration_jobs{status}` | Retained queue records by status, including jobs without an execution yet |
+| `wbd_migration_retry_jobs` | Retained jobs explicitly requested as retries |
+| `wbd_migration_retry_attempts` | Additional worker attempts across retained jobs |
+| `wbd_migration_execution_mean_seconds` | Mean duration of retained executions with start and finish timestamps |
+| `wbd_migration_queue_wait_mean_seconds` | Mean time from eligibility to the latest recorded worker claim |
+| `wbd_migration_lock_wait_max_seconds` | Longest current wait for a migration advisory lock |
+| `wbd_migration_batches_processed{direction}` | Retained batches applied (`up`) or reverted (`down`) |
+| `wbd_migration_rows_processed{direction}` | Rows applied (`up`) or reverted (`down`) in retained batches |
+| `wbd_platform_pool_connections{state}` | Active and idle PostgreSQL connections in the platform pool |
+| `wbd_platform_pool_wait_seconds_total` | Cumulative wait in seconds for successful acquisitions from the empty platform pool |
+| `wbd_platform_pool_waited_acquires_total` | Successful acquisitions that waited for the pool |
+
+Job and batch counts are snapshots of the migration store and reflect record removal. Queue wait excludes retry backoff and appears when a worker has a recorded claim. Lock wait measures ongoing contention at scrape time. Pool wait counters reset on API restart. Divide their rates to graph mean wait per delayed acquisition.
+
+Sample `GET /api/metrics` output (after an approved batch migration of 12 rows with batch size 5):
+
+```prometheus
+# HELP wbd_migration_jobs Retained worker jobs by status.
+# TYPE wbd_migration_jobs gauge
+wbd_migration_jobs{status="queued"} 0
+wbd_migration_jobs{status="running"} 0
+wbd_migration_jobs{status="succeeded"} 1
+wbd_migration_jobs{status="failed"} 0
+wbd_migration_jobs{status="cancelled"} 0
+# HELP wbd_migration_retry_jobs Retained jobs explicitly requested as retries.
+# TYPE wbd_migration_retry_jobs gauge
+wbd_migration_retry_jobs 0
+# HELP wbd_migration_retry_attempts Automatic retry attempts across retained jobs.
+# TYPE wbd_migration_retry_attempts gauge
+wbd_migration_retry_attempts 0
+# HELP wbd_migration_execution_mean_seconds Mean execution duration across retained jobs with start and finish timestamps.
+# TYPE wbd_migration_execution_mean_seconds gauge
+wbd_migration_execution_mean_seconds 0.042
+# HELP wbd_migration_lock_wait_max_seconds Longest current wait for a migration advisory lock.
+# TYPE wbd_migration_lock_wait_max_seconds gauge
+wbd_migration_lock_wait_max_seconds 0
+# HELP wbd_migration_batches_processed Batches applied or reverted across retained executions.
+# TYPE wbd_migration_batches_processed gauge
+wbd_migration_batches_processed{direction="up"} 3
+wbd_migration_batches_processed{direction="down"} 0
+# HELP wbd_migration_rows_processed Rows applied or reverted across retained batches.
+# TYPE wbd_migration_rows_processed gauge
+wbd_migration_rows_processed{direction="up"} 12
+wbd_migration_rows_processed{direction="down"} 0
+# HELP wbd_platform_pool_connections Connections currently checked out or idle in the platform pool.
+# TYPE wbd_platform_pool_connections gauge
+wbd_platform_pool_connections{state="active"} 1
+wbd_platform_pool_connections{state="idle"} 3
+# HELP wbd_platform_pool_wait_seconds_total Time spent waiting for successful acquisitions from an empty platform pool.
+# TYPE wbd_platform_pool_wait_seconds_total counter
+wbd_platform_pool_wait_seconds_total 0
+# HELP wbd_platform_pool_waited_acquires_total Successful acquisitions that waited for an empty platform pool.
+# TYPE wbd_platform_pool_waited_acquires_total counter
+wbd_platform_pool_waited_acquires_total 0
+# HELP wbd_migration_queue_wait_mean_seconds Mean time from eligibility to latest recorded worker claim across retained jobs.
+# TYPE wbd_migration_queue_wait_mean_seconds gauge
+wbd_migration_queue_wait_mean_seconds 0.018
+```
+
+### Grafana and OpenTelemetry Collector
+
+With the local PostgreSQL databases running, start the optional monitoring stack from the repository root.
+
+```sh
+mkdir -p observability/logs
+touch observability/logs/api.log observability/logs/worker.log
+docker compose -f docker-compose.observability.yml up -d --wait
+```
+
+Start the API and worker in separate terminals with OTLP export for traces and logs.
+
+```sh
+make dev-api METRICS_ENABLED=true OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+```sh
+make dev-worker OTEL_TRACES_EXPORTER=otlp OTEL_LOGS_EXPORTER=otlp OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318
+```
+
+For file-based log collection, set `OTEL_LOGS_EXPORTER=none` on those commands and pipe stdout to `tee -a observability/logs/api.log` and `tee -a observability/logs/worker.log` respectively. Select one log export path per process to keep one copy of each record.
+
+On native Linux Docker, append `HTTP_ADDR=0.0.0.0:8080` to the API command on a trusted development network so Prometheus can reach the host listener through the Docker bridge. If the API listens on another port, update the scrape target in `observability/prometheus.yml`.
+
+1. Check the `wbd-api` scrape target at [Prometheus Targets](http://127.0.0.1:9090/targets).
+2. Open [WBD Migration Observability](http://127.0.0.1:3000/d/wbd-migrations/wbd-migration-observability) with the local Grafana credentials `admin` / `admin`. Run an approved batch migration and check the job, queue wait, batch, and row panels.
+3. Open Grafana Explore with Loki and run `{service_name="wbd-worker"} | event = "migration.job.succeeded"` to see the corresponding worker completion event.
+
+The Collector accepts OTLP/HTTP on port 4318 and OTLP/gRPC on port 4317. It sends traces to Tempo and logs to Loki. To verify correlation independently of application instrumentation, run the demo below and paste its Loki query into Explore. Open the log's trace link to view the matching `observability.demo` span in Tempo. The demo emits synthetic telemetry and leaves application metrics unchanged.
+
+```sh
+sh observability/demo.sh
+```
+
+Stop the monitoring stack with `docker compose -f docker-compose.observability.yml down`.
 
 ## Local Databases
 
@@ -101,6 +404,24 @@ Target connections currently force `sslmode=disable`; a target that only accepts
 
 `make seed-large` creates `batch_demo.movies` in `target-db-large` (`TARGET_DATABASE_URL_3`): a generated movie catalog with `SEED_LARGE_ROWS` rows (default 2,000,000), then times one unbatched `UPDATE batch_demo.movies SET views = views + 1`. Re-running skips the insert unless `SEED_LARGE_FORCE=true`, which truncates and reseeds. All seeds are idempotent and use `ON CONFLICT (id) DO NOTHING` for the curated lists.
 
+### Batch Dataset Measurement
+
+The required large-dataset check was run on the local Compose target with
+`SEED_LARGE_ROWS=2000000` and a batch size of 10,000:
+
+| Operation | Rows | Duration |
+| --- | --- | --- |
+| Unbatched `UPDATE batch_demo.movies SET views = views + 1` | 2,000,000 | 11.808s |
+| Batched apply (200 batches, each in its own transaction) | 2,000,000 | 23.522s |
+| Batched rollback in reverse batch order | 2,000,000 | 15.105s |
+
+This satisfies the requirement that one unbatched full-table update takes longer
+than one second in the test environment. The batch run uses the same table and
+dataset and reports 200 committed batches / 2,000,000 rows, then 200 reverted
+batches / 2,000,000 rows. Reproduce with `make seed-large` (and optionally
+`SEED_LARGE_ROWS`/`SEED_LARGE_FORCE`) plus a batch migration using the SQL form
+described above.
+
 ## Validation
 
 ```sh
@@ -119,9 +440,25 @@ Install Chromium once, start the API and frontend in separate terminals, and run
 make test-e2e
 ```
 
-The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
+The browser suite uses `APP_ORIGIN`, `TARGET_DATABASE_URL`, `TEST_DATABASE_URL`, and the bootstrap administrator credentials loaded by Make. Run `make dev-worker` alongside the API and frontend so queued migration actions finish. It requires the existing administrator's actual password, a local development application, and two distinct local PostgreSQL databases. Run `make db-test-up` before the schema comparison test. It creates temporary users, groups, connections, and uniquely named schemas, then removes them. Existing target tables are not used. If a migration outcome remains uncertain, the fixture is preserved for reconciliation instead of being retried or deleted.
 
 Chromium exercises administrator user/group/membership/grant forms, real login, group-based access, the SQL editor, commit, rollback, history, inspection of quoted names, session revocation, logout, and schema comparison through editable generated SQL and execution. Traces and video are disabled; screenshots of the viewer and schema comparison are saved under the ignored `frontend/test-results/` directory. These tests run separately from `make check` and do not replace backend integration tests.
+
+`e2e/responsive.spec.ts` signs in as the administrator at 360 px, 820 px, and 1440 px widths. It checks that no page scrolls horizontally, that the navigation drawer opens, closes with Escape, and navigates below 1024 px, and that the workspace, viewer, migration, and administration pages render without page errors. It only reads data.
+
+## Frontend
+
+The SPA is React with TanStack Query and React Router. All pages, including sign-in and administration, share one shell: a fixed sidebar on wide screens that becomes a slide-in drawer at 1024 px and below. Wide tables, SQL editors, and plans scroll inside their own containers, so the page itself never scrolls horizontally.
+
+| Path | Purpose |
+| --- | --- |
+| `frontend/src/styles/tokens.css` | Color, radius, shadow, and spacing tokens |
+| `frontend/src/styles/components.css` | Buttons, form controls, cards, tables, badges, notices, tabs, dialogs |
+| `frontend/src/styles/layout.css` | App shell, drawer, page header, sign-in, database cards |
+| `frontend/src/ui/` | Shared components: icons, cards, feedback, confirmation dialog |
+| `frontend/src/layout/` | App shell and database section tabs |
+
+Fonts (Inter and Geist Mono, OFL) are self-hosted through `@fontsource-variable` packages and embedded in the binary; the app makes no external font requests. Migration actions and destructive admin actions ask for confirmation in an in-app dialog.
 
 ## Production Build
 
@@ -166,7 +503,15 @@ Deleting a connection also deletes its platform grants and migration history; it
 
 ## Target Database Migrations
 
-Target database migrations represent ordered, linear schema and data modifications executed on managed target PostgreSQL databases.
+Target database migrations are ordered, linear changes with immutable up/down SQL.
+A reversible migration requires down SQL; an irreversible migration requires a
+reason and cannot be rolled back. Definitions can be edited only before their first
+execution attempt; after that, corrections require a new migration.
+
+Every apply, rollback, forward, retry, success, and failure is stored as an
+execution with one or more attempts. The exact SQL snapshot is recorded on both the
+execution and the attempt, along with the version, revision, actor, timestamps,
+status, and error category. Application logs are separate and go to stdout/stderr.
 
 ### Endpoints
 
@@ -177,11 +522,119 @@ Target database migrations represent ordered, linear schema and data modificatio
 | `GET` | `/api/databases/{dbId}/migrations/{id}` | View Only / View + Edit |
 | `PUT` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
+| `GET` | `/api/databases/{dbId}/migrations/history?hide_rollback=false` | View Only / View + Edit |
+| `GET` | `/api/databases/{dbId}/jobs?limit=10` | View Only / View + Edit |
+| `GET` | `/api/databases/{dbId}/jobs/{jobId}` | View Only / View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/apply` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/rollback` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/forward` | View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/retry` | View + Edit |
+| `GET` | `/api/databases/{dbId}/migrations/{id}/executions/{executionId}/evidence` | View Only / View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile` | Platform Admin + View + Edit |
 
-Migration mutations and execution are serialized per target database using session advisory locks. SQL runs in an atomic block inside a target transaction; confirmed rollback records a generic error. The platform persists `pending` before execution. If commit or result recording is uncertain, it keeps that status and blocks retry until the target outcome is verified and the record reconciled. See the execution model in `docs/api.md` for version ordering and recovery rules.
+Action endpoints return `202 Accepted` with a migration job. The worker claims one
+job at a time per database, revalidates the action under a cross-worker advisory
+lock, executes it, and records the execution ID and final job status. Only the last
+active reversible migration can be rolled back. Forward is limited to the next
+version after the highest applied version and never runs subsequent migrations
+automatically. Retry repeats the latest failed execution snapshot. A failed
+rollback or forward rolls back its own transaction, so the migration keeps its
+previous state (still applied, or still rolled back); the action can be retried or
+requested again later, and later migrations stay blocked while an earlier one is
+rolled back. Hide rollback removes a successful rollback execution and the execution
+it cancelled, paired by execution ID; failed attempts remain visible.
 
-See [`docs/api.md`](docs/api.md) for detailed request, response, and error specifications.
+History is append-only at the attempt level: every attempt row keeps its own SQL
+snapshot, actor, timestamps, status, and error, and is never rewritten. An execution
+row is a state machine (`queued → running → succeeded | failed | partial |
+partially_reverted`). Resuming a batch execution from its checkpoint adds a new
+attempt to the same execution instead of starting over, so the committed batch
+counters stay continuous.
+
+Batch mode executes a cursor-based statement once per batch, each in its own target
+transaction. The up script receives `$1` as the cursor and `$2` as the batch size and
+must return the cursor column; `down_sql` receives `$1` as `cursor_to` and `$2` as
+`cursor_from`. Committed batches and rows are recorded, a later failure leaves the
+execution `partial`, retry resumes from the checkpoint, and rollback compensates
+committed batches in reverse order. The worker writes a target-side evidence row in
+each batch transaction so a lost platform record can be reconciled. See the sample
+large dataset from `make seed-large`.
+
+SQL runs atomically inside a target transaction. Confirmed failure records a generic
+error and preserves history. Jobs and executions survive restarts. A worker that
+loses its lease before recording a result leaves the job failed as uncertain; the
+execution remains running/pending and blocks further actions until the target
+outcome is verified. Duplicate delivery cannot commit twice because the execution
+gate rejects a second run once an execution exists. See [`docs/api.md`](docs/api.md)
+for the full execution model and error specifications.
+
+### Approvals, Timeouts, and Recovery
+
+Every apply, rollback, forward, and retry action requires a review approved by the
+leader of every group with any access to the database. Review identity includes the
+migration revision, action, and previous execution; editing the definition or the
+previous execution invalidates the review. Approvals are checked when the action is
+enqueued, when the execution is created, and again when the worker retries.
+
+Worker executions use `WORKER_EXECUTION_TIMEOUT` (default `30m`), independent of the
+API timeout. While a job runs, the worker renews its lease every third of
+`WORKER_LEASE`, so another worker does not expire a legitimately long migration. A
+statement cancelled by its deadline is rolled back with a fresh cleanup context and
+recorded as a confirmed `execution_timeout` failure; later migrations are not
+blocked.
+
+#### Lock recovery when a worker fails
+
+The per-database lock is a PostgreSQL session advisory lock held on one platform
+connection for the whole execution, including the gaps between batch commits. If the
+worker process dies, its connection closes and PostgreSQL releases the lock; if the
+worker host or network disappears instead, the platform session's TCP keepalives
+(30 s idle, then 3 probes 10 s apart, set by `Store.Open`) end the session within
+about a minute. Nothing needs to be unlocked by hand. Its job stays `running` until the
+lease (`WORKER_LEASE`, renewed by a heartbeat while the worker is alive) expires, then
+the next worker marks it failed and links it to the stuck execution. Because the
+execution itself is still `running`, every later action on that database returns
+`409 execution_pending` until the outcome is reconciled. A target transaction that
+never received `COMMIT` is rolled back by PostgreSQL when its connection drops.
+
+#### Reconciling an uncertain execution
+
+Normal executions write a target-side evidence row (`platform_migration.batches`,
+`batch_no = 0`) in the same transaction as the change, and batch executions write one
+per batch, so the outcome of a lost commit can be checked on the target. In the SPA,
+open the execution in the history; a platform administrator with View + Edit on the
+database sees the target evidence and a single reconcile action:
+
+- **Normal mode:** evidence present → `succeeded`; no evidence → `failed`. The API
+  (`POST /api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile`
+  with `{"outcome":"succeeded"|"failed","note":"..."}`) rejects an outcome that
+  contradicts the evidence with `409 evidence_mismatch`.
+- **Batch mode:** the execution stops at its checkpoint (`partial`,
+  `partially_reverted`, or `failed` when nothing committed). A retry then reads the
+  evidence of the uncertain batch, records it if it committed, and continues without
+  repeating committed batches. `succeeded` is rejected with `409 batch_reconcile`.
+
+Reconciliation takes the database lock without waiting and refuses with
+`409 database_busy` while a worker still holds it or a job lease is still live. It
+closes open attempts, settles the execution, stamps the latest job of the migration
+(`reconciled_at`, `reconciled_by`) without rewriting its status, records the note,
+and refreshes the migration status. It only records a verified outcome and never runs
+SQL on the target, so it does not need a new approval; the retry that follows does.
+
+#### Approval changes after submission
+
+Review groups are computed live from the current grants and leaders. A group that
+gains access after a review was approved must approve before the action can run; a
+group that loses access no longer counts; replacing a leader requires the new leader
+to approve; a group without an active leader blocks the action until one is
+assigned. Approval is checked again when the job is enqueued, when the execution is
+created, and when the worker retries.
+
+Worker configuration: `WORKER_ID` overrides the generated worker identity,
+`WORKER_EXECUTION_TIMEOUT` controls execution time (default `30m`), `WORKER_LEASE`
+controls the claim lease (default `2m`), and `WORKER_POLL` controls idle polling
+(default `2s`). The production build creates both `bin/server` and `bin/worker`.
 
 ## Query Execution Plan Analysis
 
@@ -306,3 +759,158 @@ The administration UI is available at `/admin` for platform administrators:
 | `/admin/connections` | Add, edit, test, and remove target connections |
 
 The admin API is under `/api/admin` and every route requires an authenticated platform administrator. Creating or promoting administrators is not supported through the API. Deactivating or deleting the last active administrator is rejected with `last_admin`.
+
+## Stress Testing with k6
+
+Stress testing is implemented with [Grafana k6](https://k6.io/) in [`k6/stress.js`](k6/stress.js) to evaluate API latency, throughput, queue wait time, asynchronous migration completion, same-database contention, multi-database parallelism, and post-peak system recovery.
+
+### Script Overview
+
+[`k6/stress.js`](k6/stress.js) runs two concurrent `ramping-vus` scenarios across four load stages (**Normal → Stress → Peak → Recovery**, total `3m10s` plus graceful ramp-down):
+
+1. **`api_stress` (0 → 10 → 40 → 80 → 10 → 0 VUs):**
+   Continuously exercises authenticated read endpoints (`GET /api/databases`, `GET /api/databases/{dbId}/migrations`, `GET /api/databases/{dbId}/migrations/history`, and `GET /api/databases/{dbId}/schemas`) across both target databases.
+2. **`migration_jobs` (0 → 2 → 6 → 12 → 2 → 0 VUs):**
+   In `setup()`, the script authenticates as the bootstrap administrator, ensures the group leader is assigned, selects two target databases (`local-target` and `local-target_b`), and clears any unexecuted leftover drafts. During the test, VUs distribute across both databases (`__VU % 2`): at 2 VUs both databases run in parallel without contention; at 6 and 12 VUs multiple VUs contend on the **same database** while other VUs execute concurrently on a **different database**. Each iteration:
+   - Creates a reversible migration draft (`SELECT 1;`), submits an `apply` review, and approves it as the group leader.
+   - Submits the approved migration via `POST /api/databases/{dbId}/migrations/{id}/apply` (retrying briefly on expected `409` same-database active-job / linear-order contention, tracked separately as `migration_same_db_conflicts`).
+   - Polls `GET /api/databases/{dbId}/jobs/{jobId}` every `150ms` until the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`). A `202 Accepted` enqueue response is **not** counted as migration success; only jobs reaching `status === "succeeded"` are counted.
+   - Computes server-side **queue wait** (`locked_at - created_at`) and **job completion duration** (`finished_at - created_at`) directly from job timestamps.
+
+### Thresholds & How to Run
+
+Configured k6 thresholds:
+
+- `api_response_time_ms`: `p(95) < 500` ms
+- `api_error_rate`: `rate < 0.05` (`< 5%`)
+- `migration_job_success_rate`: `rate > 0.95` (`> 95%`)
+
+Run locally against the API server and two asynchronous workers:
+
+```sh
+make db-up && make bootstrap && make seed-dev
+make build
+
+# Terminal 1 (API)
+set -a && . ./.env && set +a && LOG_LEVEL=warn ./bin/server
+
+# Terminal 2 & 3 (2 parallel workers)
+set -a && . ./.env && set +a && WORKER_ID=worker-1 WORKER_POLL=100ms LOG_LEVEL=warn ./bin/worker
+set -a && . ./.env && set +a && WORKER_ID=worker-2 WORKER_POLL=100ms LOG_LEVEL=warn ./bin/worker
+
+# Terminal 4 (k6 stress test)
+set -a && . ./.env && set +a && k6 run k6/stress.js
+```
+
+### Results (2 Target Databases, 2 Workers, `WORKER_POLL=100ms`)
+
+Overall run summary (`190.3s` total):
+
+- **Total HTTP Requests:** `24,521` (`128.84 req/s`)
+- **API Response Time:** `p50 = 137.01 ms`, `p95 = 601.48 ms` *(crossed `500 ms` threshold at Peak load — see analysis)*
+- **API Error Rate:** `0.000%` *(passed `< 5%` threshold)*
+- **Migration Jobs:** `713` submitted, `713` succeeded (`100.0%`, passed `> 95%` threshold), `0` failed (`3.75 jobs/s` overall)
+- **Same-DB `409` Contention:** `501` expected conflicts
+- **Queue Wait:** `p50 = 52.00 ms`, `p95 = 121.40 ms`
+- **Job Completion Duration:** `p50 = 158.00 ms`, `p95 = 379.80 ms`
+
+| Stage | VUs (API + Jobs) | Window | API Reqs (req/s) | API p50 (ms) | API p95 (ms) | API Error (%) | Queue Wait p50 / p95 (ms) | Job Dur p50 / p95 (ms) | Jobs Done (jobs/s) | 409 Conflicts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Normal** | `10 + 2` | 45s | `3,682` (`81.8`) | `15.70` | `35.59` | `0.00%` | `37.00` / `85.00` | `93.00` / `151.00` | `283` (`6.29`) | `0` |
+| **Stress** | `40 + 6` | 45s | `6,983` (`155.2`) | `122.80` | `293.25` | `0.00%` | `66.00` / `128.70` | `246.00` / `394.10` | `167` (`3.71`) | `145` |
+| **Peak** | `80 + 12` | 45s | `6,460` (`143.6`) | `443.24` | `718.23` | `0.00%` | `83.00` / `140.90` | `295.00` / `421.00` | `83` (`1.84`) | `289` |
+| **Recovery** | `10 + 2` → `0` | 55s | `4,235` (`77.0`) | `63.36` | `564.21` | `0.00%` | `52.50` / `129.15` | `195.00` / `398.40` | `180` (`3.27`) | `67` |
+
+### Analysis per Load Level
+
+1. **Normal (`10` API VUs + `2` Job VUs):**
+   The platform easily stays within SLA (`p50 = 15.70 ms`, `p95 = 35.59 ms`, `0.00%` errors). Because each job VU targets a different database and two workers run in parallel, there are `0` same-DB conflicts and job throughput peaks at `6.29 jobs/s` (`283` completed jobs, `p50` queue wait `37 ms` within the `100 ms` poll interval).
+2. **Stress (`40` API VUs + `6` Job VUs):**
+   API throughput nearly doubles to `155.2 req/s` with `p95 = 293.25 ms` (still well under the `500 ms` threshold) and `0.00%` errors. With 3 job VUs contending per database, same-DB serialization triggers `145` expected `409` conflicts, increasing median queue wait to `66 ms` and job completion duration to `246 ms` (`3.71 jobs/s`).
+3. **Peak (`80` API VUs + `12` Job VUs):**
+   The system reaches its saturation knee: API throughput plateaus/dips slightly to `143.6 req/s` while `p50` rises to `443.24 ms` and `p95` reaches `718.23 ms`, crossing the `500 ms` `p95` threshold. The primary bottlenecks are platform PostgreSQL connection pool contention (`pgxpool` default `MaxConns`) shared across 92 concurrent VUs plus heavier `GET /migrations` and `/migrations/history` reads as the history table grows past 600+ executions, along with `289` same-DB `409` conflicts from 6 VUs per database competing for linear execution order. Crucially, the system degrades gracefully: **`0.00%` API errors**, **`0` failed jobs**, and no stuck locks or double commits.
+4. **Recovery (`80 → 10` API VUs, `12 → 2` Job VUs):**
+   As load drops back to normal, the system recovers automatically without intervention: median API latency drops **7×** (`443.24 ms → 63.36 ms`; `p95` remains `564.21 ms` only because of the 15-second ramp-down tail from 80 to 10 VUs), queue wait drops (`83 ms → 52.5 ms`), job duration drops (`295 ms → 195 ms`), and job throughput rebounds to `3.27 jobs/s` (`180` jobs completed, `0` failures).
+
+### Re-run After the Reconciliation Fixes
+
+The stress test was repeated on `dev` after the worker timeout, heartbeat, and
+reconciliation changes, using the same build, two workers (`WORKER_POLL=100ms`), and
+`k6/stress.js` unchanged. k6 ran in Docker (`grafana/k6:0.54.0`) against
+`BASE_URL=http://host.docker.internal:8080` with `APP_ORIGIN=http://127.0.0.1:5173`;
+the target databases were `local-target` and `Schema Diff Demo Current`. All three
+thresholds passed (k6 exit code `0`).
+
+- **Total HTTP Requests:** `46,689` (`245.39 req/s`) over `190.3s`
+- **API Response Time:** `p50 = 27.59 ms`, `p95 = 207.70 ms` (passed `< 500 ms`)
+- **API Error Rate:** `0.000%` (passed `< 5%`)
+- **Migration Jobs:** `1,451` submitted, `1,451` succeeded (`100%`, passed `> 95%`), `7.63 jobs/s`
+- **Same-DB `409` Contention:** `1,371` expected conflicts
+- **Queue Wait:** `p50 = 40 ms`, `p95 = 92 ms`; **Job Duration:** `p50 = 86 ms`, `p95 = 182.5 ms`
+
+| Stage | Window | API Reqs (req/s) | API p50 (ms) | API p95 (ms) | API Error (%) | Queue Wait p50 / p95 (ms) | Job Dur p50 / p95 (ms) | Jobs Done (jobs/s) | 409 Conflicts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Normal** | 45s | `4,178` (`92.8`) | `6.28` | `12.59` | `0.00%` | `36.00` / `89.90` | `61.00` / `112.00` | `383` (`8.51`) | `0` |
+| **Stress** | 45s | `13,639` (`303.1`) | `18.05` | `51.25` | `0.00%` | `40.00` / `90.80` | `100.00` / `171.60` | `385` (`8.56`) | `485` |
+| **Peak** | 45s | `14,518` (`322.6`) | `136.48` | `237.21` | `0.00%` | `53.00` / `107.00` | `161.00` / `223.35` | `194` (`4.31`) | `700` |
+| **Recovery** | 55s | `7,865` (`143.0`) | `15.58` | `172.65` | `0.00%` | `35.00` / `88.60` | `68.00` / `140.00` | `489` (`8.89`) | `186` |
+
+The shape matches the first run: latency rises with load and peaks at the `80 + 12`
+VU stage, where job throughput halves because six VUs per database serialize on the
+one-active-job rule (`700` expected `409` responses), and it returns to normal levels
+in the recovery stage without errors, failed jobs, or stuck locks. Absolute numbers
+differ from the first run because the machine, network path (Docker), and database
+state differ; compare stages within one run rather than across runs.
+
+## Security: SAST with CodeQL
+
+Static Application Security Testing (SAST) is automated via GitHub Actions in [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) using GitHub CodeQL (`+security-extended` query suite).
+
+### Analysis Scope
+
+| Language | Build Mode | Scope Analyzed | Ignored Paths |
+| --- | --- | --- | --- |
+| `go` | `manual` (`go build ./...` in `backend/`) | All Go backend and worker packages (`backend/cmd/...`, `backend/internal/...`, `backend/migrations/...`) | `backend/internal/webui/dist` |
+| `javascript-typescript` | `none` | React SPA frontend (`frontend/src/...`, `frontend/tests/...`, `frontend/e2e/...`) | `frontend/dist`, `frontend/node_modules` |
+
+The workflow runs on `push` to `main`, `dev`, and `feat/codeql`, on `pull_request` to `main` and `dev`, and via manual `workflow_dispatch`. Results are uploaded to GitHub **Security → Code scanning** and also exported as SARIF artifacts (`codeql-sarif-go`, `codeql-sarif-javascript-typescript`) with a summary printed in the workflow logs.
+
+### Initial Scan Results & Findings Triage (Commit `98a96c9`)
+
+- **`javascript-typescript`:** `0` findings.
+- **`go`:** `6` findings (all `go/log-injection`, CWE-117, severity **Medium**, score `6.1`).
+
+| # | Rule (CWE) | Severity | Location | Potential Impact | Decision & Rationale | Fix Commit |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:75` | User-controlled `database_id` from HTTP route params logged on `migration.lock.failed`; unescaped CR/LF could forge log entries in line-oriented log consumers. | **Valid — Fixed.** Although `slog.JSONHandler` escapes newlines in JSON output, sanitizing CR/LF before logging provides defense-in-depth across all log handlers/OTLP exporters. | `0677e19` |
+| 2 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:78` | Same as #1, on `migration.lock.acquired`. | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 3 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:88` | Same as #1, on `migration.lock.released` (`connection_closed`). | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 4 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:92` | Same as #1, on `migration.lock.released` (`ok`). | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 5 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/logging/http.go:51` | Raw `R.URL.Path` logged as `route` on unmatched routes; attacker-controlled path could inject CR/LF into log entries. | **Valid — Fixed.** Sanitized `Route` with `SanitizeLogValue(Route)` before `Logger.LogAttrs`. | `0677e19` |
+| 6 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/logging/http.go:107` | Variadic `Args ...any` in `Logging.Record` forwarded user-controlled fields (e.g., `database_id`, `actor`) directly to `slog.Default().Log`. | **Valid — Fixed.** Normalized and sanitized `Event` and every attribute through `SanitizeLogValue` and logged via `slog.Default().LogAttrs`. | `0677e19`, `8fdff64` |
+
+### Remediation & Re-Scan Verification
+
+1. **Commit `0677e19`**: Added `Logging.SanitizeLogValue` in `backend/internal/logging/redact.go` to strip `\r` and `\n`, applied it in `backend/internal/migration/repository.go` and `backend/internal/logging/http.go`, and added unit test coverage in `backend/internal/logging/activity_test.go`. Re-scan reduced findings from **6 → 1** (alerts #1–#5 closed).
+2. **Commit `8fdff64`**: Updated `Logging.Record` in `backend/internal/logging/http.go` to convert all arguments into sanitized `slog.Attr` values via `LogAttrs`.
+3. **Final Re-Scan Result:**
+   - **`go`:** `0` findings (`go.sarif`: 0 findings; all 6 previous alerts closed in GitHub Code Scanning).
+   - **`javascript-typescript`:** `0` findings.
+   - All backend checks (`make check-fmt`, `make vet`, `go test -race ./...`) pass.
+
+### Follow-up Scan: Execution Reconciliation (PR #27)
+
+The reconciliation endpoint added in PR #27 raised `5` new findings on `dev`
+(alerts #8–#12), all in one log call of `Service.Reconcile`:
+
+| # | Rule (CWE) | Severity | Location | Potential Impact | Decision & Rationale | Fix |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8–10 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:932` | `database_id`, `migration_id`, and `execution_id` came straight from route parameters into the `migration.execution.reconciled` event. | **Valid — Fixed.** The event now logs the IDs of the execution read back from the platform database, passed through `Logging.SanitizeLogValue`. | `64a3546` |
+| 11–12 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:933` | `outcome` and the free-text `note` from the request body were logged verbatim. | **Valid — Fixed.** The event logs the resulting execution `status` and `note_length`; the note itself is stored only in the platform database (`reconcile_note`). | `64a3546` |
+
+**Re-scan:** the CodeQL run on PR #28 (merge ref `ecd0b61`) reported `0` findings for
+`go` (down from `5` on `dev` at `e41cbbc`) and `0` for `javascript-typescript`; GitHub
+closed alerts #8–#12 as fixed when PR #28 merged into `dev`. The same workflow then ran
+on `main` after the release merge.
+
+> **Note on SAST Limitations:** A clean CodeQL scan (`0` findings) does not guarantee that the application is completely free of security vulnerabilities. SAST analyzes source code statically against known patterns and data-flow rules, so it cannot replace runtime/dynamic testing (DAST), dependency auditing, authentication/authorization review, or proper deployment hardening.

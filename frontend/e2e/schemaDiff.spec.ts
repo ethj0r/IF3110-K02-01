@@ -1,5 +1,5 @@
 import { expect as Expect, test as Test } from '@playwright/test'
-import type { APIRequestContext, BrowserContext } from '@playwright/test'
+import type { APIRequestContext, BrowserContext, Locator, Page } from '@playwright/test'
 import { randomBytes as RandomBytes, randomUUID as RandomUUID } from 'node:crypto'
 
 interface RecordID { id: string }
@@ -69,11 +69,32 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     return Response.status() === 204 ? undefined as Value : await Response.json() as Value
   }
 
+  async function WaitJob(Database: RecordID, JobID: string) {
+    for (let Attempt = 0; Attempt < 60; Attempt++) {
+      const Job = await EditorAPI<{ id: string; status: string; last_error?: string }>(`/api/databases/${Database.id}/jobs/${JobID}`)
+      if (Job.status === 'succeeded') return
+      if (Job.status === 'failed' || Job.status === 'cancelled') throw new Error(`Migration job ${JobID} ended ${Job.status}: ${Job.last_error ?? ''}`)
+      await new Promise(Resolve => setTimeout(Resolve, 500))
+    }
+    throw new Error(`Migration job ${JobID} did not finish`)
+  }
+
   async function ExecuteSQL(Database: RecordID, SQL: string) {
     const Base = `/api/databases/${Database.id}/migrations`
-    const Draft = await EditorAPI<RecordID>(Base, 'POST', { title: 'Schema diff fixture', sql_text: SQL })
-    const Done = await EditorAPI<Migration>(`${Base}/${Draft.id}/execute`, 'POST')
-    Expect(Done.status).toBe('committed')
+    const Draft = await EditorAPI<RecordID>(Base, 'POST', { title: 'Schema diff fixture', sql_text: SQL, down_sql: 'SELECT 1;' })
+    const Path = `${Base}/${Draft.id}/reviews/apply`
+    const Review = await EditorAPI<RecordID>(Path, 'POST')
+    await EditorAPI(`${Path}/${Review.id}/approvals/${Group!.id}`, 'PUT')
+    const Job = await EditorAPI<{ id: string }>(`${Base}/${Draft.id}/execute`, 'POST')
+    await WaitJob(Database, Job.id)
+  }
+
+  async function ReviewAndApply(Page: Page, Row: Locator) {
+    await Row.getByRole('button', { name: 'Review apply', exact: true }).click()
+    await Page.getByRole('button', { name: 'Request review', exact: true }).click()
+    await Page.getByRole('button', { name: `Approve for ${Prefix}`, exact: true }).click()
+    await Page.getByRole('button', { name: 'Apply', exact: true }).click()
+    await Page.getByRole('dialog').getByRole('button', { name: 'Run apply', exact: true }).click()
   }
 
   async function CleanupFixtures() {
@@ -101,6 +122,7 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     User = await AdminAPI<RecordID>('/api/admin/users', 'POST', { username: Prefix, password: Password })
     Group = await AdminAPI<RecordID>('/api/admin/groups', 'POST', { name: Prefix })
     await AdminAPI(`/api/admin/groups/${Group.id}/members/${User.id}`, 'PUT')
+    await AdminAPI(`/api/admin/groups/${Group.id}/leader`, 'PUT', { user_id: User.id })
     for (const Index of Targets.keys()) {
       const Database = await AdminAPI<RecordID>('/api/connections', 'POST', ConnectionData(Index))
       Databases.push(Database)
@@ -152,11 +174,11 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     Expect(Columns.columns.some(Column => Column.name === 'enabled')).toBe(false)
     await Page.screenshot({ path: TestInfo.outputPath('schema-diff.png'), fullPage: true })
     await Page.getByRole('button', { name: 'Use SQL in migration editor', exact: true }).click()
-    const Input = Page.getByLabel('SQL Query (Transactional):', { exact: true })
+    const Input = Page.getByLabel('Up SQL', { exact: true })
     await Expect(Input).toHaveValue(SQL)
     if (Scenario === 'basic') {
       await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
-      await Expect(Page.getByRole('alert')).toContainText('Plan Analysis Failed:')
+      await Expect(Page.getByRole('alert')).toContainText('Plan analysis failed:')
       await Expect(Input).toHaveValue(SQL)
       await Input.fill(`SELECT * FROM ${Table} WHERE id = 1`)
       await Page.getByRole('button', { name: 'Analyze Plan (EXPLAIN)', exact: true }).click()
@@ -165,12 +187,13 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
     const BeforeSave = await EditorAPI<Migration[]>(`/api/databases/${Databases[0].id}/migrations`)
     Expect(BeforeSave).toHaveLength(1)
     await Input.fill(`${SQL}\nINSERT INTO ${Table} (id, value) VALUES (2, 'reviewed');`)
-    await Page.getByLabel('Title:', { exact: true }).fill('Reviewed schema migration')
+    await Page.getByLabel('Title', { exact: true }).fill('Reviewed schema migration')
+    await Page.getByLabel('Down SQL', { exact: true }).fill('SELECT 1;')
     await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
     const Row = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: 'Reviewed schema migration', exact: true }) })
     await Expect(Row.getByRole('cell', { name: 'draft', exact: true })).toBeVisible()
-    await Row.getByRole('button', { name: 'Execute', exact: true }).click()
-    await Expect(Row.getByRole('cell', { name: 'committed', exact: true })).toBeVisible()
+    await ReviewAndApply(Page, Row)
+    await Expect(Row.getByRole('cell', { name: 'applied', exact: true })).toBeVisible()
     await Page.getByRole('link', { name: 'Compare schemas', exact: true }).click()
     await Page.getByLabel('Reference database', { exact: true }).selectOption(Databases[1].id)
     await Page.getByLabel('Schema', { exact: true }).selectOption(Schema)
@@ -183,11 +206,12 @@ for (const Scenario of ['basic', 'enum'] as const) Test(`compares ${Scenario} sc
       await Expect(Page.getByText(/This migration only adds enum values/)).toHaveCount(0)
       await Page.getByRole('button', { name: 'Use SQL in migration editor', exact: true }).click()
       await Expect(Input).toHaveValue(RemainingSQL)
-      await Page.getByLabel('Title:', { exact: true }).fill('Finish enum migration')
+      await Page.getByLabel('Title', { exact: true }).fill('Finish enum migration')
+      await Page.getByLabel('Down SQL', { exact: true }).fill('SELECT 1;')
       await Page.getByRole('button', { name: 'Save Draft', exact: true }).click()
       const Final = Page.getByRole('row').filter({ has: Page.getByRole('cell', { name: 'Finish enum migration', exact: true }) })
-      await Final.getByRole('button', { name: 'Execute', exact: true }).click()
-      await Expect(Final.getByRole('cell', { name: 'committed', exact: true })).toBeVisible()
+      await ReviewAndApply(Page, Final)
+      await Expect(Final.getByRole('cell', { name: 'applied', exact: true })).toBeVisible()
       await Page.getByRole('link', { name: 'Compare schemas', exact: true }).click()
       await Page.getByLabel('Reference database', { exact: true }).selectOption(Databases[1].id)
       await Page.getByLabel('Schema', { exact: true }).selectOption(Schema)

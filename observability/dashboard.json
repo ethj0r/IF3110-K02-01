@@ -1,0 +1,113 @@
+{
+  "uid": "wbd-migrations",
+  "title": "WBD Migration Observability",
+  "schemaVersion": 41,
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Migration jobs by status",
+      "description": "Job records currently retained in the platform database.",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_jobs", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Platform database connections",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_platform_pool_connections", "legendFormat": "{{state}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Mean migration execution duration",
+      "description": "Mean across retained executions with start and finish timestamps.",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_execution_mean_seconds", "legendFormat": "Execution duration" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Mean queue wait",
+      "description": "Time from eligibility to the latest recorded worker claim.",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_queue_wait_mean_seconds", "legendFormat": "Queue wait" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Migration retries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_retry_jobs", "legendFormat": "Requested retry jobs" },
+        { "refId": "B", "expr": "wbd_migration_retry_attempts", "legendFormat": "Automatic retry attempts" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Mean platform connection wait",
+      "description": "Wait per successful acquisition from an empty pool in a five-minute window.",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(wbd_platform_pool_wait_seconds_total[5m]) / (rate(wbd_platform_pool_waited_acquires_total[5m]) > 0)",
+          "legendFormat": "Pool wait"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Longest current migration lock wait",
+      "gridPos": { "x": 0, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_lock_wait_max_seconds", "legendFormat": "Lock wait" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Processed migration batches",
+      "gridPos": { "x": 8, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_batches_processed", "legendFormat": "{{direction}}" }
+      ]
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Processed migration rows",
+      "gridPos": { "x": 16, "y": 24, "w": 8, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "wbd_migration_rows_processed", "legendFormat": "{{direction}}" }
+      ]
+    }
+  ]
+}

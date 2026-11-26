@@ -1,9 +1,13 @@
 package Access
 
 import (
+	Bytes "bytes"
 	Context "context"
 	Errors "errors"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Slog "log/slog"
+	Strings "strings"
 	Testing "testing"
 )
 
@@ -74,5 +78,39 @@ func TestStaticEvaluatorAndPlatformAdminSeparation(T *Testing.T) {
 	}
 	if LevelViewEdit.Rank() <= LevelViewOnly.Rank() || LevelNone.Rank() != 0 || FromRank(2) != LevelViewEdit || FromRank(1) != LevelViewOnly {
 		T.Fatal("level ranking is inconsistent")
+	}
+}
+
+func TestCanAnnotatesRequestScopeWithFirstDatabase(T *Testing.T) {
+	Ctx := Logging.NewScope(Context.Background())
+	Viewer := Auth.Principal{ID: "user-1", Username: "viewer"}
+	Policy := StaticEvaluator{Grants: map[string]map[string]Level{"user-1": {"db-1": LevelViewOnly}}}
+	if Allowed, Err := Can(Ctx, Policy, Viewer, ActionView, "db-1"); Err != nil || !Allowed {
+		T.Fatal("viewer must be allowed to view db-1")
+	}
+	if Allowed, _ := Can(Ctx, Policy, Viewer, ActionView, "db-2"); Allowed {
+		T.Fatal("viewer must not be allowed to view db-2")
+	}
+	Attrs := Logging.Attrs(Ctx)
+	if len(Attrs) != 1 || Attrs[0].Key != "database_id" || Attrs[0].Value.String() != "db-1" {
+		T.Fatalf("expected the first checked database in the log scope, got %v", Attrs)
+	}
+	if Allowed, _ := Can(Ctx, nil, Viewer, ActionView, "db-1"); Allowed {
+		T.Fatal("missing policy must deny access")
+	}
+}
+
+func TestCanLogsDeniedAccess(T *Testing.T) {
+	Buffer := &Bytes.Buffer{}
+	Previous := Slog.Default()
+	Slog.SetDefault(Logging.New(Buffer, Slog.LevelInfo))
+	T.Cleanup(func() { Slog.SetDefault(Previous) })
+	Viewer := Auth.Principal{ID: "user-1", Username: "viewer"}
+	Policy := StaticEvaluator{Grants: map[string]map[string]Level{"user-1": {"db-1": LevelViewOnly}}}
+	_, _ = Can(Context.Background(), Policy, Viewer, ActionView, "db-1")
+	_, _ = Can(Context.Background(), Policy, Viewer, ActionEdit, "db-1")
+	Output := Buffer.String()
+	if Strings.Count(Output, `"event":"access.denied"`) != 1 || !Strings.Contains(Output, `"action":"edit"`) || !Strings.Contains(Output, `"actor":"viewer"`) {
+		T.Fatalf("expected exactly one access.denied record for the edit attempt: %s", Output)
 	}
 }

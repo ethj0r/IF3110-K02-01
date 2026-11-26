@@ -6,6 +6,7 @@ import (
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Mime "mime"
@@ -22,22 +23,23 @@ func (Routes *Handler) Register(Api Chi.Router) {
 		R.Use(Routes.Auth.RequireSession)
 		R.Use(Access.RequireAdmin)
 		R.Get("/users", Routes.ListUsers)
-		R.Post("/users", Routes.CreateUser)
+		R.With(Logging.Activity("admin.user.create")).Post("/users", Routes.CreateUser)
 		R.Get("/users/{id}", Routes.GetUser)
-		R.Patch("/users/{id}", Routes.UpdateUser)
-		R.Delete("/users/{id}", Routes.DeleteUser)
-		R.Put("/users/{id}/password", Routes.ResetPassword)
+		R.With(Logging.Activity("admin.user.update")).Patch("/users/{id}", Routes.UpdateUser)
+		R.With(Logging.Activity("admin.user.delete")).Delete("/users/{id}", Routes.DeleteUser)
+		R.With(Logging.Activity("admin.user.password_reset")).Put("/users/{id}/password", Routes.ResetPassword)
 		R.Get("/groups", Routes.ListGroups)
-		R.Post("/groups", Routes.CreateGroup)
+		R.With(Logging.Activity("admin.group.create")).Post("/groups", Routes.CreateGroup)
 		R.Get("/groups/{id}", Routes.GetGroup)
-		R.Patch("/groups/{id}", Routes.UpdateGroup)
-		R.Delete("/groups/{id}", Routes.DeleteGroup)
+		R.With(Logging.Activity("admin.group.update")).Patch("/groups/{id}", Routes.UpdateGroup)
+		R.With(Logging.Activity("admin.group.delete")).Delete("/groups/{id}", Routes.DeleteGroup)
+		R.With(Logging.Activity("admin.group.leader_set")).Put("/groups/{id}/leader", Routes.SetGroupLeader)
 		R.Get("/groups/{id}/members", Routes.ListMembers)
-		R.Put("/groups/{id}/members/{userId}", Routes.AddMember)
-		R.Delete("/groups/{id}/members/{userId}", Routes.RemoveMember)
+		R.With(Logging.Activity("admin.group.member_add")).Put("/groups/{id}/members/{userId}", Routes.AddMember)
+		R.With(Logging.Activity("admin.group.member_remove")).Delete("/groups/{id}/members/{userId}", Routes.RemoveMember)
 		R.Get("/groups/{id}/access", Routes.ListGroupAccess)
-		R.Put("/groups/{id}/access/{databaseId}", Routes.SetAccess)
-		R.Delete("/groups/{id}/access/{databaseId}", Routes.RemoveAccess)
+		R.With(Logging.DatabaseParam("databaseId"), Logging.Activity("admin.access.grant")).Put("/groups/{id}/access/{databaseId}", Routes.SetAccess)
+		R.With(Logging.DatabaseParam("databaseId"), Logging.Activity("admin.access.revoke")).Delete("/groups/{id}/access/{databaseId}", Routes.RemoveAccess)
 		R.Get("/access", Routes.Matrix)
 	})
 }
@@ -63,6 +65,8 @@ func DecodeInput(W Http.ResponseWriter, R *Http.Request, Target any) bool {
 
 func WriteAdminError(W Http.ResponseWriter, Err error) {
 	switch {
+	case Errors.Is(Err, ErrInvalidLeader):
+		Httpx.Error(W, Http.StatusBadRequest, "invalid_group_leader", "Select an active group member as leader")
 	case Errors.Is(Err, ErrInvalidInput), Errors.Is(Err, Access.ErrInvalidLevel):
 		Httpx.Error(W, Http.StatusBadRequest, "invalid_request", "Invalid administration request")
 	case Errors.Is(Err, ErrNotFound), Errors.Is(Err, Access.ErrNotFound):
@@ -204,6 +208,20 @@ func (Routes *Handler) ListMembers(W Http.ResponseWriter, R *Http.Request) {
 		return
 	}
 	Httpx.JSON(W, Http.StatusOK, Result)
+}
+
+func (Routes *Handler) SetGroupLeader(W Http.ResponseWriter, R *Http.Request) {
+	var Input struct {
+		UserID string `json:"user_id"`
+	}
+	if !DecodeInput(W, R, &Input) {
+		return
+	}
+	if Err := Routes.Service.SetGroupLeader(R.Context(), Chi.URLParam(R, "id"), Input.UserID); Err != nil {
+		WriteAdminError(W, Err)
+		return
+	}
+	W.WriteHeader(Http.StatusNoContent)
 }
 
 func (Routes *Handler) AddMember(W Http.ResponseWriter, R *Http.Request) {

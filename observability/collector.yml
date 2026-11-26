@@ -1,0 +1,66 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  file_log/wbd:
+    include: [/var/log/wbd/api.log, /var/log/wbd/worker.log]
+    include_file_name: true
+    start_at: end
+    resource:
+      service.name: wbd-api
+    operators:
+      - type: add
+        if: 'attributes["log.file.name"] == "worker.log"'
+        field: resource["service.name"]
+        value: wbd-worker
+      - type: json_parser
+        on_error: drop_quiet
+        timestamp:
+          parse_from: attributes.time
+          layout_type: gotime
+          layout: "2006-01-02T15:04:05.999999999Z07:00"
+      - type: trace_parser
+        if: 'attributes["trace_id"] != nil && attributes["span_id"] != nil'
+        trace_id:
+          parse_from: attributes.trace_id
+        span_id:
+          parse_from: attributes.span_id
+      - type: move
+        from: attributes.msg
+        to: body
+        on_error: drop_quiet
+
+extensions:
+  health_check:
+    endpoint: 127.0.0.1:13133
+    path: /ready
+
+processors:
+  attributes/logs:
+    actions:
+      - key: sql
+        action: delete
+      - key: sql_text
+        action: delete
+  batch:
+
+exporters:
+  otlp_http/tempo:
+    endpoint: http://127.0.0.1:4418
+  otlp_http/loki:
+    endpoint: http://127.0.0.1:3100/otlp
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/tempo]
+    logs:
+      receivers: [otlp, file_log/wbd]
+      processors: [attributes/logs, batch]
+      exporters: [otlp_http/loki]

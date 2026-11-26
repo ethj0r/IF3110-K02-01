@@ -10,4 +10,5 @@
 !/backend/internal/webui/dist/.gitkeep
 *.log
 coverage.out
+/k6/summary.json
 .DS_Store

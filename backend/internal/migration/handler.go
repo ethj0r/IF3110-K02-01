@@ -3,12 +3,16 @@ package Migration
 import (
 	Json "encoding/json"
 	Errors "errors"
+	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Chi "github.com/go-chi/chi/v5"
 	Io "io"
 	Http "net/http"
+	Strconv "strconv"
 )
 
 type Handler struct {
@@ -22,16 +26,34 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Use(Auth.NoStore)
 			R.Use(Routes.Auth.RequireSession)
 			R.Get(Prefix, Routes.List)
-			R.Post(Prefix, Routes.Create)
-			R.Post(Prefix+"/analyze", Routes.Analyze)
+			R.With(Logging.Activity("migration.draft.create")).Post(Prefix, Routes.Create)
+			R.With(Logging.Activity("migration.plan.analyze")).Post(Prefix+"/analyze", Routes.Analyze)
+			R.Get(Prefix+"/history", Routes.History)
 			R.Get(Prefix+"/{migrationID}", Routes.Show)
-			R.Put(Prefix+"/{migrationID}", Routes.Update)
-			R.Delete(Prefix+"/{migrationID}", Routes.Delete)
-			R.Post(Prefix+"/{migrationID}/execute", Routes.Execute)
+			R.With(Logging.Activity("migration.draft.update")).Put(Prefix+"/{migrationID}", Routes.Update)
+			R.With(Logging.Activity("migration.draft.delete")).Delete(Prefix+"/{migrationID}", Routes.Delete)
+			R.With(Logging.Activity("migration.action.execute")).Post(Prefix+"/{migrationID}/execute", Routes.Execute)
+			R.With(Logging.Activity("migration.action.apply")).Post(Prefix+"/{migrationID}/apply", Routes.Apply)
+			R.With(Logging.Activity("migration.action.rollback")).Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
+			R.With(Logging.Activity("migration.action.forward")).Post(Prefix+"/{migrationID}/forward", Routes.Forward)
+			R.With(Logging.Activity("migration.action.retry")).Post(Prefix+"/{migrationID}/retry", Routes.Retry)
+			R.Get(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
+			R.With(Logging.Activity("migration.review.submit")).Post(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
+			R.With(Logging.Activity("migration.review.approve")).Put(Prefix+"/{migrationID}/reviews/{action}/{reviewID}/approvals/{groupID}", Routes.ApproveReview)
+			R.With(Logging.Activity("migration.execution.reconcile")).Post(Prefix+"/{migrationID}/executions/{executionID}/reconcile", Routes.Reconcile)
+			R.Get(Prefix+"/{migrationID}/executions/{executionID}/evidence", Routes.Evidence)
 		})
 	}
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
+	Api.Group(func(R Chi.Router) {
+		R.Use(Auth.NoStore)
+		R.Use(Routes.Auth.RequireSession)
+		R.Get("/databases/{dbID}/jobs", Routes.Jobs)
+		R.Get("/connections/{dbID}/jobs", Routes.Jobs)
+		R.Get("/databases/{dbID}/jobs/{jobID}", Routes.Job)
+		R.Get("/connections/{dbID}/jobs/{jobID}", Routes.Job)
+	})
 }
 
 func DecodeInput(W Http.ResponseWriter, R *Http.Request) (MigrationInput, bool) {
@@ -55,6 +77,12 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 400, "invalid_request", "Invalid migration request parameters")
 	case Errors.Is(Err, ErrForbidden):
 		Httpx.Error(W, 403, "forbidden", "Insufficient database permissions for migration")
+	case Errors.Is(Err, ErrReviewNotFound):
+		Httpx.Error(W, 404, "review_not_found", "Current migration review not found")
+	case Errors.Is(Err, ErrReviewUnavailable):
+		Httpx.Error(W, 409, "review_unavailable", "Migration action is not available for review")
+	case Errors.Is(Err, ErrApprovalRequired):
+		Httpx.Error(W, 409, "approval_required", "Every group with access must approve this migration action")
 	case Errors.Is(Err, ErrNotFound):
 		Httpx.Error(W, 404, "not_found", "Migration or target database not found")
 	case Errors.Is(Err, ErrAlreadyExecuted):
@@ -63,8 +91,40 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 409, "out_of_order", "Earlier migrations must finish first; only the latest attempt can be retried")
 	case Errors.Is(Err, ErrPending):
 		Httpx.Error(W, 409, "execution_pending", "Verify the previous execution outcome before retrying")
+	case Errors.Is(Err, ErrExecutionTimeout):
+		Httpx.Error(W, 422, "execution_timeout", "Migration exceeded its execution timeout")
+	case Errors.Is(Err, ErrReconcileNotAllowed):
+		Httpx.Error(W, 409, "reconcile_not_allowed", "Only a queued or running execution can be reconciled")
+	case Errors.Is(Err, ErrDatabaseBusy):
+		Httpx.Error(W, 409, "database_busy", "A worker still holds this database; wait for the job or its lease to end")
+	case Errors.Is(Err, ErrEvidenceMismatch):
+		Httpx.Error(W, 409, "evidence_mismatch", "The outcome contradicts the target evidence")
+	case Errors.Is(Err, ErrBatchReconcile):
+		Httpx.Error(W, 409, "batch_reconcile", "Batch executions stop at their checkpoint; reconcile as failed and retry")
 	case Errors.Is(Err, ErrConflict):
 		Httpx.Error(W, 409, "conflict", "Migration version conflict")
+	case Errors.Is(Err, ErrLocked):
+		Httpx.Error(W, 409, "migration_locked", "Executed migration definitions are immutable")
+	case Errors.Is(Err, ErrIrreversible):
+		Httpx.Error(W, 409, "irreversible", "Irreversible migrations cannot be rolled back")
+	case Errors.Is(Err, ErrNotApplied):
+		Httpx.Error(W, 409, "not_applied", "Migration is not currently applied")
+	case Errors.Is(Err, ErrNotRolledBack):
+		Httpx.Error(W, 409, "not_rolled_back", "Migration is not currently rolled back")
+	case Errors.Is(Err, ErrRollbackOrder):
+		Httpx.Error(W, 409, "rollback_order", "Only the last active migration can be rolled back")
+	case Errors.Is(Err, ErrForwardOrder):
+		Httpx.Error(W, 409, "forward_order", "Migration must be forwarded in linear order")
+	case Errors.Is(Err, ErrNoFailedAttempt):
+		Httpx.Error(W, 409, "no_failed_attempt", "Migration has no failed execution to retry")
+	case Errors.Is(Err, ErrExecutionMissing):
+		Httpx.Error(W, 404, "execution_not_found", "Migration execution not found")
+	case Errors.Is(Err, ErrJobConflict):
+		Httpx.Error(W, 409, "job_conflict", "A migration job is already active for this database")
+	case Errors.Is(Err, ErrJobNotFound):
+		Httpx.Error(W, 404, "job_not_found", "Migration job not found")
+	case Errors.Is(Err, ErrJobUnavailable):
+		Httpx.Error(W, 502, "job_unavailable", "Migration job store is unavailable")
 	case Errors.Is(Err, Driver.ErrExecution):
 		Httpx.Error(W, 422, "execution_failed", "Target database migration execution failed")
 	case Errors.Is(Err, Driver.ErrUnavailable), Errors.Is(Err, ErrUnavailable):
@@ -141,9 +201,160 @@ func (Routes *Handler) Delete(W Http.ResponseWriter, R *Http.Request) {
 
 func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.EnqueueExecute(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Tracing.Inject(R.Context()))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
+	Httpx.JSON(W, 202, Result)
+}
+
+func (Routes *Handler) Job(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.GetJob(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "jobID"))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Jobs(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Limit := DefaultJobLimit
+	if Raw := R.URL.Query().Get("limit"); Raw != "" {
+		Parsed, Err := Strconv.Atoi(Raw)
+		if Err != nil || Parsed < 1 || Parsed > MaxJobLimit {
+			Httpx.Error(W, 400, "invalid_request", "limit must be between 1 and 50")
+			return
+		}
+		Limit = Parsed
+	}
+	Result, Err := Routes.Service.ListJobs(R.Context(), User, Chi.URLParam(R, "dbID"), Limit)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) enqueue(W Http.ResponseWriter, R *Http.Request, Action JobAction) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.Enqueue(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Action, Tracing.Inject(R.Context()))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Logging.Annotate(R.Context(), "job_id", Result.ID)
+	Httpx.JSON(W, 202, Result)
+}
+
+func (Routes *Handler) History(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
 	DBID := Chi.URLParam(R, "dbID")
-	ID := Chi.URLParam(R, "migrationID")
-	Result, Err := Routes.Service.Execute(R.Context(), User, DBID, ID)
+	HideRollback := false
+	if Raw := R.URL.Query().Get("hide_rollback"); Raw != "" {
+		Parsed, Err := Strconv.ParseBool(Raw)
+		if Err != nil {
+			Httpx.Error(W, 400, "invalid_request", "hide_rollback must be a boolean")
+			return
+		}
+		HideRollback = Parsed
+	}
+	Result, Err := Routes.Service.History(R.Context(), User, DBID, HideRollback)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Apply(W Http.ResponseWriter, R *Http.Request) {
+	Routes.enqueue(W, R, JobApply)
+}
+
+func (Routes *Handler) Rollback(W Http.ResponseWriter, R *Http.Request) {
+	Routes.enqueue(W, R, JobRollback)
+}
+
+func (Routes *Handler) Forward(W Http.ResponseWriter, R *Http.Request) {
+	Routes.enqueue(W, R, JobForward)
+}
+
+func (Routes *Handler) Retry(W Http.ResponseWriter, R *Http.Request) {
+	Routes.enqueue(W, R, JobRetry)
+}
+
+func reviewKeyFromRequest(R *Http.Request) reviewKey {
+	return reviewKey{Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), ExecutionKind(Chi.URLParam(R, "action"))}
+}
+
+func (Routes *Handler) Review(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Key := reviewKeyFromRequest(R)
+	Permission := Access.ActionView
+	if R.Method == Http.MethodPost {
+		Permission = Access.ActionEdit
+	}
+	if Err := Routes.Service.checkReviewAccess(R.Context(), User, Key, Permission); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	if R.Method == Http.MethodPost {
+		if Err := Routes.Service.Reviews.submitReview(R.Context(), Key, User.ID); Err != nil {
+			WriteMigrationError(W, Err)
+			return
+		}
+	}
+	Result, Err := Routes.Service.Reviews.getReview(R.Context(), Key, User.ID)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, Http.StatusOK, Result)
+}
+
+func (Routes *Handler) ApproveReview(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Key := reviewKeyFromRequest(R)
+	if Err := Routes.Service.checkReviewAccess(R.Context(), User, Key, Access.ActionView); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	if Err := Routes.Service.Reviews.approveReview(R.Context(), Key, Chi.URLParam(R, "reviewID"), Chi.URLParam(R, "groupID"), User.ID); Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	W.WriteHeader(Http.StatusNoContent)
+}
+
+func (Routes *Handler) Reconcile(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	var Input struct {
+		Outcome string `json:"outcome"`
+		Note    string `json:"note"`
+	}
+	Decoder := Json.NewDecoder(Http.MaxBytesReader(W, R.Body, 8192))
+	Decoder.DisallowUnknownFields()
+	if Err := Decoder.Decode(&Input); Err != nil {
+		Httpx.Error(W, 400, "invalid_request", "Invalid reconciliation request")
+		return
+	}
+	Result, Err := Routes.Service.Reconcile(R.Context(), User,
+		Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Chi.URLParam(R, "executionID"),
+		Input.Outcome, Input.Note)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Evidence(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.ExecutionEvidence(R.Context(), User,
+		Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Chi.URLParam(R, "executionID"))
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return

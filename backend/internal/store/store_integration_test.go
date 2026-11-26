@@ -3,14 +3,17 @@
 package Store_test
 
 import (
+	Bytes "bytes"
 	Context "context"
 	Sql "database/sql"
 	Httpx "github.com/ethj0r/IF3110-K02-01/backend/internal/httpx"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Store "github.com/ethj0r/IF3110-K02-01/backend/internal/store"
 	Testutil "github.com/ethj0r/IF3110-K02-01/backend/internal/testutil"
 	Migrations "github.com/ethj0r/IF3110-K02-01/backend/migrations"
 	Stdlib "github.com/jackc/pgx/v5/stdlib"
 	Goose "github.com/pressly/goose/v3"
+	Slog "log/slog"
 	Http "net/http"
 	Httptest "net/http/httptest"
 	Os "os"
@@ -35,6 +38,25 @@ func TestOpenAndReadiness(T *Testing.T) {
 	Httpx.NewRouter(Pool.Ping, Http.NotFoundHandler()).ServeHTTP(Response, Httptest.NewRequest("GET", "/api/ready", nil))
 	if Response.Code != 200 {
 		T.Fatalf("readiness with real PostgreSQL: %d", Response.Code)
+	}
+}
+
+func TestOpenSetsSessionKeepalives(T *Testing.T) {
+	Ctx, Cancel := Context.WithTimeout(Context.Background(), 10*Time.Second)
+	defer Cancel()
+	Pool, Err := Store.Open(Ctx, Os.Getenv("TEST_DATABASE_URL"))
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	defer Pool.Close()
+	for Name, Want := range Store.KeepaliveParams {
+		var Got string
+		if Err := Pool.QueryRow(Ctx, "SELECT current_setting($1)", Name).Scan(&Got); Err != nil {
+			T.Fatal(Err)
+		}
+		if Got != Want {
+			T.Fatalf("%s = %s, want %s", Name, Got, Want)
+		}
 	}
 }
 
@@ -85,5 +107,23 @@ func TestIsolatedSchemasAndGoose(T *Testing.T) {
 	var Exists bool
 	if Err := First.QueryRow(Ctx, "SELECT to_regclass('goose_probe') IS NOT NULL").Scan(&Exists); Err != nil || !Exists {
 		T.Fatal("goose must apply migration to isolated schema")
+	}
+}
+
+func TestOpenAttachesSQLTracer(T *Testing.T) {
+	Ctx, Cancel := Context.WithTimeout(Context.Background(), 10*Time.Second)
+	defer Cancel()
+	Buffer := &Bytes.Buffer{}
+	Pool, Err := Store.Open(Ctx, Os.Getenv("TEST_DATABASE_URL"), Logging.SQLTracer{Database: "platform", Logger: Logging.New(Buffer, Slog.LevelInfo)})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	defer Pool.Close()
+	var Value int
+	if Err := Pool.QueryRow(Ctx, "SELECT $1::int + 1", 41).Scan(&Value); Err != nil || Value != 42 {
+		T.Fatal("query through traced pool failed")
+	}
+	if !Strings.Contains(Buffer.String(), `"db":"platform"`) || !Strings.Contains(Buffer.String(), `"params":["41"]`) {
+		T.Fatalf("platform pool did not trace the statement: %s", Buffer.String())
 	}
 }

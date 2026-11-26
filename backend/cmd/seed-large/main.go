@@ -4,6 +4,7 @@ import (
 	Context "context"
 	Errors "errors"
 	Fmt "fmt"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Pgx "github.com/jackc/pgx/v5"
 	Slog "log/slog"
 	Os "os"
@@ -15,6 +16,7 @@ import (
 const DefaultRows = int64(2000000)
 
 func main() {
+	Slog.SetDefault(Logging.New(Os.Stderr, Logging.ParseLevel(Os.Getenv("LOG_LEVEL"))))
 	if Err := Run(); Err != nil {
 		Slog.Error("large dataset seeding failed", "error", Err)
 		Os.Exit(1)
@@ -41,6 +43,7 @@ func Run() error {
 		return Errors.New("invalid seed database URL")
 	}
 	Cfg.ConnectTimeout = 5 * Time.Second
+	Cfg.Tracer = Logging.SQLTracer{Database: "target"}
 	Ctx, Cancel := Context.WithTimeout(Context.Background(), 30*Time.Minute)
 	defer Cancel()
 	Conn, Err := Pgx.ConnectConfig(Ctx, Cfg)

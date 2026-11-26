@@ -10,6 +10,7 @@ import (
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
+	Os "os"
 	Strings "strings"
 	Testing "testing"
 	Time "time"
@@ -92,6 +93,7 @@ func TestServiceRealDatabaseExecution(T *Testing.T) {
 		Title: "Create real table",
 		SQLText: `CREATE TABLE test_real_table (id SERIAL PRIMARY KEY, val TEXT);
 INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay text$value$);`,
+		DownSQL: "DROP TABLE test_real_table;",
 	}
 	Created, Err := Service.Create(Ctx, Editor, DBID, ValidInput)
 	if Err != nil {
@@ -102,8 +104,8 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	if Err != nil {
 		T.Fatalf("failed to execute real migration: %v", Err)
 	}
-	if Executed.Status != StatusCommitted || Executed.ExecutedAt == nil {
-		T.Fatalf("expected committed status, got %+v", Executed)
+	if Executed.Status != ExecutionSucceeded || Executed.FinishedAt == nil || len(Executed.Attempts) != 1 {
+		T.Fatalf("expected committed execution, got %+v", Executed)
 	}
 
 	// Verify table exists on target DB
@@ -120,6 +122,7 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	BrokenInput := MigrationInput{
 		Title:   "Broken SQL migration",
 		SQLText: "CREATE TABLE test_broken_table (id INT); SELECT 1/0;",
+		DownSQL: "DROP TABLE test_broken_table;",
 	}
 	CreatedBroken, Err := Service.Create(Ctx, Editor, DBID, BrokenInput)
 	if Err != nil {
@@ -130,8 +133,8 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 	if !Errors.Is(Err, Driver.ErrExecution) {
 		T.Fatalf("expected ErrExecution, got %v", Err)
 	}
-	if ExecutedBroken.Status != StatusRolledBack || ExecutedBroken.ErrorMessage == nil {
-		T.Fatalf("expected rolled_back status with error recorded, got %+v", ExecutedBroken)
+	if ExecutedBroken.Status != ExecutionFailed || ExecutedBroken.ErrorMessage == nil {
+		T.Fatalf("expected failed execution with error recorded, got %+v", ExecutedBroken)
 	}
 
 	// Verify table was rolled back and does NOT exist in target database
@@ -144,12 +147,12 @@ INSERT INTO test_real_table(val) VALUES ($value$quote ' and $$ and COMMIT; stay 
 		"CREATE TABLE escaped (id int); DO $body$ BEGIN COMMIT; END $body$;",
 		"CREATE TABLE escaped (id int); DO $$ BEGIN RAISE EXCEPTION 'private-marker'; END $$;",
 	} {
-		Item, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{Title: "Atomic script", SQLText: Script})
+		Item, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{Title: "Atomic script", SQLText: Script, DownSQL: "SELECT 1;"})
 		if Err != nil {
 			T.Fatal(Err)
 		}
 		Result, Err := Service.Execute(Ctx, Editor, DBID, Item.ID)
-		if !Errors.Is(Err, Driver.ErrExecution) || Result.Status != StatusRolledBack || Result.ErrorMessage == nil || *Result.ErrorMessage != Driver.ErrExecution.Error() {
+		if !Errors.Is(Err, Driver.ErrExecution) || Result.Status != ExecutionFailed || Result.ErrorMessage == nil || *Result.ErrorMessage != Driver.ErrExecution.Error() {
 			T.Fatalf("script failure must be sanitized and rolled back: %+v %v", Result, Err)
 		}
 		if Err := TargetPool.QueryRow(Ctx, "SELECT to_regclass('escaped') IS NOT NULL").Scan(&Exists); Err != nil || Exists {
@@ -181,11 +184,11 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 	if _, Err := Target.Exec(Ctx, "CREATE TABLE effects (id int)"); Err != nil {
 		T.Fatal(Err)
 	}
-	First, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "First", SQLText: "INSERT INTO effects VALUES (1)"})
+	First, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "First", SQLText: "INSERT INTO effects VALUES (1)", DownSQL: "DELETE FROM effects WHERE id = 1"})
 	if Err != nil {
 		T.Fatal(Err)
 	}
-	Second, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "Second", SQLText: "INSERT INTO effects VALUES (2)"})
+	Second, Err := Server.Create(Ctx, User, DBID, MigrationInput{Title: "Second", SQLText: "INSERT INTO effects VALUES (2)", DownSQL: "DELETE FROM effects WHERE id = 2"})
 	if Err != nil {
 		T.Fatal(Err)
 	}
@@ -206,7 +209,7 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 	Results := make(chan error, 3)
 	go func() { _, Err := Server.Execute(Ctx, User, Strings.ToUpper(DBID), First.ID); Results <- Err }()
 	go func() {
-		_, Err := Server.UpdateDraft(Ctx, User, Strings.ReplaceAll(DBID, "-", ""), First.ID, MigrationInput{Title: "Changed", SQLText: "DELETE FROM effects"})
+		_, Err := Server.UpdateDraft(Ctx, User, Strings.ReplaceAll(DBID, "-", ""), First.ID, MigrationInput{Title: "Changed", SQLText: "DELETE FROM effects", DownSQL: "SELECT 1"})
 		Results <- Err
 	}()
 	go func() { Results <- Server.DeleteDraft(Ctx, User, DBID, First.ID) }()
@@ -215,12 +218,12 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 		T.Fatal(Err)
 	}
 	for Index := 0; Index < 3; Index++ {
-		if Err := <-Results; !Errors.Is(Err, ErrAlreadyExecuted) {
+		if Err := <-Results; !Errors.Is(Err, ErrAlreadyExecuted) && !Errors.Is(Err, ErrLocked) {
 			T.Fatalf("concurrent mutation was accepted: %v", Err)
 		}
 	}
 	Stored, Err := Repo.Get(Ctx, DBID, First.ID)
-	if Err != nil || Stored.SQLText != First.SQLText || Stored.Status != StatusCommitted {
+	if Err != nil || Stored.SQLText != First.SQLText || Stored.Status != StatusApplied {
 		T.Fatalf("history does not match execution: %+v %v", Stored, Err)
 	}
 	var Count int
@@ -229,5 +232,364 @@ func TestConcurrentExecutionAndDraftMutations(T *Testing.T) {
 	}
 	if _, Err := Server.Execute(Ctx, User, DBID, Second.ID); Err != nil {
 		T.Fatalf("next version could not execute: %v", Err)
+	}
+}
+
+func TestServiceBatchExecutionRollbackAndForward(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_items (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_items SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Input := MigrationInput{
+		Title:       "Batch increment",
+		SQLText:     `UPDATE batch_items SET value = value + 1 WHERE id IN (SELECT id FROM batch_items WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_items SET value = value - 1 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, Input)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Applied, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch apply failed: %v", Err)
+	}
+	if Applied.Status != ExecutionSucceeded || Applied.CommittedBatches != 3 || Applied.CommittedRows != 25 {
+		T.Fatalf("unexpected batch apply progress: %+v", Applied)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_items WHERE value = 1").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("batch update did not touch every row: %d %v", Count, Err)
+	}
+	RolledBack, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch rollback failed: %v", Err)
+	}
+	if RolledBack.Status != ExecutionSucceeded || RolledBack.RevertedBatches != 3 || RolledBack.RevertedRows != 25 {
+		T.Fatalf("unexpected batch rollback progress: %+v", RolledBack)
+	}
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_items WHERE value = 0").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("batch rollback did not restore every row: %d %v", Count, Err)
+	}
+	Forward, Err := Service.Forward(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch forward failed: %v", Err)
+	}
+	if Forward.Status != ExecutionSucceeded || Forward.CommittedBatches != 3 {
+		T.Fatalf("unexpected batch forward: %+v", Forward)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusApplied {
+		T.Fatalf("batch migration state is wrong: %+v %v", Migration, Err)
+	}
+}
+
+func TestServiceBatchPartialFailureAndRollback(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_partial (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_partial SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Input := MigrationInput{
+		Title:       "Batch partial",
+		SQLText:     `UPDATE batch_partial SET value = 1 / (CASE WHEN id = 15 THEN 0 ELSE 1 END) WHERE id IN (SELECT id FROM batch_partial WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_partial SET value = 0 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, Input)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) {
+		T.Fatalf("expected batch SQL failure, got %v", Err)
+	}
+	if Partial.Status != ExecutionPartial || Partial.CommittedBatches != 1 || Partial.CommittedRows != 10 {
+		T.Fatalf("unexpected partial progress: %+v", Partial)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusPartial {
+		T.Fatalf("migration should be partial: %+v %v", Migration, Err)
+	}
+	Reverted, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("partial rollback failed: %v", Err)
+	}
+	if Reverted.Status != ExecutionSucceeded || Reverted.RevertedBatches != 1 || Reverted.RevertedRows != 10 {
+		T.Fatalf("unexpected partial rollback: %+v", Reverted)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_partial WHERE value = 0").Scan(&Count); Err != nil || Count != 25 {
+		T.Fatalf("partial rollback did not restore committed batch: %d %v", Count, Err)
+	}
+}
+
+func TestServiceBatchRetryResumesCheckpoint(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_retry (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_retry SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{
+		Title:       "Batch retry",
+		SQLText:     `UPDATE batch_retry SET value = 1 / (CASE WHEN id = 15 THEN 0 ELSE 1 END) WHERE id IN (SELECT id FROM batch_retry WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_retry SET value = 0 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) || Partial.Status != ExecutionPartial || Partial.CommittedBatches != 1 {
+		T.Fatalf("unexpected partial apply: %+v %v", Partial, Err)
+	}
+	if _, Err := Target.Exec(Ctx, "DELETE FROM batch_retry WHERE id = 15"); Err != nil {
+		T.Fatal(Err)
+	}
+	Retried, Err := Service.Retry(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("batch retry failed: %v", Err)
+	}
+	if Retried.ID != Partial.ID || Retried.Status != ExecutionSucceeded || Retried.CommittedBatches != 3 || Retried.CommittedRows != 24 {
+		T.Fatalf("batch retry did not resume the checkpoint: %+v", Retried)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_retry WHERE value = 1").Scan(&Count); Err != nil || Count != 24 {
+		T.Fatalf("batch retry did not apply remaining rows: %d %v", Count, Err)
+	}
+}
+
+func TestServiceExecutionTimeoutIsConfirmedFailure(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:             &Repository{Pool: Platform},
+		Access:           Access.AllowAll(),
+		Resolver:         DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:           testTargetDriver{Pool: Target},
+		ExecutionTimeout: 100 * Time.Millisecond,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Slow", SQLText: "SELECT pg_sleep(1);", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	TimedOut, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, ErrExecutionTimeout) {
+		T.Fatalf("expected ErrExecutionTimeout, got %v", Err)
+	}
+	if TimedOut.Status != ExecutionFailed || TimedOut.ErrorMessage == nil || *TimedOut.ErrorMessage != ErrExecutionTimeout.Error() {
+		T.Fatalf("timeout was not recorded as a confirmed failure: %+v", TimedOut)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusFailed {
+		T.Fatalf("migration should be failed after timeout: %+v %v", Migration, Err)
+	}
+	Next, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Next", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Service.Apply(Ctx, User, DBID, Next.ID); Err != nil {
+		T.Fatalf("a timeout left the database blocked: %v", Err)
+	}
+}
+
+func TestServiceReconcileUncertainExecution(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Admin := Auth.Principal{ID: UserID, Username: "test_migrator", IsPlatformAdmin: true}
+	Repo := &Repository{Pool: Platform}
+	Service := &Service{
+		Repo:     Repo,
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Uncertain", SQLText: "CREATE TABLE reconcile_test (id int);", DownSQL: "DROP TABLE reconcile_test;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Exec, Err := Repo.CreateExecution(Ctx, DBID, Created.ID, ExecutionRequest{Kind: KindApply, Direction: DirectionUp, SQLText: Created.SQLText, RequestedBy: &UserID})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Repo.CreateAttempt(Ctx, Exec.ID, &UserID, Created.SQLText); Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Repo.RefreshStatus(Ctx, DBID, Created.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Reconciled, Err := Service.Reconcile(Ctx, Admin, DBID, Created.ID, Exec.ID, "failed", "verified no target changes")
+	if Err != nil {
+		T.Fatalf("reconcile failed: %v", Err)
+	}
+	if Reconciled.Status != ExecutionFailed || Reconciled.ReconciledAt == nil || Reconciled.ReconcileNote == nil || *Reconciled.ReconcileNote != "verified no target changes" {
+		T.Fatalf("reconcile fields are incomplete: %+v", Reconciled)
+	}
+	if len(Reconciled.Attempts) != 1 || Reconciled.Attempts[0].Status != AttemptFailed {
+		T.Fatalf("open attempt was not closed: %+v", Reconciled.Attempts)
+	}
+	Migration, Err := Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusFailed {
+		T.Fatalf("migration status was not refreshed: %+v %v", Migration, Err)
+	}
+}
+
+func TestServiceExecutionEvidenceForNormalRun(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Evidence", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Executed, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Evidence, Err := Service.ExecutionEvidence(Ctx, User, DBID, Created.ID, Executed.ID)
+	if Err != nil || len(Evidence) != 1 {
+		T.Fatalf("normal execution evidence missing: %+v %v", Evidence, Err)
+	}
+	if Evidence[0].BatchNo != 0 || Evidence[0].Direction != string(DirectionUp) || Evidence[0].AttemptNo != 1 {
+		T.Fatalf("unexpected normal evidence: %+v", Evidence[0])
+	}
+}
+
+func TestServiceBatchPartialRevertResume(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_revert (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_revert SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{
+		Title:       "Batch revert resume",
+		SQLText:     `UPDATE batch_revert SET value = 1 WHERE id IN (SELECT id FROM batch_revert WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_revert SET value = 0 / (CASE WHEN id = 20 THEN 0 ELSE 1 END) WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Service.Apply(Ctx, User, DBID, Created.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) {
+		T.Fatalf("expected a down-batch failure, got %v", Err)
+	}
+	if Partial.Status != ExecutionPartiallyReverted || Partial.RevertedBatches != 1 || Partial.RevertedRows != 5 {
+		T.Fatalf("unexpected partially reverted state: %+v", Partial)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusPartiallyReverted {
+		T.Fatalf("migration should be partially reverted: %+v %v", Migration, Err)
+	}
+	if _, Err := Target.Exec(Ctx, "DELETE FROM batch_revert WHERE id = 20"); Err != nil {
+		T.Fatal(Err)
+	}
+	Resumed, Err := Service.Retry(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("resume revert failed: %v", Err)
+	}
+	if Resumed.Status != ExecutionSucceeded || Resumed.RevertedBatches != 3 || Resumed.RevertedRows != 25 {
+		T.Fatalf("resume did not finish the revert: %+v", Resumed)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_revert WHERE value = 0").Scan(&Count); Err != nil || Count != 24 {
+		T.Fatalf("reverted rows were not restored: %d %v", Count, Err)
+	}
+}
+
+func TestServiceLongMigrationBeyondLegacyLimit(T *Testing.T) {
+	if Os.Getenv("SLOW_MIGRATION_TEST") != "1" {
+		T.Skip("set SLOW_MIGRATION_TEST=1 to run the 31-second regression")
+	}
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:             &Repository{Pool: Platform},
+		Access:           Access.AllowAll(),
+		Resolver:         DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:           testTargetDriver{Pool: Target},
+		ExecutionTimeout: 45 * Time.Second,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Legacy 30s regression", SQLText: "SELECT pg_sleep(31);", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Started := Time.Now()
+	Done, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	Duration := Time.Since(Started)
+	if Err != nil || Done.Status != ExecutionSucceeded {
+		T.Fatalf("31-second migration failed: %+v %v", Done, Err)
+	}
+	if Duration < 30*Time.Second {
+		T.Fatalf("regression migration finished too quickly: %s", Duration)
 	}
 }

@@ -122,12 +122,12 @@ func TestGeneratedMigrationConvergesRealSchemasWithoutAutomaticWrites(T *Testing
 	Policy := Access.StaticEvaluator{Grants: map[string]map[string]Access.Level{UserID: {Database.ID: Access.LevelViewEdit}}}
 	Migrations := &Migration.Service{Repo: &Migration.Repository{Pool: Platform}, Access: Policy, Driver: Driver.PostgresDriver{}, Resolver: Migration.DSNResolverFunc(func(Context.Context, string) (string, error) { return CurrentDSN, nil })}
 	User := Auth.Principal{ID: UserID}
-	Draft, Err := Migrations.Create(Ctx, User, Database.ID, Migration.MigrationInput{Title: "Generated and reviewed", SQLText: Before.SQLText + "\nINSERT INTO " + Table + " (value) VALUES ('reviewed');"})
+	Draft, Err := Migrations.Create(Ctx, User, Database.ID, Migration.MigrationInput{Title: "Generated and reviewed", SQLText: Before.SQLText + "\nINSERT INTO " + Table + " (value) VALUES ('reviewed');", DownSQL: "SELECT 1;"})
 	if Err != nil {
 		T.Fatal(Err)
 	}
 	Done, Err := Migrations.Execute(Ctx, User, Database.ID, Draft.ID)
-	if Err != nil || Done.Status != Migration.StatusCommitted {
+	if Err != nil || Done.Status != Migration.ExecutionSucceeded {
 		T.Fatalf("generated SQL failed the transaction executor: %v", Err)
 	}
 	After, Err := Generator.Generate(Ctx, CurrentDSN, ReferenceDSN, Schema)

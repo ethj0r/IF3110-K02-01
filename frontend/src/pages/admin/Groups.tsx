@@ -10,12 +10,14 @@ import {
   ListMembers,
   ListUsers,
   RemoveMember,
+  SetGroupLeader,
   UpdateGroup,
 } from '../../api/admin'
 import type { AdminGroup } from '../../api/admin'
-import { ConfirmDialog } from '../../components/ConfirmDialog'
-import { RequestError } from '../../components/Feedback'
-import { PageHeading } from '../../components/PageHeading'
+import { Card, PageHeader } from '../../ui/Card'
+import { ConfirmDialog } from '../../ui/ConfirmDialog'
+import { Badge, EmptyState, Loading, Notice as NoticeBanner, RequestError } from '../../ui/Feedback'
+import { Icon } from '../../ui/Icon'
 
 export function GroupsPage() {
   const Cache = useQueryClient()
@@ -74,148 +76,126 @@ export function GroupsPage() {
   }
 
   return (
-    <section>
-      <PageHeading
+    <>
+      <PageHeader
         Title="Groups"
-        Description="Groups collect users and carry database grants. A user receives the highest level granted by any group they belong to."
         Actions={(
-          <button type="button" className={ShowCreate ? 'secondary' : ''} onClick={() => SetShowCreate(Value => !Value)}>
-            {ShowCreate ? 'Cancel' : 'New group'}
+          <button type="button" className={ShowCreate ? 'btn btn-secondary' : 'btn'} onClick={() => SetShowCreate(Value => !Value)}>
+            {ShowCreate ? 'Cancel' : <><Icon Name="plus" Size={14} />New group</>}
           </button>
         )}
       />
 
       {ShowCreate && (
-        <form className="panel form-panel" onSubmit={HandleCreate}>
-          <header className="panel-header">
-            <div>
-              <h3>Create group</h3>
-              <p>Add members and database grants after creating the group.</p>
+        <Card Title="Create group">
+          <form className="stack" onSubmit={HandleCreate}>
+            <div className="form-grid">
+              <div className="field">
+                <label htmlFor="group-name">Name</label>
+                <input className="input" id="group-name" name="name" required maxLength={64} autoComplete="off" />
+              </div>
+              <div className="field">
+                <label htmlFor="group-description">Description</label>
+                <input className="input" id="group-description" name="description" maxLength={500} autoComplete="off" />
+              </div>
             </div>
-          </header>
-          <div className="form-grid">
-            <div className="field">
-              <label htmlFor="group-name">Name</label>
-              <input id="group-name" name="name" required maxLength={64} autoComplete="off" />
-              <span className="hint">1–64 letters, digits, spaces, dots, underscores, or hyphens.</span>
+            <RequestError error={Create.error} />
+            <div className="form-actions">
+              <button className="btn" type="submit" disabled={Create.isPending}>{Create.isPending ? 'Creating…' : 'Create group'}</button>
             </div>
-            <div className="field grow">
-              <label htmlFor="group-description">Description</label>
-              <input id="group-description" name="description" maxLength={500} autoComplete="off" />
-              <span className="hint">Optional, up to 500 characters.</span>
-            </div>
-            <button type="submit" disabled={Create.isPending}>{Create.isPending ? 'Creating…' : 'Create group'}</button>
-          </div>
-          <RequestError error={Create.error} />
-        </form>
+          </form>
+        </Card>
       )}
 
-      {Notice && <p className="notice-banner" role="status">{Notice}</p>}
+      {Notice !== '' && <NoticeBanner Tone="success" Role="status">{Notice}</NoticeBanner>}
       <RequestError error={Update.error ?? Remove.error} />
 
-      <div className="panel">
-        <header className="panel-header">
-          <div>
-            <h3>All groups</h3>
-            <p>Select a group to edit its details or manage members.</p>
-          </div>
-          <span className="count-badge">{Groups.data?.length ?? 0}</span>
-        </header>
-
-        {Groups.isPending && <p className="state" role="status">Loading groups…</p>}
-        <RequestError error={Groups.error} />
-
-        {Groups.data && (
-          <div className="table-wrap">
-            <table className="data-table">
+      <Card Flush>
+        {Groups.isPending && <div className="card-body"><Loading>Loading groups…</Loading></div>}
+        {Groups.error !== null && <div className="card-body"><RequestError error={Groups.error} /></div>}
+        {Groups.data?.length === 0 && <EmptyState IconName="group" Title="No groups yet" />}
+        {Groups.data && Groups.data.length > 0 && (
+          <div className="table-scroll">
+            <table className="table">
               <thead>
                 <tr>
                   <th>Group</th>
                   <th>Members</th>
                   <th>Grants</th>
-                  <th className="actions-column">Actions</th>
+                  <th>Leader</th>
+                  <th className="cell-actions">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {Groups.data.map(Group => (
-                  <tr key={Group.id} className={Group.id === SelectedID ? 'selected-row' : undefined}>
+                  <tr key={Group.id} className={Group.id === SelectedID ? 'is-selected' : undefined}>
                     <td>
-                      <div>
+                      <div className="cell-stack">
                         <strong>{Group.name}</strong>
-                        <span className="table-subtext">{Group.description || 'No description'}</span>
+                        {Group.description && <span className="cell-sub">{Group.description}</span>}
                       </div>
                     </td>
-                    <td>{Group.member_count}</td>
-                    <td>{Group.access_count}</td>
-                    <td className="actions-column">
-                      <button
-                        className="secondary small"
-                        type="button"
-                        onClick={() => SetSelectedID(Group.id === SelectedID ? null : Group.id)}
-                      >
+                    <td className="mono">{Group.member_count}</td>
+                    <td className="mono">{Group.access_count}</td>
+                    <td>{Group.leader_user_id ? <Badge Tone="success" Dot>Assigned</Badge> : <span className="muted">—</span>}</td>
+                    <td className="cell-actions">
+                      <button className="btn btn-secondary btn-sm" type="button" onClick={() => SetSelectedID(Group.id === SelectedID ? null : Group.id)}>
                         {Group.id === SelectedID ? 'Close' : 'Manage'}
                       </button>
                     </td>
                   </tr>
                 ))}
-                {Groups.data.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="empty-cell">No groups yet.</td>
-                  </tr>
-                )}
               </tbody>
             </table>
           </div>
         )}
-      </div>
+      </Card>
 
       {Selected && (
-        <section className="panel detail-panel">
-          <header className="panel-header">
-            <div>
-              <h3>{Selected.name}</h3>
-              <p>{Selected.description || 'No description'}</p>
-            </div>
-            <div className="row-actions">
-              <button className="ghost small" type="button" onClick={() => SetSelectedID(null)}>Close</button>
-              <button className="danger small" type="button" onClick={() => SetDeleteTarget(Selected)}>Delete group</button>
-            </div>
-          </header>
-
-          <div className="detail-grid">
-            <div>
-              <h4>Group settings</h4>
+        <Card
+          Title={Selected.name}
+          Actions={(
+            <>
+              <button className="btn btn-ghost btn-sm" type="button" onClick={() => SetSelectedID(null)}>Close</button>
+              <button className="btn btn-danger btn-sm" type="button" onClick={() => SetDeleteTarget(Selected)}>Delete group</button>
+            </>
+          )}
+        >
+          <div className="split">
+            <div className="stack">
               <form className="stack" key={`${Selected.id}-${Selected.updated_at}`} onSubmit={HandleUpdate}>
                 <div className="field">
                   <label htmlFor={`name-${Selected.id}`}>Name</label>
-                  <input id={`name-${Selected.id}`} name="name" defaultValue={Selected.name} required maxLength={64} />
+                  <input className="input" id={`name-${Selected.id}`} name="name" defaultValue={Selected.name} required maxLength={64} />
                 </div>
                 <div className="field">
                   <label htmlFor={`description-${Selected.id}`}>Description</label>
-                  <input id={`description-${Selected.id}`} name="description" defaultValue={Selected.description} maxLength={500} />
+                  <input className="input" id={`description-${Selected.id}`} name="description" defaultValue={Selected.description} maxLength={500} />
                 </div>
-                <button type="submit" disabled={Update.isPending}>{Update.isPending ? 'Saving…' : 'Save changes'}</button>
+                <div className="form-actions">
+                  <button className="btn" type="submit" disabled={Update.isPending}>{Update.isPending ? 'Saving…' : 'Save changes'}</button>
+                </div>
               </form>
             </div>
-            <div>
-              <h4>Members</h4>
+            <div className="stack">
+              <h3>Members</h3>
               <GroupMembers Group={Selected} key={Selected.id} />
             </div>
           </div>
-        </section>
+        </Card>
       )}
 
       {DeleteTarget && (
         <ConfirmDialog
           Title="Delete group"
-          Description={`Delete ${DeleteTarget.name}? Memberships and database grants will be removed, and member sessions revoked.`}
+          Description={`Delete ${DeleteTarget.name}?`}
           ConfirmLabel="Delete group"
           Pending={Remove.isPending}
           OnConfirm={() => Remove.mutate(DeleteTarget.id)}
           OnCancel={() => SetDeleteTarget(null)}
         />
       )}
-    </section>
+    </>
   )
 }
 
@@ -232,6 +212,11 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
     mutationFn: (UserID: string) => RemoveMember(Group.id, UserID),
     onSuccess: Refresh,
   })
+  const SetLeader = useMutation({
+    mutationFn: (UserID: string) => SetGroupLeader(Group.id, UserID),
+    onSuccess: () => Cache.invalidateQueries({ queryKey: AdminQueryKeys.groups }),
+  })
+  const MembershipBusy = Add.isPending || Remove.isPending || SetLeader.isPending
 
   function Refresh() {
     void Cache.invalidateQueries({ queryKey: AdminQueryKeys.members(Group.id) })
@@ -249,18 +234,25 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
 
   return (
     <div className="stack">
-      <RequestError error={Members.error ?? Users.error ?? Add.error ?? Remove.error} />
-      {Members.isPending && <p className="state" role="status">Loading members…</p>}
+      <RequestError error={Members.error ?? Users.error ?? Add.error ?? Remove.error ?? SetLeader.error} />
+      {Members.isPending && <Loading>Loading members…</Loading>}
 
       {Members.data && Members.data.length > 0 && (
-        <ul className="member-list">
+        <ul className="list">
           {Members.data.map(Member => (
-            <li key={Member.id}>
-              <div>
+            <li key={Member.id} className="list-item">
+              <div className="list-item-main">
+                <span className="avatar" aria-hidden="true">{Member.username.slice(0, 1)}</span>
                 <strong>{Member.username}</strong>
-                {Member.is_platform_admin && <span className="badge admin">Platform admin</span>}
+                {Member.is_platform_admin && <Badge Tone="ink">Platform admin</Badge>}
+                {Member.id === Group.leader_user_id && <Badge Tone="success" Dot>{Member.is_active ? 'Leader' : 'Inactive leader'}</Badge>}
               </div>
-              <button className="ghost small" type="button" disabled={Remove.isPending} onClick={() => Remove.mutate(Member.id)}>Remove</button>
+              <div className="row-actions">
+                {Member.is_active && Member.id !== Group.leader_user_id && (
+                  <button className="btn btn-secondary btn-sm" type="button" disabled={MembershipBusy} onClick={() => SetLeader.mutate(Member.id)}>Set as leader</button>
+                )}
+                <button className="btn btn-ghost btn-sm" type="button" disabled={MembershipBusy} onClick={() => Remove.mutate(Member.id)}>Remove</button>
+              </div>
             </li>
           ))}
         </ul>
@@ -268,17 +260,17 @@ function GroupMembers({ Group }: { Group: AdminGroup }) {
       {Members.data?.length === 0 && <p className="muted">No members yet.</p>}
 
       {Available.length > 0 ? (
-        <form className="member-add" onSubmit={HandleAdd}>
-          <div className="field grow">
+        <form className="toolbar" onSubmit={HandleAdd}>
+          <div className="field">
             <label htmlFor={`member-${Group.id}`}>Add user</label>
-            <select id={`member-${Group.id}`} value={Selected} onChange={Event => SetSelected(Event.target.value)}>
+            <select className="select" id={`member-${Group.id}`} value={Selected} onChange={Event => SetSelected(Event.target.value)}>
               <option value="">Select a user</option>
               {Available.map(User => <option key={User.id} value={User.id}>{User.username}</option>)}
             </select>
           </div>
-          <button className="secondary" type="submit" disabled={!Selected || Add.isPending}>{Add.isPending ? 'Adding…' : 'Add member'}</button>
+          <button className="btn btn-secondary" type="submit" disabled={!Selected || MembershipBusy}>{Add.isPending ? 'Adding…' : 'Add member'}</button>
         </form>
-      ) : <p className="muted">Every user is already a member.</p>}
+      ) : null}
     </div>
   )
 }

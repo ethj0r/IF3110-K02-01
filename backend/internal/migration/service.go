@@ -2,12 +2,18 @@ package Migration
 
 import (
 	Context "context"
+	Errors "errors"
+	Slog "log/slog"
 	Strings "strings"
 	Time "time"
 
 	Access "github.com/ethj0r/IF3110-K02-01/backend/internal/access"
 	Auth "github.com/ethj0r/IF3110-K02-01/backend/internal/auth"
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
+	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
+	Attribute "go.opentelemetry.io/otel/attribute"
+	Trace "go.opentelemetry.io/otel/trace"
 )
 
 type DSNResolver interface {
@@ -22,21 +28,60 @@ func (F DSNResolverFunc) DialTargetDSN(Ctx Context.Context, DatabaseID string) (
 
 type MigrationRepository interface {
 	WithDatabaseLock(Context.Context, string, func(MigrationRepository) (Migration, error)) (Migration, error)
+	WithExecutionLock(Context.Context, string, func(MigrationRepository) (Execution, error)) (Execution, error)
 	Create(Ctx Context.Context, DatabaseID string, Input MigrationInput, CreatedBy *string) (Migration, error)
 	Get(Ctx Context.Context, DatabaseID string, ID string) (Migration, error)
 	GetByVersion(Ctx Context.Context, DatabaseID string, Version int64) (Migration, error)
 	List(Ctx Context.Context, DatabaseID string) ([]Migration, error)
 	UpdateDraft(Ctx Context.Context, DatabaseID string, ID string, Input MigrationInput) (Migration, error)
-	StartExecution(Ctx Context.Context, DatabaseID, ID string, ExecutedBy *string) (Migration, error)
-	RecordExecution(Ctx Context.Context, DatabaseID string, ID string, ExecutedBy *string, Succeeded bool, ExecutionErr *string) (Migration, error)
 	DeleteDraft(Ctx Context.Context, DatabaseID string, ID string) error
+	CreateExecution(Ctx Context.Context, DatabaseID string, MigrationID string, Request ExecutionRequest) (Execution, error)
+	GetExecution(Ctx Context.Context, DatabaseID string, ExecutionID string) (Execution, error)
+	LatestExecution(Ctx Context.Context, DatabaseID string, MigrationID string) (Execution, error)
+	LatestSuccessfulExecution(Ctx Context.Context, DatabaseID string, MigrationID string) (Execution, error)
+	CreateAttempt(Ctx Context.Context, ExecutionID string, ActorID *string, SQLText string) (Attempt, error)
+	FinishAttempt(Ctx Context.Context, AttemptID string, Status AttemptStatus, ExecutionErr *string) error
+	FinishExecution(Ctx Context.Context, ExecutionID string, Status ExecutionStatus, ExecutionErr *string) error
+	RefreshStatus(Ctx Context.Context, DatabaseID string, MigrationID string) (Migration, error)
+	ListHistory(Ctx Context.Context, DatabaseID string, HideRollback bool) ([]Execution, error)
+	EnqueueJob(Ctx Context.Context, DatabaseID string, MigrationID string, Action JobAction, RequestedBy *string, TraceParent *string) (Job, error)
+	GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error)
+	ListJobs(Ctx Context.Context, DatabaseID string, Limit int) ([]Job, error)
+	ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error)
+	RenewJobLease(Ctx Context.Context, JobID string, WorkerID string, Lease Time.Duration) error
+	FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error
+	ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error)
+	RequeueJob(Ctx Context.Context, JobID string, AvailableAt Time.Time, LastError string) error
+	SetExecutionRunning(Ctx Context.Context, DatabaseID string, ExecutionID string) (Execution, error)
+	RecordBatchUp(Ctx Context.Context, ExecutionID string, DatabaseID string, BatchNo int64, CursorFrom int64, CursorTo int64, RowCount int64) (Execution, error)
+	RecordBatchReverted(Ctx Context.Context, RollbackExecutionID string, UpExecutionID string, DatabaseID string, BatchNo int64) (Execution, error)
+	ListCommittedBatches(Ctx Context.Context, ExecutionID string) ([]Batch, error)
+	CloseRunningAttempts(Ctx Context.Context, ExecutionID string, Status AttemptStatus, Message string) error
+	ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Status ExecutionStatus, ActorID *string, Note string) (Execution, error)
 }
 
 type Service struct {
-	Repo     MigrationRepository
-	Access   Access.Evaluator
-	Resolver DSNResolver
-	Driver   Driver.Driver
+	Repo             MigrationRepository
+	Reviews          *Repository
+	Access           Access.Evaluator
+	Resolver         DSNResolver
+	Driver           Driver.Driver
+	Logger           *Slog.Logger
+	ExecutionTimeout Time.Duration
+}
+
+func (Server *Service) executionTimeout() Time.Duration {
+	if Server.ExecutionTimeout > 0 {
+		return Server.ExecutionTimeout
+	}
+	return 30 * Time.Minute
+}
+
+func (Server *Service) logger() *Slog.Logger {
+	if Server.Logger != nil {
+		return Server.Logger
+	}
+	return Slog.Default()
 }
 
 func (Server *Service) checkAccess(Ctx Context.Context, User Auth.Principal, Act Access.Action, DatabaseID string) error {
@@ -57,6 +102,23 @@ func (Server *Service) getDriver() Driver.Driver {
 	return Driver.PostgresDriver{}
 }
 
+func actorID(User Auth.Principal) *string {
+	if User.ID == "" {
+		return nil
+	}
+	return &User.ID
+}
+
+func safeMessage(Err error) *string {
+	Message := Driver.ErrExecution.Error()
+	if Errors.Is(Err, ErrExecutionTimeout) || Errors.Is(Err, Context.DeadlineExceeded) {
+		Message = ErrExecutionTimeout.Error()
+	} else if Errors.Is(Err, ErrUnavailable) || Errors.Is(Err, Driver.ErrUnavailable) || Errors.Is(Err, Driver.ErrInvalidDSN) {
+		Message = Driver.ErrUnavailable.Error()
+	}
+	return &Message
+}
+
 func (Server *Service) Create(Ctx Context.Context, User Auth.Principal, DatabaseID string, Input MigrationInput) (Migration, error) {
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	if DatabaseID == "" {
@@ -68,11 +130,7 @@ func (Server *Service) Create(Ctx Context.Context, User Auth.Principal, Database
 	if Err := Input.Validate(); Err != nil {
 		return Migration{}, Err
 	}
-	var UserID *string
-	if User.ID != "" {
-		UserID = &User.ID
-	}
-	return Server.Repo.Create(Ctx, DatabaseID, Input, UserID)
+	return Server.Repo.Create(Ctx, DatabaseID, Input, actorID(User))
 }
 
 func (Server *Service) Get(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Migration, error) {
@@ -95,7 +153,26 @@ func (Server *Service) List(Ctx Context.Context, User Auth.Principal, DatabaseID
 	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
 		return nil, Err
 	}
-	return Server.Repo.List(Ctx, DatabaseID)
+	Items, Err := Server.Repo.List(Ctx, DatabaseID)
+	if Err != nil {
+		return nil, Err
+	}
+	History, Err := Server.Repo.ListHistory(Ctx, DatabaseID, false)
+	if Err != nil {
+		return nil, Err
+	}
+	return AnnotateCapabilities(Items, History), nil
+}
+
+func (Server *Service) History(Ctx Context.Context, User Auth.Principal, DatabaseID string, HideRollback bool) ([]Execution, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	if DatabaseID == "" {
+		return nil, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return nil, Err
+	}
+	return Server.Repo.ListHistory(Ctx, DatabaseID, HideRollback)
 }
 
 func (Server *Service) UpdateDraft(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Input MigrationInput) (Migration, error) {
@@ -125,96 +202,848 @@ func (Server *Service) DeleteDraft(Ctx Context.Context, User Auth.Principal, Dat
 	return Server.Repo.DeleteDraft(Ctx, DatabaseID, ID)
 }
 
-func (Server *Service) Execute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Migration, error) {
-	Ctx, Cancel := Context.WithTimeout(Ctx, 30*Time.Second)
+func (Server *Service) Execute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		Latest, Err := Repo.LatestExecution(Ctx, Current.DatabaseID, Current.ID)
+		if Errors.Is(Err, ErrNotFound) {
+			return Server.applyLocked(Ctx, Repo, User, Current)
+		}
+		if Err != nil {
+			return Execution{}, Err
+		}
+		switch {
+		case Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning:
+			return Execution{}, ErrPending
+		case Latest.Status.IsFailure():
+			return Server.retryLocked(Ctx, Repo, User, Current, Latest)
+		default:
+			return Execution{}, ErrAlreadyExecuted
+		}
+	})
+}
+
+func (Server *Service) Apply(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		return Server.applyLocked(Ctx, Repo, User, Current)
+	})
+}
+
+func (Server *Service) Rollback(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		return Server.rollbackLocked(Ctx, Repo, User, Current)
+	})
+}
+
+func (Server *Service) Forward(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		return Server.forwardLocked(Ctx, Repo, User, Current)
+	})
+}
+
+func (Server *Service) Retry(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		Latest, Err := Repo.LatestExecution(Ctx, Current.DatabaseID, Current.ID)
+		if Err != nil {
+			if Errors.Is(Err, ErrNotFound) {
+				return Execution{}, ErrNoFailedAttempt
+			}
+			return Execution{}, Err
+		}
+		return Server.retryLocked(Ctx, Repo, User, Current, Latest)
+	})
+}
+
+func (Server *Service) RetryTransient(Ctx Context.Context, User Auth.Principal, DatabaseID, ID, ExecutionID string, ExpectedKind ExecutionKind) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		Latest, Err := Repo.LatestExecution(Ctx, Current.DatabaseID, Current.ID)
+		if Err != nil {
+			if Errors.Is(Err, ErrNotFound) {
+				return Execution{}, ErrNoFailedAttempt
+			}
+			return Execution{}, Err
+		}
+		_, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
+		if Err != nil {
+			return Execution{}, Err
+		}
+		if Err := ValidateRetry(Current, History); Err != nil {
+			return Execution{}, Err
+		}
+		if Latest.ID != ExecutionID || Latest.Kind != ExpectedKind || !Latest.Status.IsFailure() {
+			return Execution{}, ErrOutOfOrder
+		}
+		if Server.Reviews != nil && Server.Reviews.requireReview {
+			Approved, Err := Server.reviewStore(Repo).hasExecutionApproval(Ctx, Current.DatabaseID, Latest.ID)
+			if Err != nil {
+				return Execution{}, Err
+			}
+			if !Approved {
+				return Execution{}, ErrApprovalRequired
+			}
+		}
+		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
+	})
+}
+
+func (Server *Service) reviewStore(Repo MigrationRepository) *Repository {
+	if Locked, Ok := Repo.(*Repository); Ok {
+		return Locked
+	}
+	return Server.Reviews
+}
+
+func (Server *Service) withAction(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Run func(Context.Context, MigrationRepository, Auth.Principal, Migration) (Execution, error)) (Execution, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, Server.executionTimeout())
 	defer Cancel()
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	ID = Strings.TrimSpace(ID)
 	if DatabaseID == "" || ID == "" {
-		return Migration{}, ErrNotFound
+		return Execution{}, ErrNotFound
 	}
 	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
-		return Migration{}, Err
+		return Execution{}, Err
 	}
-
 	if Server.Resolver == nil {
-		return Migration{}, ErrUnavailable
+		return Execution{}, ErrUnavailable
 	}
-	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, DatabaseID)
+	Ctx = Logging.With(Ctx, "migration_id", ID)
+	Ctx, Span := Tracing.Start(Ctx, "migration.lock", Attribute.String("database_id", DatabaseID), Attribute.String("migration_id", ID))
+	defer Span.End()
+	Result, Err := Server.Repo.WithExecutionLock(Ctx, DatabaseID, func(Repo MigrationRepository) (Execution, error) {
+		Current, Err := Repo.Get(Ctx, DatabaseID, ID)
+		if Err != nil {
+			return Execution{}, Err
+		}
+		return Run(Ctx, Repo, User, Current)
+	})
+	Tracing.Fail(Span, Err, "migration action failed")
+	return Result, Err
+}
+
+func (Server *Service) applyLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
-		return Migration{}, Err
+		return Execution{}, Err
 	}
-	return Server.Repo.WithDatabaseLock(Ctx, DatabaseID, func(Locked MigrationRepository) (Migration, error) {
-		return Server.execute(Ctx, Locked, User, DatabaseID, ID, DSN)
+	if Err := ValidateApply(Current, Items, History); Err != nil {
+		return Execution{}, Err
+	}
+	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
+		Kind:        KindApply,
+		Direction:   DirectionUp,
+		SQLText:     Current.SQLText,
+		RequestedBy: actorID(User),
 	})
 }
 
-func (Server *Service) execute(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, DatabaseID, ID, DSN string) (Migration, error) {
-	Current, Err := Repo.Get(Ctx, DatabaseID, ID)
+func (Server *Service) rollbackLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
 	if Err != nil {
-		return Migration{}, Err
+		return Execution{}, Err
 	}
-	if Current.Status.IsSuccess() {
-		return Current, ErrAlreadyExecuted
-	}
-	if Current.Status == StatusPending {
-		return Current, ErrPending
-	}
-	History, Err := Repo.List(Ctx, DatabaseID)
+	Success, Err := ValidateRollback(Current, Items, History)
 	if Err != nil {
-		return Migration{}, Err
+		return Execution{}, Err
 	}
-	for _, Item := range History {
-		if (Item.Version < Current.Version && !Item.Status.IsTerminal()) || (Item.Version > Current.Version && !Item.Status.IsDraft()) {
-			return Migration{}, ErrOutOfOrder
+	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
+		Kind:        KindRollback,
+		Direction:   DirectionDown,
+		SQLText:     *Current.DownSQL,
+		RollbackOf:  &Success.ID,
+		RequestedBy: actorID(User),
+	})
+}
+
+func (Server *Service) forwardLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+	Items, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Err := ValidateForward(Current, Items, History); Err != nil {
+		return Execution{}, Err
+	}
+	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
+		Kind:        KindForward,
+		Direction:   DirectionUp,
+		SQLText:     Current.SQLText,
+		RequestedBy: actorID(User),
+	})
+}
+
+func (Server *Service) retryLocked(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
+	_, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Err := ValidateRetry(Current, History); Err != nil {
+		return Execution{}, Err
+	}
+	if Latest.Mode == ModeBatch {
+		if Server.Reviews != nil && Server.Reviews.requireReview {
+			Approved, Err := Server.reviewStore(Repo).hasReviewApproval(Ctx, reviewKey{Current.DatabaseID, Current.ID, KindRetry}, Latest.SQLText)
+			if Err != nil {
+				return Execution{}, Err
+			}
+			if !Approved {
+				return Execution{}, ErrApprovalRequired
+			}
+		}
+		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
+	}
+	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
+		Kind:        KindRetry,
+		Direction:   Latest.Direction,
+		SQLText:     Latest.SQLText,
+		RetryOf:     &Latest.ID,
+		RequestedBy: actorID(User),
+	})
+}
+
+func (Server *Service) Enqueue(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Action JobAction, TraceParent string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	ID = Strings.TrimSpace(ID)
+	if DatabaseID == "" || ID == "" {
+		return Job{}, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	Current, Err := Server.Repo.Get(Ctx, DatabaseID, ID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	Items, History, Err := Server.loadState(Ctx, Server.Repo, DatabaseID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	switch Action {
+	case JobApply:
+		Err = ValidateApply(Current, Items, History)
+	case JobRollback:
+		_, Err = ValidateRollback(Current, Items, History)
+	case JobForward:
+		Err = ValidateForward(Current, Items, History)
+	case JobRetry:
+		Err = ValidateRetry(Current, History)
+	default:
+		Err = ErrInvalidInput
+	}
+	if Err != nil {
+		return Job{}, Err
+	}
+	if Server.Reviews != nil && Server.Reviews.requireReview {
+		Kind := kindForJobAction(Action)
+		if Kind == "" {
+			return Job{}, ErrInvalidInput
+		}
+		Review, ReviewErr := Server.Reviews.getReview(Ctx, reviewKey{DatabaseID, ID, Kind}, User.ID)
+		if ReviewErr != nil || Review.Status != "approved" {
+			return Job{}, ErrApprovalRequired
 		}
 	}
+	return Server.Repo.EnqueueJob(Ctx, DatabaseID, ID, Action, actorID(User), &TraceParent)
+}
 
+func kindForJobAction(Action JobAction) ExecutionKind {
+	switch Action {
+	case JobApply:
+		return KindApply
+	case JobRollback:
+		return KindRollback
+	case JobForward:
+		return KindForward
+	case JobRetry:
+		return KindRetry
+	default:
+		return ""
+	}
+}
+
+func (Server *Service) EnqueueExecute(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, TraceParent string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	ID = Strings.TrimSpace(ID)
+	if DatabaseID == "" || ID == "" {
+		return Job{}, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	_, History, Err := Server.loadState(Ctx, Server.Repo, DatabaseID)
+	if Err != nil {
+		return Job{}, Err
+	}
+	Latest, Ok := LatestFor(History, ID)
+	if !Ok {
+		return Server.Enqueue(Ctx, User, DatabaseID, ID, JobApply, TraceParent)
+	}
+	switch {
+	case Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning:
+		return Job{}, ErrPending
+	case Latest.Status.IsFailure() || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted:
+		return Server.Enqueue(Ctx, User, DatabaseID, ID, JobRetry, TraceParent)
+	default:
+		return Job{}, ErrAlreadyExecuted
+	}
+}
+
+func (Server *Service) GetJob(Ctx Context.Context, User Auth.Principal, DatabaseID string, JobID string) (Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	JobID = Strings.TrimSpace(JobID)
+	if DatabaseID == "" || JobID == "" {
+		return Job{}, ErrJobNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return Job{}, Err
+	}
+	return Server.Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+const (
+	DefaultJobLimit = 10
+	MaxJobLimit     = 50
+)
+
+// ListJobs returns the latest jobs of a database so the SPA can recover the
+// active job after navigation or reload.
+func (Server *Service) ListJobs(Ctx Context.Context, User Auth.Principal, DatabaseID string, Limit int) ([]Job, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	if DatabaseID == "" {
+		return nil, ErrNotFound
+	}
+	if Limit < 1 || Limit > MaxJobLimit {
+		return nil, ErrInvalidInput
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return nil, Err
+	}
+	return Server.Repo.ListJobs(Ctx, DatabaseID, Limit)
+}
+
+func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
+	if Err := Repo.CloseRunningAttempts(Ctx, Latest.ID, AttemptFailed, "superseded by retry"); Err != nil {
+		return Execution{}, Err
+	}
+	Running, Err := Repo.SetExecutionRunning(Ctx, Current.DatabaseID, Latest.ID)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	if _, Err := Repo.RefreshStatus(RecordCtx, Current.DatabaseID, Current.ID); Err != nil {
+		return Running, ErrUnavailable
+	}
+	return Server.runExecution(Ctx, Repo, User, Current, Running)
+}
+
+func (Server *Service) loadState(Ctx Context.Context, Repo MigrationRepository, DatabaseID string) ([]Migration, []Execution, error) {
+	Items, Err := Repo.List(Ctx, DatabaseID)
+	if Err != nil {
+		return nil, nil, Err
+	}
+	History, Err := Repo.ListHistory(Ctx, DatabaseID, false)
+	if Err != nil {
+		return nil, nil, Err
+	}
+	return Items, History, nil
+}
+
+func (Server *Service) startExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Request ExecutionRequest) (Execution, error) {
+	Exec, Err := Repo.CreateExecution(Ctx, Current.DatabaseID, Current.ID, Request)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	if _, Err := Repo.RefreshStatus(RecordCtx, Current.DatabaseID, Current.ID); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	return Server.runExecution(Ctx, Repo, User, Current, Exec)
+}
+
+func (Server *Service) runExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Exec Execution) (Execution, error) {
+	Ctx, Span := Tracing.Start(Ctx, "migration.execute",
+		Attribute.String("migration_id", Current.ID), Attribute.String("execution_id", Exec.ID),
+		Attribute.Int64("migration.version", Current.Version), Attribute.String("migration.kind", string(Exec.Kind)),
+		Attribute.String("migration.direction", string(Exec.Direction)))
+	defer Span.End()
+	Result, Err := Server.runAttempt(Ctx, Repo, User, Current, Exec)
+	Span.SetAttributes(Attribute.String("execution.status", string(Result.Status)))
+	Tracing.Fail(Span, Err, "migration execution failed")
+	return Result, Err
+}
+
+func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Exec Execution) (Execution, error) {
+	Attempt, Err := Repo.CreateAttempt(Ctx, Exec.ID, actorID(User), Exec.SQLText)
+	if Err != nil {
+		return Exec, ErrUnavailable
+	}
+	Ctx = Logging.With(Ctx, "migration_id", Current.ID, "execution_id", Exec.ID, "version", Current.Version, "attempt", Attempt.AttemptNo)
+	Trace.SpanFromContext(Ctx).SetAttributes(Attribute.Int("attempt", Attempt.AttemptNo))
+	Server.logger().InfoContext(Ctx, "migration execution started",
+		"event", "migration.execution.started",
+		"actor_id", User.ID, "actor", User.Username,
+		"database_id", Current.DatabaseID, "migration_id", Current.ID,
+		"execution_id", Exec.ID, "version", Current.Version, "revision", Exec.Revision,
+		"kind", Exec.Kind, "direction", Exec.Direction, "attempt", Attempt.AttemptNo,
+		"sql", Exec.SQLText)
+
+	if Server.Resolver == nil {
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Driver.ErrUnavailable)
+	}
+	if Exec.Mode == ModeBatch {
+		if Exec.Direction == DirectionUp {
+			return Server.runBatchUp(Ctx, Repo, User, Current, Exec, Attempt)
+		}
+		return Server.runBatchDown(Ctx, Repo, User, Current, Exec, Attempt)
+	}
+	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, Current.DatabaseID)
+	if Err != nil {
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Err)
+	}
 	TargetConn, Err := Server.getDriver().Open(DSN)
 	if Err != nil {
-		return Migration{}, ErrUnavailable
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, Err))
 	}
 	defer TargetConn.Close()
+	if Err := Server.ensureBatchEvidence(Ctx, TargetConn); Err != nil {
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
+	}
 
 	TargetTx, Err := TargetConn.Begin(Ctx)
 	if Err != nil {
-		return Migration{}, ErrUnavailable
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, Err))
 	}
+	Closed := false
 	defer func() {
-		Cleanup, Cancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		if Closed {
+			return
+		}
+		Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer Cancel()
 		_ = TargetTx.Rollback(Cleanup)
 	}()
 
-	var UserID *string
-	if User.ID != "" {
-		UserID = &User.ID
-	}
-
-	if _, Err := Repo.StartExecution(Ctx, DatabaseID, ID, UserID); Err != nil {
-		return Migration{}, Err
-	}
-	ExecErr := TargetTx.ExecScript(Ctx, Current.SQLText)
-	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
-	defer Cancel()
-	if ExecErr != nil {
-		if Err := TargetTx.Rollback(RecordCtx); Err != nil {
-			return Migration{}, ErrUnavailable
+	if Err := TargetTx.ExecScript(Ctx, Exec.SQLText); Err != nil {
+		RollbackCtx, RollbackCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+		RollbackErr := TargetTx.Rollback(RollbackCtx)
+		RollbackCancel()
+		if RollbackErr != nil {
+			if Cause := timeoutCause(Ctx, nil); Cause != nil {
+				Closed = true
+				Server.logger().WarnContext(Ctx, "migration deadline closed the target connection; transaction was aborted",
+					"event", "migration.execution.timeout_cleanup",
+					"database_id", Current.DatabaseID, "migration_id", Current.ID,
+					"execution_id", Exec.ID, "sql", Exec.SQLText)
+				return Server.finishFailure(Ctx, Repo, Exec, Attempt, Cause)
+			}
+			Server.logger().ErrorContext(Ctx, "migration execution outcome is uncertain after rollback failure",
+				"event", "migration.execution.uncertain",
+				"database_id", Current.DatabaseID, "migration_id", Current.ID,
+				"execution_id", Exec.ID, "sql", Exec.SQLText)
+			return Exec, ErrUnavailable
 		}
-		ErrDetail := Driver.ErrExecution.Error()
-		Updated, RecordErr := Repo.RecordExecution(RecordCtx, DatabaseID, ID, UserID, false, &ErrDetail)
-		if RecordErr != nil {
-			return Migration{}, RecordErr
-		}
-		return Updated, Driver.ErrExecution
+		Closed = true
+		Cause := timeoutCause(Ctx, Driver.ErrExecution)
+		Server.logger().ErrorContext(Ctx, "migration SQL failed; target transaction rolled back",
+			"event", "migration.execution.rolled_back",
+			"database_id", Current.DatabaseID, "migration_id", Current.ID,
+			"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText, "error", Cause)
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Cause)
+	}
+	if Err := writeBatchEvidence(Ctx, TargetTx, Exec.ID, 0, string(Exec.Direction), 0, 0, 0, Attempt.AttemptNo); Err != nil {
+		RollbackCtx, RollbackCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+		_ = TargetTx.Rollback(RollbackCtx)
+		RollbackCancel()
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
 	}
 
 	if Err := TargetTx.Commit(Ctx); Err != nil {
-		// A failed commit response does not prove the target rolled back.
-		return Migration{}, ErrUnavailable
+		Server.logger().ErrorContext(Ctx, "migration commit response is uncertain",
+			"event", "migration.execution.uncertain",
+			"database_id", Current.DatabaseID, "migration_id", Current.ID,
+			"execution_id", Exec.ID, "sql", Exec.SQLText)
+		return Exec, ErrUnavailable
 	}
+	Closed = true
+	Server.logger().InfoContext(Ctx, "migration target transaction committed",
+		"event", "migration.execution.committed",
+		"database_id", Current.DatabaseID, "migration_id", Current.ID,
+		"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText)
 
-	return Repo.RecordExecution(RecordCtx, DatabaseID, ID, UserID, true, nil)
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	if Err := Repo.FinishAttempt(RecordCtx, Attempt.ID, AttemptSucceeded, nil); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	if Err := Repo.FinishExecution(RecordCtx, Exec.ID, ExecutionSucceeded, nil); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	if _, Err := Repo.RefreshStatus(RecordCtx, Current.DatabaseID, Current.ID); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	Updated, Err := Repo.GetExecution(RecordCtx, Current.DatabaseID, Exec.ID)
+	if Err != nil {
+		return Exec, ErrUnavailable
+	}
+	Server.logger().InfoContext(Ctx, "migration execution succeeded",
+		"event", "migration.execution.succeeded",
+		"actor_id", User.ID, "actor", User.Username,
+		"database_id", Current.DatabaseID, "migration_id", Current.ID,
+		"execution_id", Exec.ID, "version", Current.Version, "revision", Exec.Revision,
+		"kind", Exec.Kind, "direction", Exec.Direction, "attempt", Attempt.AttemptNo)
+	return Updated, nil
+}
+
+func timeoutCause(Ctx Context.Context, Fallback error) error {
+	if Errors.Is(Ctx.Err(), Context.DeadlineExceeded) {
+		return ErrExecutionTimeout
+	}
+	return Fallback
+}
+
+func (Server *Service) finishFailure(Ctx Context.Context, Repo MigrationRepository, Exec Execution, Attempt Attempt, Cause error) (Execution, error) {
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	Safe := safeMessage(Cause)
+	if Err := Repo.FinishAttempt(RecordCtx, Attempt.ID, AttemptFailed, Safe); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	if Err := Repo.FinishExecution(RecordCtx, Exec.ID, ExecutionFailed, Safe); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	if _, Err := Repo.RefreshStatus(RecordCtx, Exec.DatabaseID, Exec.MigrationID); Err != nil {
+		return Exec, ErrUnavailable
+	}
+	Updated, Err := Repo.GetExecution(RecordCtx, Exec.DatabaseID, Exec.ID)
+	if Err != nil {
+		return Exec, Cause
+	}
+	Server.logger().ErrorContext(Ctx, "migration execution failed",
+		"event", "migration.execution.failed",
+		"database_id", Exec.DatabaseID, "migration_id", Exec.MigrationID,
+		"execution_id", Exec.ID, "attempt", Attempt.AttemptNo,
+		"status", Updated.Status, "error", *Safe)
+	return Updated, Cause
+}
+
+func LatestFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		if History[Index].MigrationID == MigrationID {
+			return History[Index], true
+		}
+	}
+	return Execution{}, false
+}
+
+func LatestSuccessfulFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		if History[Index].MigrationID == MigrationID && History[Index].Status == ExecutionSucceeded {
+			return History[Index], true
+		}
+	}
+	return Execution{}, false
+}
+
+// SettledFor returns the latest execution of a migration that changed (or
+// partly changed) the target. Plain failures roll back their transaction, so
+// they never move the migration: after a failed rollback the migration is still
+// applied, and after a failed forward it is still rolled back.
+func SettledFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		Item := History[Index]
+		if Item.MigrationID == MigrationID && Item.Status != ExecutionFailed {
+			return Item, true
+		}
+	}
+	return Execution{}, false
+}
+
+func ValidateApply(Current Migration, Items []Migration, History []Execution) error {
+	if Current.LockedAt != nil || !Current.Status.IsDraft() {
+		return ErrAlreadyExecuted
+	}
+	if _, Ok := LatestFor(History, Current.ID); Ok {
+		return ErrAlreadyExecuted
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if !CanApplyNow(Items, Current.Version) {
+		return ErrOutOfOrder
+	}
+	return nil
+}
+
+func ValidateRollback(Current Migration, Items []Migration, History []Execution) (Execution, error) {
+	if Current.Irreversible || Current.DownSQL == nil {
+		return Execution{}, ErrIrreversible
+	}
+	Latest, Ok := SettledFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionUp {
+		return Execution{}, ErrNotApplied
+	}
+	if Latest.Status != ExecutionSucceeded && Latest.Status != ExecutionPartial {
+		return Execution{}, ErrNotApplied
+	}
+	if HasPending(History) {
+		return Execution{}, ErrPending
+	}
+	if Current.Version != FrontierVersion(Items) {
+		return Execution{}, ErrRollbackOrder
+	}
+	return Latest, nil
+}
+
+func ValidateForward(Current Migration, Items []Migration, History []Execution) error {
+	Latest, Ok := SettledFor(History, Current.ID)
+	if !Ok || Latest.Direction != DirectionDown || Latest.Status != ExecutionSucceeded {
+		return ErrNotRolledBack
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if Current.Version != NextVersionAfter(Items, MaxAppliedVersion(Items)) {
+		return ErrForwardOrder
+	}
+	return nil
+}
+
+func ValidateRetry(Current Migration, History []Execution) error {
+	Latest, Ok := LatestFor(History, Current.ID)
+	if !Ok || (!Latest.Status.IsFailure() && Latest.Status != ExecutionPartial && Latest.Status != ExecutionPartiallyReverted) {
+		return ErrNoFailedAttempt
+	}
+	if HasPending(History) {
+		return ErrPending
+	}
+	if len(History) == 0 || History[len(History)-1].ID != Latest.ID {
+		return ErrOutOfOrder
+	}
+	return nil
+}
+
+func FrontierVersion(Items []Migration) int64 {
+	Result := MaxAppliedVersion(Items)
+	for _, Item := range Items {
+		if Item.Status == StatusPartial && Item.Version > Result {
+			Result = Item.Version
+		}
+	}
+	return Result
+}
+
+func HasPending(History []Execution) bool {
+	for _, Item := range History {
+		if Item.Status == ExecutionQueued || Item.Status == ExecutionRunning {
+			return true
+		}
+	}
+	return false
+}
+
+func MaxAppliedVersion(Items []Migration) int64 {
+	Result := int64(0)
+	for _, Item := range Items {
+		if Item.Status.IsApplied() && Item.Version > Result {
+			Result = Item.Version
+		}
+	}
+	return Result
+}
+
+func NextVersionAfter(Items []Migration, Version int64) int64 {
+	Result := int64(0)
+	for _, Item := range Items {
+		if Item.Version > Version && (Result == 0 || Item.Version < Result) {
+			Result = Item.Version
+		}
+	}
+	return Result
+}
+
+func CanApplyNow(Items []Migration, Version int64) bool {
+	for _, Item := range Items {
+		if Item.Version < Version && !Item.Status.IsApplied() && !Item.Status.IsFailure() {
+			return false
+		}
+		if Item.Version > Version && (Item.LockedAt != nil || !Item.Status.IsDraft()) {
+			return false
+		}
+	}
+	return true
+}
+
+func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
+	Latest := map[string]Execution{}
+	Settled := map[string]Execution{}
+	Pending := false
+	for _, Item := range History {
+		Latest[Item.MigrationID] = Item
+		if Item.Status != ExecutionFailed {
+			Settled[Item.MigrationID] = Item
+		}
+		if Item.Status == ExecutionQueued || Item.Status == ExecutionRunning {
+			Pending = true
+		}
+	}
+	Last := Execution{}
+	if len(History) > 0 {
+		Last = History[len(History)-1]
+	}
+	MaxApplied := MaxAppliedVersion(Items)
+	Next := NextVersionAfter(Items, MaxApplied)
+	Result := make([]Migration, len(Items))
+	copy(Result, Items)
+	for Index := range Result {
+		Item := &Result[Index]
+		Item.CanApply = false
+		Item.CanRollback = false
+		Item.CanForward = false
+		Item.CanRetry = false
+		if Pending {
+			continue
+		}
+		switch {
+		case Item.LockedAt == nil && Item.Status.IsDraft():
+			Item.CanApply = CanApplyNow(Result, Item.Version)
+		case Item.Status.IsApplied() || Item.Status == StatusPartial:
+			LatestItem, HasLatest := Settled[Item.ID]
+			Item.CanRollback = Item.Version == FrontierVersion(Result) && !Item.Irreversible && Item.DownSQL != nil &&
+				HasLatest && LatestItem.Direction == DirectionUp && (LatestItem.Status == ExecutionSucceeded || LatestItem.Status == ExecutionPartial)
+		case Item.Status.IsRolledBack():
+			LatestItem, HasLatest := Settled[Item.ID]
+			Item.CanForward = Item.Version == Next && HasLatest && LatestItem.Direction == DirectionDown && LatestItem.Status == ExecutionSucceeded
+		}
+		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.ID == Last.ID && (LatestItem.Status.IsFailure() || LatestItem.Status == ExecutionPartial || LatestItem.Status == ExecutionPartiallyReverted) {
+			Item.CanRetry = true
+		}
+	}
+	return Result
+}
+
+// Reconcile settles an execution left queued/running by a lost commit result or
+// a dead worker. It needs a platform administrator who also holds View + Edit
+// on the database (admins do not bypass grants). A normal execution is checked
+// against its target evidence row, written in the same transaction as the
+// change, so the recorded outcome cannot contradict the target. A batch
+// execution stops at its checkpoint; a retry then reconciles the last batch from
+// its evidence and continues.
+func (Server *Service) Reconcile(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string, Outcome string, Note string) (Execution, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	defer Cancel()
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	MigrationID = Strings.TrimSpace(MigrationID)
+	ExecutionID = Strings.TrimSpace(ExecutionID)
+	Outcome = Strings.TrimSpace(Outcome)
+	Note = Strings.TrimSpace(Note)
+	if DatabaseID == "" || MigrationID == "" || ExecutionID == "" {
+		return Execution{}, ErrNotFound
+	}
+	if !User.IsPlatformAdmin {
+		return Execution{}, ErrForbidden
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Execution{}, Err
+	}
+	if (Outcome != "succeeded" && Outcome != "failed") || len(Note) > 500 {
+		return Execution{}, ErrInvalidInput
+	}
+	Current, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID)
+	if Errors.Is(Err, ErrNotFound) || (Err == nil && Current.MigrationID != MigrationID) {
+		return Execution{}, ErrExecutionMissing
+	}
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Current.Status != ExecutionQueued && Current.Status != ExecutionRunning {
+		return Execution{}, ErrReconcileNotAllowed
+	}
+	Status, Err := ReconcileStatus(Current, Outcome == "succeeded")
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Current.Mode != ModeBatch {
+		Evidence, Err := Server.readEvidence(Ctx, DatabaseID, Current.ID)
+		if Err != nil {
+			return Execution{}, Err
+		}
+		if (len(Evidence) > 0) != (Status == ExecutionSucceeded) {
+			return Execution{}, ErrEvidenceMismatch
+		}
+	}
+	Result, Err := Server.Repo.ReconcileExecution(Ctx, DatabaseID, MigrationID, Current.ID, Status, actorID(User), Note)
+	if Err != nil {
+		return Execution{}, Err
+	}
+	Server.logger().InfoContext(Ctx, "migration execution reconciled",
+		"event", "migration.execution.reconciled", "actor_id", User.ID, "actor", User.Username,
+		"database_id", Logging.SanitizeLogValue(Result.DatabaseID), "migration_id", Logging.SanitizeLogValue(Result.MigrationID),
+		"execution_id", Logging.SanitizeLogValue(Result.ID), "mode", Result.Mode, "status", Result.Status, "note_length", len(Note))
+	return Result, nil
+}
+
+func (Server *Service) ExecutionEvidence(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string) ([]Evidence, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	defer Cancel()
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	MigrationID = Strings.TrimSpace(MigrationID)
+	ExecutionID = Strings.TrimSpace(ExecutionID)
+	if DatabaseID == "" || MigrationID == "" || ExecutionID == "" {
+		return nil, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return nil, Err
+	}
+	Current, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID)
+	if Errors.Is(Err, ErrNotFound) || (Err == nil && Current.MigrationID != MigrationID) {
+		return nil, ErrExecutionMissing
+	}
+	if Err != nil {
+		return nil, Err
+	}
+	return Server.readEvidence(Ctx, DatabaseID, Current.ID)
+}
+
+// readEvidence lists the target-side evidence rows of an execution. A target
+// that never ran a platform migration has no evidence table, which simply means
+// no evidence.
+func (Server *Service) readEvidence(Ctx Context.Context, DatabaseID string, ExecutionID string) ([]Evidence, error) {
+	if Server.Resolver == nil {
+		return nil, ErrUnavailable
+	}
+	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, DatabaseID)
+	if Err != nil {
+		return nil, Err
+	}
+	Target, Err := Server.getDriver().Open(DSN)
+	if Err != nil {
+		return nil, ErrUnavailable
+	}
+	defer Target.Close()
+	Rows, Err := Target.Query(Ctx, `SELECT execution_id::text, batch_no, direction, cursor_from, cursor_to, row_count, attempt_no, created_at
+FROM platform_migration.batches WHERE execution_id = $1::uuid ORDER BY batch_no`, ExecutionID)
+	if Err != nil {
+		if isUndefinedTable(Err) {
+			return []Evidence{}, nil
+		}
+		return nil, ErrUnavailable
+	}
+	defer Rows.Close()
+	Result := []Evidence{}
+	for Rows.Next() {
+		var Item Evidence
+		if Err := Rows.Scan(&Item.ExecutionID, &Item.BatchNo, &Item.Direction, &Item.CursorFrom, &Item.CursorTo, &Item.RowCount, &Item.AttemptNo, &Item.CreatedAt); Err != nil {
+			return nil, ErrUnavailable
+		}
+		Result = append(Result, Item)
+	}
+	if Err := Rows.Err(); Err != nil {
+		if isUndefinedTable(Err) {
+			return []Evidence{}, nil
+		}
+		return nil, ErrUnavailable
+	}
+	return Result, nil
 }
 
 func (Server *Service) AnalyzePlan(Ctx Context.Context, User Auth.Principal, DatabaseID string, SQL string) (QueryPlanAnalysis, error) {
@@ -249,7 +1078,7 @@ func (Server *Service) AnalyzePlan(Ctx Context.Context, User Auth.Principal, Dat
 		return QueryPlanAnalysis{}, ErrUnavailable
 	}
 	defer func() {
-		Cleanup, CleanupCancel := Context.WithTimeout(Context.Background(), 5*Time.Second)
+		Cleanup, CleanupCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 		defer CleanupCancel()
 		_ = TargetTx.Rollback(Cleanup)
 	}()

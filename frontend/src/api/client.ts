@@ -4,14 +4,40 @@ export interface User {
   is_platform_admin: boolean
 }
 
-export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed'
+export type MigrationStatus = 'draft' | 'pending' | 'committed' | 'applied' | 'rolled_back' | 'failed' | 'partial' | 'partially_reverted'
+
+export type ExecutionKind = 'apply' | 'rollback' | 'forward' | 'retry'
+export type ExecutionDirection = 'up' | 'down'
+export type ExecutionStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'partial' | 'partially_reverted'
+
+export interface MigrationReview {
+  id: string
+  revision: number
+  action: ExecutionKind
+  sql_text: string
+  status: 'pending_review' | 'approved'
+  groups: {
+    id: string
+    name: string
+    leader_user_id?: string
+    approved: boolean
+    can_approve: boolean
+  }[]
+}
 
 export interface Migration {
   id: string
   database_id: string
   version: number
+  revision: number
   title: string
   sql_text: string
+  down_sql?: string
+  batch_mode: boolean
+  batch_column?: string
+  batch_size?: number
+  irreversible: boolean
+  irreversible_reason?: string
   status: MigrationStatus
   error_message?: string
   created_by?: string
@@ -20,11 +46,73 @@ export interface Migration {
   created_at: string
   updated_at: string
   executed_at?: string
+  locked_at?: string
+  can_apply: boolean
+  can_rollback: boolean
+  can_forward: boolean
+  can_retry: boolean
 }
 
 export interface MigrationInput {
   title: string
   sql_text: string
+  down_sql: string
+  batch_mode: boolean
+  batch_column: string
+  batch_size: number
+  irreversible: boolean
+  irreversible_reason: string
+}
+
+export interface MigrationAttempt {
+  id: string
+  execution_id: string
+  attempt_no: number
+  version: number
+  revision: number
+  actor_id?: string
+  actor_username?: string
+  sql_text: string
+  status: 'running' | 'succeeded' | 'failed'
+  error_message?: string
+  started_at: string
+  finished_at?: string
+  duration_ms?: number
+}
+
+export interface MigrationExecution {
+  id: string
+  migration_id: string
+  database_id: string
+  version: number
+  revision: number
+  title: string
+  kind: ExecutionKind
+  direction: ExecutionDirection
+  status: ExecutionStatus
+  sql_text: string
+  up_sql: string
+  down_sql?: string
+  mode: 'normal' | 'batch'
+  batch_column?: string
+  batch_size?: number
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
+  rollback_of_execution_id?: string
+  retry_of_execution_id?: string
+  requested_by?: string
+  requested_by_username?: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  error_message?: string
+  reconciled_at?: string
+  reconciled_by?: string
+  reconcile_note?: string
+  attempts: MigrationAttempt[]
 }
 
 export interface QueryPlanAnalysis {
@@ -135,10 +223,123 @@ export async function DeleteMigrationDraft(DatabaseID: string, MigrationID: stri
   })
 }
 
-export async function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<Migration> {
-  return ApiRequest<Migration>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/execute`, {
+export type JobAction = 'apply' | 'rollback' | 'forward' | 'retry'
+export type JobStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+
+export interface MigrationJob {
+  id: string
+  database_id: string
+  migration_id: string
+  version: number
+  title: string
+  action: JobAction
+  status: JobStatus
+  attempts: number
+  max_attempts: number
+  available_at: string
+  locked_by?: string
+  locked_at?: string
+  lease_expires_at?: string
+  last_error?: string
+  execution_id?: string
+  requested_by?: string
+  requested_by_username?: string
+  traceparent?: string
+  execution_status?: ExecutionStatus
+  mode?: string
+  committed_batches: number
+  committed_rows: number
+  reverted_batches: number
+  reverted_rows: number
+  checkpoint_cursor: number
+  created_at: string
+  updated_at: string
+  finished_at?: string
+  reconciled_at?: string
+  reconciled_by?: string
+}
+
+export interface ExecutionEvidence {
+  execution_id: string
+  batch_no: number
+  direction: string
+  cursor_from: number
+  cursor_to: number
+  row_count: number
+  attempt_no: number
+  created_at: string
+}
+
+function ActionRequest(DatabaseID: string, MigrationID: string, Action: JobAction | 'execute'): Promise<MigrationJob> {
+  return ApiRequest<MigrationJob>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/${Action}`, {
     method: 'POST',
   })
+}
+
+export function ExecuteMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'execute')
+}
+
+export function ApplyMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'apply')
+}
+
+export function RollbackMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'rollback')
+}
+
+export function ForwardMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'forward')
+}
+
+export function RetryMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
+  return ActionRequest(DatabaseID, MigrationID, 'retry')
+}
+
+export function ListMigrationJobs(DatabaseID: string, Signal?: AbortSignal): Promise<MigrationJob[]> {
+  return ApiRequest<MigrationJob[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/jobs`, { signal: Signal })
+}
+
+export function GetMigrationJob(DatabaseID: string, JobID: string, Signal?: AbortSignal): Promise<MigrationJob> {
+  return ApiRequest<MigrationJob>(`/api/databases/${encodeURIComponent(DatabaseID)}/jobs/${encodeURIComponent(JobID)}`, { signal: Signal })
+}
+
+function MigrationReviewPath(DatabaseID: string, MigrationID: string, Action: ExecutionKind) {
+  return `/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/reviews/${Action}`
+}
+
+export async function GetMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind, Signal?: AbortSignal): Promise<MigrationReview | null> {
+  try {
+    return await ApiRequest<MigrationReview>(MigrationReviewPath(DatabaseID, MigrationID, Action), { signal: Signal })
+  } catch (Error) {
+    if (Error instanceof ApiError && Error.Status === 404 && Error.Code === 'review_not_found') return null
+    throw Error
+  }
+}
+
+export function SubmitMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind) {
+  return ApiRequest<MigrationReview>(MigrationReviewPath(DatabaseID, MigrationID, Action), { method: 'POST' })
+}
+
+export function ApproveMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind, ReviewID: string, GroupID: string) {
+  const Path = MigrationReviewPath(DatabaseID, MigrationID, Action)
+  return ApiRequest<void>(`${Path}/${encodeURIComponent(ReviewID)}/approvals/${encodeURIComponent(GroupID)}`, { method: 'PUT' })
+}
+
+export function GetExecutionEvidence(DatabaseID: string, MigrationID: string, ExecutionID: string, Signal?: AbortSignal): Promise<ExecutionEvidence[]> {
+  return ApiRequest<ExecutionEvidence[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/executions/${encodeURIComponent(ExecutionID)}/evidence`, { signal: Signal })
+}
+
+export function ReconcileExecution(DatabaseID: string, MigrationID: string, ExecutionID: string, Outcome: 'succeeded' | 'failed', Note: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/executions/${encodeURIComponent(ExecutionID)}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({ outcome: Outcome, note: Note }),
+  })
+}
+
+export async function ListMigrationHistory(DatabaseID: string, HideRollback: boolean, Signal?: AbortSignal): Promise<MigrationExecution[]> {
+  const Query = HideRollback ? '?hide_rollback=true' : ''
+  return ApiRequest<MigrationExecution[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/history${Query}`, { signal: Signal })
 }
 
 export async function AnalyzeQueryPlan(DatabaseID: string, SQLText: string): Promise<QueryPlanAnalysis> {
