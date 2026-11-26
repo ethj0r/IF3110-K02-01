@@ -275,6 +275,51 @@ The endpoint is disabled by default. When enabled, restrict access to the monito
 
 Job and batch counts are snapshots of the migration store and reflect record removal. Queue wait excludes retry backoff and appears when a worker has a recorded claim. Lock wait measures ongoing contention at scrape time. Pool wait counters reset on API restart. Divide their rates to graph mean wait per delayed acquisition.
 
+Sample `GET /api/metrics` output (after an approved batch migration of 12 rows with batch size 5):
+
+```prometheus
+# HELP wbd_migration_jobs Retained worker jobs by status.
+# TYPE wbd_migration_jobs gauge
+wbd_migration_jobs{status="queued"} 0
+wbd_migration_jobs{status="running"} 0
+wbd_migration_jobs{status="succeeded"} 1
+wbd_migration_jobs{status="failed"} 0
+wbd_migration_jobs{status="cancelled"} 0
+# HELP wbd_migration_retry_jobs Retained jobs explicitly requested as retries.
+# TYPE wbd_migration_retry_jobs gauge
+wbd_migration_retry_jobs 0
+# HELP wbd_migration_retry_attempts Automatic retry attempts across retained jobs.
+# TYPE wbd_migration_retry_attempts gauge
+wbd_migration_retry_attempts 0
+# HELP wbd_migration_execution_mean_seconds Mean execution duration across retained jobs with start and finish timestamps.
+# TYPE wbd_migration_execution_mean_seconds gauge
+wbd_migration_execution_mean_seconds 0.042
+# HELP wbd_migration_lock_wait_max_seconds Longest current wait for a migration advisory lock.
+# TYPE wbd_migration_lock_wait_max_seconds gauge
+wbd_migration_lock_wait_max_seconds 0
+# HELP wbd_migration_batches_processed Batches applied or reverted across retained executions.
+# TYPE wbd_migration_batches_processed gauge
+wbd_migration_batches_processed{direction="up"} 3
+wbd_migration_batches_processed{direction="down"} 0
+# HELP wbd_migration_rows_processed Rows applied or reverted across retained batches.
+# TYPE wbd_migration_rows_processed gauge
+wbd_migration_rows_processed{direction="up"} 12
+wbd_migration_rows_processed{direction="down"} 0
+# HELP wbd_platform_pool_connections Connections currently checked out or idle in the platform pool.
+# TYPE wbd_platform_pool_connections gauge
+wbd_platform_pool_connections{state="active"} 1
+wbd_platform_pool_connections{state="idle"} 3
+# HELP wbd_platform_pool_wait_seconds_total Time spent waiting for successful acquisitions from an empty platform pool.
+# TYPE wbd_platform_pool_wait_seconds_total counter
+wbd_platform_pool_wait_seconds_total 0
+# HELP wbd_platform_pool_waited_acquires_total Successful acquisitions that waited for an empty platform pool.
+# TYPE wbd_platform_pool_waited_acquires_total counter
+wbd_platform_pool_waited_acquires_total 0
+# HELP wbd_migration_queue_wait_mean_seconds Mean time from eligibility to latest recorded worker claim across retained jobs.
+# TYPE wbd_migration_queue_wait_mean_seconds gauge
+wbd_migration_queue_wait_mean_seconds 0.018
+```
+
 ### Grafana and OpenTelemetry Collector
 
 With the local PostgreSQL databases running, start the optional monitoring stack from the repository root.
