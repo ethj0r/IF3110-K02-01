@@ -530,15 +530,27 @@ status, and error category. Application logs are separate and go to stdout/stder
 | `POST` | `/api/databases/{dbId}/migrations/{id}/rollback` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/forward` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/retry` | View + Edit |
+| `GET` | `/api/databases/{dbId}/migrations/{id}/executions/{executionId}/evidence` | View Only / View + Edit |
+| `POST` | `/api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile` | Platform Admin + View + Edit |
 
 Action endpoints return `202 Accepted` with a migration job. The worker claims one
 job at a time per database, revalidates the action under a cross-worker advisory
 lock, executes it, and records the execution ID and final job status. Only the last
 active reversible migration can be rolled back. Forward is limited to the next
 version after the highest applied version and never runs subsequent migrations
-automatically. Retry repeats the latest failed execution snapshot. Hide rollback
-removes a successful rollback execution and the execution it cancelled, paired by
-execution ID; failed attempts remain visible.
+automatically. Retry repeats the latest failed execution snapshot. A failed
+rollback or forward rolls back its own transaction, so the migration keeps its
+previous state (still applied, or still rolled back); the action can be retried or
+requested again later, and later migrations stay blocked while an earlier one is
+rolled back. Hide rollback removes a successful rollback execution and the execution
+it cancelled, paired by execution ID; failed attempts remain visible.
+
+History is append-only at the attempt level: every attempt row keeps its own SQL
+snapshot, actor, timestamps, status, and error, and is never rewritten. An execution
+row is a state machine (`queued → running → succeeded | failed | partial |
+partially_reverted`). Resuming a batch execution from its checkpoint adds a new
+attempt to the same execution instead of starting over, so the committed batch
+counters stay continuous.
 
 Batch mode executes a cursor-based statement once per batch, each in its own target
 transaction. The up script receives `$1` as the cursor and `$2` as the batch size and
@@ -572,16 +584,52 @@ statement cancelled by its deadline is rolled back with a fresh cleanup context 
 recorded as a confirmed `execution_timeout` failure; later migrations are not
 blocked.
 
-If a commit result is lost or a worker dies, the job becomes failed/uncertain and
-the execution stays `running`, blocking later actions. A platform administrator
-verifies the target and uses the execution reconcile action (or
-`POST /api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile`)
-with `{"outcome":"succeeded"|"failed","note":"..."}`. Target evidence is available
-at `GET .../executions/{executionId}/evidence`. Reconciliation closes open attempts,
-updates the execution and job, refreshes the migration status, and preserves the
-SQL history. The per-database advisory lock is released when the worker's platform
-connection closes; the pending execution is what blocks later actions until
-reconciliation.
+#### Lock recovery when a worker fails
+
+The per-database lock is a PostgreSQL session advisory lock held on one platform
+connection for the whole execution, including the gaps between batch commits. If the
+worker process dies, its connection closes and PostgreSQL releases the lock; if the
+worker host or network disappears instead, the platform session's TCP keepalives
+(30 s idle, then 3 probes 10 s apart, set by `Store.Open`) end the session within
+about a minute. Nothing needs to be unlocked by hand. Its job stays `running` until the
+lease (`WORKER_LEASE`, renewed by a heartbeat while the worker is alive) expires, then
+the next worker marks it failed and links it to the stuck execution. Because the
+execution itself is still `running`, every later action on that database returns
+`409 execution_pending` until the outcome is reconciled. A target transaction that
+never received `COMMIT` is rolled back by PostgreSQL when its connection drops.
+
+#### Reconciling an uncertain execution
+
+Normal executions write a target-side evidence row (`platform_migration.batches`,
+`batch_no = 0`) in the same transaction as the change, and batch executions write one
+per batch, so the outcome of a lost commit can be checked on the target. In the SPA,
+open the execution in the history; a platform administrator with View + Edit on the
+database sees the target evidence and a single reconcile action:
+
+- **Normal mode:** evidence present → `succeeded`; no evidence → `failed`. The API
+  (`POST /api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile`
+  with `{"outcome":"succeeded"|"failed","note":"..."}`) rejects an outcome that
+  contradicts the evidence with `409 evidence_mismatch`.
+- **Batch mode:** the execution stops at its checkpoint (`partial`,
+  `partially_reverted`, or `failed` when nothing committed). A retry then reads the
+  evidence of the uncertain batch, records it if it committed, and continues without
+  repeating committed batches. `succeeded` is rejected with `409 batch_reconcile`.
+
+Reconciliation takes the database lock without waiting and refuses with
+`409 database_busy` while a worker still holds it or a job lease is still live. It
+closes open attempts, settles the execution, stamps the latest job of the migration
+(`reconciled_at`, `reconciled_by`) without rewriting its status, records the note,
+and refreshes the migration status. It only records a verified outcome and never runs
+SQL on the target, so it does not need a new approval; the retry that follows does.
+
+#### Approval changes after submission
+
+Review groups are computed live from the current grants and leaders. A group that
+gains access after a review was approved must approve before the action can run; a
+group that loses access no longer counts; replacing a leader requires the new leader
+to approve; a group without an active leader blocks the action until one is
+assigned. Approval is checked again when the job is enqueued, when the execution is
+created, and when the worker retries.
 
 Worker configuration: `WORKER_ID` overrides the generated worker identity,
 `WORKER_EXECUTION_TIMEOUT` controls execution time (default `30m`), `WORKER_LEASE`
@@ -784,6 +832,36 @@ Overall run summary (`190.3s` total):
 4. **Recovery (`80 → 10` API VUs, `12 → 2` Job VUs):**
    As load drops back to normal, the system recovers automatically without intervention: median API latency drops **7×** (`443.24 ms → 63.36 ms`; `p95` remains `564.21 ms` only because of the 15-second ramp-down tail from 80 to 10 VUs), queue wait drops (`83 ms → 52.5 ms`), job duration drops (`295 ms → 195 ms`), and job throughput rebounds to `3.27 jobs/s` (`180` jobs completed, `0` failures).
 
+### Re-run After the Reconciliation Fixes
+
+The stress test was repeated on `dev` after the worker timeout, heartbeat, and
+reconciliation changes, using the same build, two workers (`WORKER_POLL=100ms`), and
+`k6/stress.js` unchanged. k6 ran in Docker (`grafana/k6:0.54.0`) against
+`BASE_URL=http://host.docker.internal:8080` with `APP_ORIGIN=http://127.0.0.1:5173`;
+the target databases were `local-target` and `Schema Diff Demo Current`. All three
+thresholds passed (k6 exit code `0`).
+
+- **Total HTTP Requests:** `46,689` (`245.39 req/s`) over `190.3s`
+- **API Response Time:** `p50 = 27.59 ms`, `p95 = 207.70 ms` (passed `< 500 ms`)
+- **API Error Rate:** `0.000%` (passed `< 5%`)
+- **Migration Jobs:** `1,451` submitted, `1,451` succeeded (`100%`, passed `> 95%`), `7.63 jobs/s`
+- **Same-DB `409` Contention:** `1,371` expected conflicts
+- **Queue Wait:** `p50 = 40 ms`, `p95 = 92 ms`; **Job Duration:** `p50 = 86 ms`, `p95 = 182.5 ms`
+
+| Stage | Window | API Reqs (req/s) | API p50 (ms) | API p95 (ms) | API Error (%) | Queue Wait p50 / p95 (ms) | Job Dur p50 / p95 (ms) | Jobs Done (jobs/s) | 409 Conflicts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Normal** | 45s | `4,178` (`92.8`) | `6.28` | `12.59` | `0.00%` | `36.00` / `89.90` | `61.00` / `112.00` | `383` (`8.51`) | `0` |
+| **Stress** | 45s | `13,639` (`303.1`) | `18.05` | `51.25` | `0.00%` | `40.00` / `90.80` | `100.00` / `171.60` | `385` (`8.56`) | `485` |
+| **Peak** | 45s | `14,518` (`322.6`) | `136.48` | `237.21` | `0.00%` | `53.00` / `107.00` | `161.00` / `223.35` | `194` (`4.31`) | `700` |
+| **Recovery** | 55s | `7,865` (`143.0`) | `15.58` | `172.65` | `0.00%` | `35.00` / `88.60` | `68.00` / `140.00` | `489` (`8.89`) | `186` |
+
+The shape matches the first run: latency rises with load and peaks at the `80 + 12`
+VU stage, where job throughput halves because six VUs per database serialize on the
+one-active-job rule (`700` expected `409` responses), and it returns to normal levels
+in the recovery stage without errors, failed jobs, or stuck locks. Absolute numbers
+differ from the first run because the machine, network path (Docker), and database
+state differ; compare stages within one run rather than across runs.
+
 ## Security: SAST with CodeQL
 
 Static Application Security Testing (SAST) is automated via GitHub Actions in [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) using GitHub CodeQL (`+security-extended` query suite).
@@ -819,5 +897,15 @@ The workflow runs on `push` to `main`, `dev`, and `feat/codeql`, on `pull_reques
    - **`go`:** `0` findings (`go.sarif`: 0 findings; all 6 previous alerts closed in GitHub Code Scanning).
    - **`javascript-typescript`:** `0` findings.
    - All backend checks (`make check-fmt`, `make vet`, `go test -race ./...`) pass.
+
+### Follow-up Scan: Execution Reconciliation (PR #27)
+
+The reconciliation endpoint added in PR #27 raised `5` new findings on `dev`
+(alerts #8–#12), all in one log call of `Service.Reconcile`:
+
+| # | Rule (CWE) | Severity | Location | Potential Impact | Decision & Rationale | Fix |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8–10 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:932` | `database_id`, `migration_id`, and `execution_id` came straight from route parameters into the `migration.execution.reconciled` event. | **Valid — Fixed.** The event now logs the IDs of the execution read back from the platform database, passed through `Logging.SanitizeLogValue`. | `fix(reconcile): verify target evidence` |
+| 11–12 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:933` | `outcome` and the free-text `note` from the request body were logged verbatim. | **Valid — Fixed.** The event logs the resulting execution `status` and `note_length`; the note itself is stored only in the platform database (`reconcile_note`). | `fix(reconcile): verify target evidence` |
 
 > **Note on SAST Limitations:** A clean CodeQL scan (`0` findings) does not guarantee that the application is completely free of security vulnerabilities. SAST analyzes source code statically against known patterns and data-flow rules, so it cannot replace runtime/dynamic testing (DAST), dependency auditing, authentication/authorization review, or proper deployment hardening.
