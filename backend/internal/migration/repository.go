@@ -134,6 +134,11 @@ E.rollback_of_execution_id::text, E.retry_of_execution_id::text,
 E.requested_by::text, U.username, E.created_at, E.started_at, E.finished_at, E.error_message,
 E.reconciled_at, E.reconciled_by::text, E.reconcile_note`
 
+func isUndefinedTable(Err error) bool {
+	var PgErr *Pgconn.PgError
+	return Errors.As(Err, &PgErr) && (PgErr.Code == "42P01" || PgErr.Code == "3F000")
+}
+
 func isConflict(Err error) bool {
 	var PgErr *Pgconn.PgError
 	return Errors.As(Err, &PgErr) && PgErr.Code == "23505"
@@ -586,22 +591,21 @@ SELECT direction, finished_at, requested_by
 FROM migration_executions
 WHERE database_id = $1 AND migration_id = $2 AND status = 'succeeded'
 ORDER BY finished_at DESC NULLS LAST, created_at DESC, id DESC LIMIT 1
-), Applied AS (
+), Settled AS (
+-- Latest execution that changed the target. A plain failure rolled back its
+-- transaction, so the migration keeps the state of the execution before it.
 SELECT status, direction
 FROM migration_executions
-WHERE database_id = $1 AND migration_id = $2 AND direction = 'up' AND status IN ('succeeded', 'partial')
+WHERE database_id = $1 AND migration_id = $2 AND status IN ('succeeded', 'partial', 'partially_reverted')
 ORDER BY created_at DESC, id DESC LIMIT 1
 ), Derived AS (
 SELECT CASE
     WHEN NOT EXISTS (SELECT 1 FROM Latest) THEN 'draft'
     WHEN (SELECT status FROM Latest) IN ('queued', 'running') THEN 'pending'
-    WHEN (SELECT status FROM Latest) = 'partial' THEN 'partial'
-    WHEN (SELECT status FROM Latest) = 'partially_reverted' THEN 'partially_reverted'
-    WHEN (SELECT status FROM Latest) = 'succeeded' AND (SELECT direction FROM Latest) = 'up' THEN 'applied'
-    WHEN (SELECT status FROM Latest) = 'succeeded' AND (SELECT direction FROM Latest) = 'down' THEN 'rolled_back'
-    WHEN (SELECT status FROM Applied) = 'partial' THEN 'partial'
-    WHEN (SELECT status FROM Applied) = 'succeeded' THEN 'applied'
-    WHEN (SELECT direction FROM Success) = 'down' THEN 'rolled_back'
+    WHEN (SELECT status FROM Settled) = 'partial' THEN 'partial'
+    WHEN (SELECT status FROM Settled) = 'partially_reverted' THEN 'partially_reverted'
+    WHEN (SELECT status FROM Settled) = 'succeeded' AND (SELECT direction FROM Settled) = 'up' THEN 'applied'
+    WHEN (SELECT status FROM Settled) = 'succeeded' AND (SELECT direction FROM Settled) = 'down' THEN 'rolled_back'
     ELSE 'failed'
 END AS status,
 (SELECT error_message FROM Latest) AS error_message,
@@ -867,6 +871,11 @@ UPDATE migration_jobs J
 SET status = 'failed',
     last_error = 'worker lease expired; verify the execution outcome before retrying',
     finished_at = CURRENT_TIMESTAMP, locked_by = NULL, lease_expires_at = NULL,
+    execution_id = COALESCE(J.execution_id, (
+        SELECT X.id FROM migration_executions X
+        WHERE X.database_id = J.database_id AND X.migration_id = J.migration_id AND X.status IN ('queued', 'running')
+        ORDER BY X.created_at DESC, X.id DESC LIMIT 1
+    )),
     updated_at = CURRENT_TIMESTAMP
 FROM Expired E
 WHERE J.id = E.id`, Limit)
@@ -983,12 +992,25 @@ WHERE execution_id::text = $1 AND status = 'running'`, ExecutionID, string(Statu
 	return nil
 }
 
-func (Repo *Repository) ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error) {
+// ReconcileExecution settles a queued/running execution whose outcome was
+// verified outside the worker. It takes the per-database advisory lock without
+// waiting, so a live worker (which holds that lock for the whole execution)
+// makes it fail fast with ErrDatabaseBusy instead of blocking the request.
+// Attempt and job rows keep their history: running attempts are closed, and the
+// latest job of the migration is stamped with the reconciliation.
+func (Repo *Repository) ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Status ExecutionStatus, ActorID *string, Note string) (Execution, error) {
 	Tx, Err := Repo.begin(Ctx)
 	if Err != nil {
 		return Execution{}, ErrUnavailable
 	}
 	defer Tx.Rollback(Ctx)
+	var Locked bool
+	if Err := Tx.QueryRow(Ctx, "SELECT pg_try_advisory_xact_lock(hashtext('migration_' || $1::uuid::text))", DatabaseID).Scan(&Locked); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	if !Locked {
+		return Execution{}, ErrDatabaseBusy
+	}
 	var CurrentStatus string
 	Err = Tx.QueryRow(Ctx, `SELECT status FROM migration_executions
 WHERE database_id::text = $1 AND migration_id::text = $2 AND id::text = $3 FOR UPDATE`, DatabaseID, MigrationID, ExecutionID).Scan(&CurrentStatus)
@@ -1001,46 +1023,51 @@ WHERE database_id::text = $1 AND migration_id::text = $2 AND id::text = $3 FOR U
 	if CurrentStatus != string(ExecutionRunning) && CurrentStatus != string(ExecutionQueued) {
 		return Execution{}, ErrReconcileNotAllowed
 	}
-	Status := ExecutionFailed
-	AttemptStatus := AttemptFailed
-	if Succeeded {
-		Status = ExecutionSucceeded
-		AttemptStatus = AttemptSucceeded
+	var LiveJob bool
+	if Err := Tx.QueryRow(Ctx, `SELECT EXISTS (SELECT 1 FROM migration_jobs
+WHERE database_id::text = $1 AND status = 'running' AND lease_expires_at > CURRENT_TIMESTAMP)`, DatabaseID).Scan(&LiveJob); Err != nil {
+		return Execution{}, ErrUnavailable
 	}
-	ErrorText := Note
-	if Succeeded {
-		ErrorText = ""
+	if LiveJob {
+		return Execution{}, ErrDatabaseBusy
+	}
+	AttemptStatus := AttemptFailed
+	var Message *string
+	if Status == ExecutionSucceeded {
+		AttemptStatus = AttemptSucceeded
+	} else {
+		Text := "outcome reconciled after verification"
+		Message = &Text
 	}
 	if _, Err := Tx.Exec(Ctx, `UPDATE migration_attempts
-SET status = $2,
-    error_message = CASE WHEN $2 = 'succeeded' THEN NULL ELSE $3 END,
-    finished_at = CURRENT_TIMESTAMP,
+SET status = $2, error_message = $3, finished_at = CURRENT_TIMESTAMP,
     duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000)::bigint)
-WHERE execution_id::text = $1 AND status = 'running'`, ExecutionID, string(AttemptStatus), ErrorText); Err != nil {
+WHERE execution_id::text = $1 AND status = 'running'`, ExecutionID, string(AttemptStatus), Message); Err != nil {
 		return Execution{}, ErrUnavailable
 	}
 	var NoteValue *string
 	if Note != "" {
 		NoteValue = &Note
 	}
-	var ErrorValue *string
-	if !Succeeded && Note != "" {
-		ErrorValue = &Note
-	}
 	if _, Err := Tx.Exec(Ctx, `UPDATE migration_executions
 SET status = $2, error_message = $3, finished_at = CURRENT_TIMESTAMP,
     reconciled_at = CURRENT_TIMESTAMP, reconciled_by = $4, reconcile_note = $5
-WHERE database_id::text = $1 AND migration_id::text = $6 AND id::text = $7`,
-		DatabaseID, string(Status), ErrorValue, ActorID, NoteValue, MigrationID, ExecutionID); Err != nil {
+WHERE id::text = $1`, ExecutionID, string(Status), Message, ActorID, NoteValue); Err != nil {
 		return Execution{}, ErrUnavailable
 	}
 	if _, Err := Tx.Exec(Ctx, `UPDATE migration_jobs
-SET status = $2,
-    last_error = CASE WHEN $2 = 'failed' THEN $3 ELSE NULL END,
+SET status = CASE WHEN status = 'running' THEN 'failed' ELSE status END,
+    last_error = CASE WHEN status = 'running' THEN 'worker stopped; execution reconciled' ELSE last_error END,
     finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+    execution_id = COALESCE(execution_id, $3::uuid),
     reconciled_at = CURRENT_TIMESTAMP, reconciled_by = $4,
     locked_by = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
-WHERE execution_id::text = $1`, ExecutionID, string(Status), NoteValue, ActorID); Err != nil {
+WHERE id = (
+    SELECT id FROM migration_jobs
+    WHERE database_id::text = $1 AND migration_id::text = $2 AND status IN ('running', 'failed')
+      AND (execution_id IS NULL OR execution_id::text = $3)
+    ORDER BY created_at DESC, id DESC LIMIT 1
+)`, DatabaseID, MigrationID, ExecutionID, ActorID); Err != nil {
 		return Execution{}, ErrUnavailable
 	}
 	if Err := Tx.Commit(Ctx); Err != nil {

@@ -451,7 +451,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
               </table>
             </div>
           )}
-          {SelectedExecution && <ExecutionDetails Execution={SelectedExecution} IsAdmin={IsAdmin} OnReconciled={Refresh} />}
+          {SelectedExecution && <ExecutionDetails Execution={SelectedExecution} CanReconcile={IsAdmin && CanEdit && !JobActive} OnReconciled={Refresh} />}
         </Card>
       )}
 
@@ -584,14 +584,14 @@ function SQLInput({ Label, Value, OnChange, OnAnalyze, Pending }: { Label: strin
 }
 
 function ReconcilePanel({ Execution, OnReconciled }: { Execution: MigrationExecution; OnReconciled: () => void }) {
-  const [Outcome, SetOutcome] = useState<'succeeded' | 'failed'>('failed')
   const [Note, SetNote] = useState('')
-  const [EvidenceOpen, SetEvidenceOpen] = useState(false)
   const Evidence = useQuery({
     queryKey: ['migration-evidence', Execution.id],
     queryFn: ({ signal }) => GetExecutionEvidence(Execution.database_id, Execution.migration_id, Execution.id, signal),
-    enabled: EvidenceOpen,
   })
+  const Batch = Execution.mode === 'batch'
+  const Committed = (Evidence.data?.length ?? 0) > 0
+  const Outcome: 'succeeded' | 'failed' = !Batch && Committed ? 'succeeded' : 'failed'
   const Reconcile = useMutation({
     mutationFn: () => ReconcileExecution(Execution.database_id, Execution.migration_id, Execution.id, Outcome, Note),
     onSuccess: () => {
@@ -599,33 +599,19 @@ function ReconcilePanel({ Execution, OnReconciled }: { Execution: MigrationExecu
       OnReconciled()
     },
   })
+  const Label = Batch ? 'Stop at checkpoint' : Outcome === 'succeeded' ? 'Mark succeeded' : 'Mark failed'
   return (
-    <div className="reconcile-panel">
-      <Notice Tone="warning" Role="status">
-        This execution is still running or uncertain. Verify the target database and reconcile it before running later migrations.
-      </Notice>
-      <div className="form-grid">
-        <div className="field">
-          <label htmlFor="reconcile-outcome">Verified outcome</label>
-          <select id="reconcile-outcome" className="select" value={Outcome} onChange={Event => SetOutcome(Event.target.value as 'succeeded' | 'failed')}>
-            <option value="failed">Failed — transaction rolled back</option>
-            <option value="succeeded">Succeeded — transaction committed</option>
-          </select>
-        </div>
-        <div className="field">
-          <label htmlFor="reconcile-note">Evidence note</label>
-          <input id="reconcile-note" className="input" value={Note} onChange={Event => SetNote(Event.target.value)} maxLength={500} placeholder="What was verified in the target database?" />
-        </div>
-      </div>
-      <div className="form-actions">
-        <button className="btn" type="button" disabled={Reconcile.isPending} onClick={() => Reconcile.mutate()}>{Reconcile.isPending ? 'Reconciling…' : 'Reconcile execution'}</button>
-        <button className="btn btn-secondary" type="button" onClick={() => SetEvidenceOpen(Value => !Value)}>{EvidenceOpen ? 'Hide evidence' : 'Load target evidence'}</button>
-      </div>
-      {Reconcile.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Reconcile.error, 'Unable to reconcile the execution.')}</Notice>}
-      {Reconcile.isSuccess && <Notice Tone="success" Role="status">Execution reconciled. History refreshed.</Notice>}
-      {EvidenceOpen && Evidence.isPending && <Loading>Loading target evidence…</Loading>}
-      {EvidenceOpen && Evidence.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Evidence.error, 'Unable to read target evidence.')}</Notice>}
-      {EvidenceOpen && Evidence.data && (Evidence.data.length === 0 ? <p className="muted">No target evidence rows found.</p> : (
+    <section className="reconcile-panel" aria-label="Reconcile execution">
+      <Notice Tone="warning" Role="status">Outcome uncertain. Reconcile it to unblock this database.</Notice>
+      {Evidence.isPending && <Loading>Reading target evidence…</Loading>}
+      {Evidence.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Evidence.error, 'Unable to read target evidence.')}</Notice>}
+      {Evidence.data && (
+        <dl className="meta-grid">
+          <div><dt>Target evidence</dt><dd>{Batch ? `${Evidence.data.length} batch row(s)` : Committed ? 'Committed' : 'No commit'}</dd></div>
+          <div><dt>Result</dt><dd><StateBadge Status={Batch ? (Execution.direction === 'down' && Execution.reverted_batches > 0 ? 'partially_reverted' : Execution.committed_batches > 0 ? 'partial' : 'failed') : Outcome} /></dd></div>
+        </dl>
+      )}
+      {Evidence.data && Batch && Evidence.data.length > 0 && (
         <div className="table-scroll inset-table">
           <table className="table">
             <thead><tr><th>Batch</th><th>Direction</th><th>Cursor from</th><th>Cursor to</th><th>Rows</th><th>Attempt</th><th>Created</th></tr></thead>
@@ -636,12 +622,20 @@ function ReconcilePanel({ Execution, OnReconciled }: { Execution: MigrationExecu
             ))}</tbody>
           </table>
         </div>
-      ))}
-    </div>
+      )}
+      <div className="field">
+        <label htmlFor="reconcile-note">Note</label>
+        <input id="reconcile-note" className="input" value={Note} onChange={Event => SetNote(Event.target.value)} maxLength={500} />
+      </div>
+      <div className="form-actions">
+        <button className="btn" type="button" disabled={!Evidence.data || Reconcile.isPending} onClick={() => Reconcile.mutate()}>{Reconcile.isPending ? 'Reconciling…' : Label}</button>
+      </div>
+      {Reconcile.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Reconcile.error, 'Unable to reconcile the execution.')}</Notice>}
+    </section>
   )
 }
 
-function ExecutionDetails({ Execution, IsAdmin, OnReconciled }: { Execution: MigrationExecution; IsAdmin: boolean; OnReconciled: () => void }) {
+function ExecutionDetails({ Execution, CanReconcile, OnReconciled }: { Execution: MigrationExecution; CanReconcile: boolean; OnReconciled: () => void }) {
   return (
     <div className="card-body execution-details">
       <hr className="divider" />
@@ -666,7 +660,13 @@ function ExecutionDetails({ Execution, IsAdmin, OnReconciled }: { Execution: Mig
       )}
       <SQLBlock Label="Executed SQL snapshot" SQL={Execution.sql_text} />
       {Execution.error_message && <Notice Tone="danger" Role="alert">{Execution.error_message}</Notice>}
-      {IsAdmin && (Execution.status === 'running' || Execution.status === 'queued') && (
+      {Execution.reconciled_at && (
+        <dl className="meta-grid">
+          <div><dt>Reconciled</dt><dd>{new Date(Execution.reconciled_at).toLocaleString()}</dd></div>
+          {Execution.reconcile_note && <div><dt>Note</dt><dd>{Execution.reconcile_note}</dd></div>}
+        </dl>
+      )}
+      {CanReconcile && (Execution.status === 'running' || Execution.status === 'queued') && (
         <ReconcilePanel Execution={Execution} OnReconciled={OnReconciled} />
       )}
       <div className="table-scroll inset-table">

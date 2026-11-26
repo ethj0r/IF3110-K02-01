@@ -91,7 +91,7 @@ the definition (`locked_at`); later edits must be new migrations.
 | `POST` | `/databases/{dbId}/migrations/{id}/forward` | View + Edit | None | `202` job | Enqueues a forward |
 | `POST` | `/databases/{dbId}/migrations/{id}/retry` | View + Edit | None | `202` job | Enqueues a retry |
 | `GET` | `/databases/{dbId}/migrations/{id}/executions/{executionId}/evidence` | View Only, View + Edit | None | `200` `[...]` | Lists target-side execution evidence |
-| `POST` | `/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile` | Platform Admin | `{"outcome":"succeeded"\|"failed","note":"..."}` | `200` `{...}` | Reconciles a queued/running execution after target verification |
+| `POST` | `/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile` | Platform Admin + View + Edit | `{"outcome":"succeeded"\|"failed","note":"..."}` | `200` `{...}` | Reconciles a queued/running execution after target verification |
 | `POST` | `/databases/{dbId}/migrations/analyze` | View Only, View + Edit | `{"sql_text":"..."}` | `200` `{...}` | Runs EXPLAIN (ANALYZE) in a target rollback transaction |
 
 Action endpoints enqueue a migration job and return it immediately. A job contains
@@ -164,12 +164,32 @@ batch, allowing the worker to reconcile a commit whose platform record was lost.
 Normal and batch executions write a target-side evidence row inside the same target
 transaction as the change (`platform_migration.batches`, `batch_no=0` for normal
 mode). If a commit result is lost, a worker dies, or the lease expires, the
-execution remains `running` and blocks later actions. A platform administrator
-verifies the target and calls the reconcile endpoint with `outcome` and a `note`.
-Reconciliation only accepts `queued` or `running` executions; it closes open
-attempts, updates the execution and related job, refreshes the migration status,
-and records the actor/note. `GET .../evidence` exposes the target evidence rows for
-verification. Reconciliation never rewrites execution/attempt SQL history.
+execution remains `running` and blocks later actions. Expiring a stale job links it
+to that execution.
+
+`POST .../executions/{executionId}/reconcile` requires a platform administrator who
+also has View + Edit on the database. Body: `{"outcome":"succeeded"|"failed","note":"..."}`
+(note up to 500 characters, unknown fields rejected).
+
+| Response | When |
+| --- | --- |
+| `200` execution | Settled. Normal mode becomes `succeeded`/`failed`; batch mode stops at its checkpoint (`partial`, `partially_reverted`, or `failed` when nothing committed). |
+| `400 invalid_request` | Unknown outcome, note too long, or malformed body. |
+| `403 forbidden` | Not a platform administrator, or no View + Edit grant on the database. |
+| `404 execution_not_found` | The execution does not belong to this database and migration. |
+| `409 reconcile_not_allowed` | The execution is not `queued` or `running`. |
+| `409 evidence_mismatch` | Normal mode: the outcome contradicts the target evidence (row present means committed). |
+| `409 batch_reconcile` | Batch mode with `outcome=succeeded`; resume with a retry instead. |
+| `409 database_busy` | A worker still holds the database lock or a job lease is still live. |
+
+Reconciliation takes the advisory lock with `pg_try_advisory_xact_lock`, so it never
+waits behind a running migration. It closes open attempts, settles the execution,
+stamps the latest job of the migration (`reconciled_at`, `reconciled_by`) without
+rewriting the job status, refreshes the migration status, and records the actor and
+note. It never runs SQL on the target and never rewrites SQL snapshots.
+
+`GET .../executions/{executionId}/evidence` (View Only or View + Edit) lists the
+evidence rows of an execution; a target without the evidence table returns `[]`.
 
 ### Migration Review
 

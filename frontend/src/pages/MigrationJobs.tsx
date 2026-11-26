@@ -14,12 +14,12 @@ export function JobPanel({ Job, OnClose }: { Job: MigrationJob; OnClose?: () => 
       Actions={(
         <>
           <StateBadge Status={Job.status} />
-          {IsPartial(Job) && <StateBadge Status={Job.execution_status!} />}
+          {ExecutionOutcome(Job) && <StateBadge Status={ExecutionOutcome(Job)!} />}
           {!Active && OnClose && <button type="button" className="btn btn-ghost btn-sm" onClick={OnClose}>Close</button>}
         </>
       )}
     >
-      <span className="sr-only" role="status">{Label} {Job.status}{IsPartial(Job) ? `, ${Job.execution_status}` : ''}</span>
+      <span className="sr-only" role="status">{Label} {Job.status}{ExecutionOutcome(Job) ? `, execution ${ExecutionOutcome(Job)}` : ''}</span>
       {Active && <div className="progress" role="progressbar" aria-label={`${Label} progress`} />}
       <dl className="meta-grid">
         <div><dt>Migration</dt><dd>{Job.title}</dd></div>
@@ -28,6 +28,7 @@ export function JobPanel({ Job, OnClose }: { Job: MigrationJob; OnClose?: () => 
         <div><dt>Requested by</dt><dd>{Job.requested_by_username ?? '—'}</dd></div>
         {Job.locked_by && <div><dt>Worker</dt><dd className="mono">{Job.locked_by}</dd></div>}
         {Job.execution_id && <div><dt>Execution</dt><dd><code title={Job.execution_id}>{Job.execution_id.slice(0, 8)}</code></dd></div>}
+        {Job.reconciled_at && <div><dt>Reconciled</dt><dd>{new Date(Job.reconciled_at).toLocaleString()}</dd></div>}
       </dl>
       {Job.mode === 'batch' && (Reverts ? (
         <div className="metrics">
@@ -78,7 +79,7 @@ export function RecentJobs({ Jobs, SelectedID, OnSelect }: {
                 <td className="cell-nowrap">{ActionLabel(Job.action)}</td>
                 <td className="cell-nowrap">
                   <StateBadge Status={Job.status} />
-                  {IsPartial(Job) && <> <StateBadge Status={Job.execution_status!} /></>}
+                  {ExecutionOutcome(Job) && <> <StateBadge Status={ExecutionOutcome(Job)!} /></>}
                 </td>
                 <td className="mono">{Job.attempts}/{Job.max_attempts}</td>
                 <td className="mono cell-nowrap">{Job.mode === 'batch' ? BatchCount(Job, 'batches') : '—'}</td>
@@ -98,8 +99,12 @@ export function RecentJobs({ Jobs, SelectedID, OnSelect }: {
   )
 }
 
-function IsPartial(Job: MigrationJob) {
-  return Job.execution_status === 'partial' || Job.execution_status === 'partially_reverted'
+// ExecutionOutcome returns the execution status worth showing next to the job
+// status: partial progress, or the outcome an administrator reconciled.
+function ExecutionOutcome(Job: MigrationJob) {
+  if (Job.execution_status === 'partial' || Job.execution_status === 'partially_reverted') return Job.execution_status
+  if (Job.reconciled_at && Job.execution_status && Job.execution_status !== Job.status) return Job.execution_status
+  return undefined
 }
 
 function BatchCount(Job: MigrationJob, Unit: 'batches' | 'rows') {

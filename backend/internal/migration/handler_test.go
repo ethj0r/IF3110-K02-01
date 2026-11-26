@@ -55,6 +55,8 @@ func newTestHandler(Policy Access.Evaluator, DriverMock Driver.Driver) (Http.Han
 		R.Post(Prefix+"/{migrationID}/rollback", Routes.Rollback)
 		R.Post(Prefix+"/{migrationID}/forward", Routes.Forward)
 		R.Post(Prefix+"/{migrationID}/retry", Routes.Retry)
+		R.Post(Prefix+"/{migrationID}/executions/{executionID}/reconcile", Routes.Reconcile)
+		R.Get(Prefix+"/{migrationID}/executions/{executionID}/evidence", Routes.Evidence)
 	}
 	registerRoutes("/databases/{dbID}/migrations")
 	registerRoutes("/connections/{dbID}/migrations")
@@ -296,5 +298,54 @@ func TestHandlerAnalyzeEndpoint(T *Testing.T) {
 	Router.ServeHTTP(Res, Req)
 	if Res.Code != 400 {
 		T.Fatalf("expected 400 for empty sql, got %d", Res.Code)
+	}
+}
+
+func TestHandlerReconcileResponses(T *Testing.T) {
+	Policy := Access.StaticEvaluator{
+		DefaultLevel: Access.LevelNone,
+		Grants: map[string]map[string]Access.Level{
+			"user-editor": {"db-1": Access.LevelViewEdit},
+		},
+	}
+	Router, Repo, Principal, _ := newTestHandler(Policy, &MockDriver{Conn: &MockConn{Tx: &MockTx{}}})
+	Repo.Executions["exec-1"] = Execution{ID: "exec-1", DatabaseID: "db-1", MigrationID: "mig-1", Status: ExecutionRunning, Mode: ModeBatch, Direction: DirectionUp, CommittedBatches: 1}
+	Path := "/databases/db-1/migrations/mig-1/executions/exec-1/reconcile"
+	Send := func(Body string) (int, string) {
+		Recorder := Httptest.NewRecorder()
+		Router.ServeHTTP(Recorder, Httptest.NewRequest(Http.MethodPost, Path, Strings.NewReader(Body)))
+		var Payload struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+			Status string `json:"status"`
+		}
+		_ = Json.Unmarshal(Recorder.Body.Bytes(), &Payload)
+		if Payload.Error.Code != "" {
+			return Recorder.Code, Payload.Error.Code
+		}
+		return Recorder.Code, Payload.Status
+	}
+	if Code, Value := Send(`{"outcome":"failed"}`); Code != 403 || Value != "forbidden" {
+		T.Fatalf("editor without platform admin must get 403, got %d %s", Code, Value)
+	}
+	Principal.IsPlatformAdmin = true
+	if Code, Value := Send(`{"outcome":"failed","extra":1}`); Code != 400 || Value != "invalid_request" {
+		T.Fatalf("unknown fields must get 400, got %d %s", Code, Value)
+	}
+	if Code, Value := Send(`{"outcome":"succeeded"}`); Code != 409 || Value != "batch_reconcile" {
+		T.Fatalf("batch succeeded must get 409 batch_reconcile, got %d %s", Code, Value)
+	}
+	if Code, Value := Send(`{"outcome":"failed","note":"worker host lost"}`); Code != 200 || Value != string(ExecutionPartial) {
+		T.Fatalf("reconcile should stop the batch at its checkpoint, got %d %s", Code, Value)
+	}
+	if Code, Value := Send(`{"outcome":"failed"}`); Code != 409 || Value != "reconcile_not_allowed" {
+		T.Fatalf("second reconcile must get 409, got %d %s", Code, Value)
+	}
+	Principal.ID = "user-stranger"
+	Recorder := Httptest.NewRecorder()
+	Router.ServeHTTP(Recorder, Httptest.NewRequest(Http.MethodGet, "/databases/db-1/migrations/mig-1/executions/exec-1/evidence", nil))
+	if Recorder.Code != 403 {
+		T.Fatalf("evidence without a grant must get 403, got %d", Recorder.Code)
 	}
 }

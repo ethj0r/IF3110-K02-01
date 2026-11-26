@@ -314,7 +314,7 @@ func (M *MockRepo) CloseRunningAttempts(_ Context.Context, ExecutionID string, S
 	return nil
 }
 
-func (M *MockRepo) ReconcileExecution(_ Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error) {
+func (M *MockRepo) ReconcileExecution(_ Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Status ExecutionStatus, ActorID *string, Note string) (Execution, error) {
 	Exec, Ok := M.Executions[ExecutionID]
 	if !Ok || Exec.DatabaseID != DatabaseID || Exec.MigrationID != MigrationID {
 		return Execution{}, ErrExecutionMissing
@@ -322,36 +322,18 @@ func (M *MockRepo) ReconcileExecution(_ Context.Context, DatabaseID string, Migr
 	if Exec.Status != ExecutionRunning && Exec.Status != ExecutionQueued {
 		return Execution{}, ErrReconcileNotAllowed
 	}
-	Status := ExecutionFailed
 	AttemptStatus := AttemptFailed
-	if Succeeded {
-		Status = ExecutionSucceeded
+	if Status == ExecutionSucceeded {
 		AttemptStatus = AttemptSucceeded
 	}
 	Exec.Status = Status
-	Exec.ErrorMessage = nil
-	if !Succeeded && Note != "" {
-		Exec.ErrorMessage = &Note
-	}
 	Now := Time.Now().UTC()
 	Exec.FinishedAt = &Now
 	Exec.ReconciledAt = &Now
 	Exec.ReconciledBy = ActorID
 	Exec.ReconcileNote = &Note
 	M.Executions[ExecutionID] = Exec
-	_ = M.CloseRunningAttempts(Context.Background(), ExecutionID, AttemptStatus, Note)
-	for ID, Job := range M.Jobs {
-		if Job.ExecutionID != nil && *Job.ExecutionID == ExecutionID {
-			Job.Status = JobFailed
-			if Succeeded {
-				Job.Status = JobSucceeded
-			}
-			Job.FinishedAt = &Now
-			Job.ReconciledAt = &Now
-			Job.ReconciledBy = ActorID
-			M.Jobs[ID] = Job
-		}
-	}
+	_ = M.CloseRunningAttempts(Context.Background(), ExecutionID, AttemptStatus, "outcome reconciled after verification")
 	_, _ = M.RefreshStatus(Context.Background(), DatabaseID, MigrationID)
 	return M.GetExecution(Context.Background(), DatabaseID, ExecutionID)
 }
@@ -504,11 +486,11 @@ func (M *MockRepo) RefreshStatus(_ Context.Context, DatabaseID string, Migration
 			Success, SuccessOk = Exec, true
 		}
 	}
-	Applied, AppliedOk := Execution{}, false
+	Settled, SettledOk := Execution{}, false
 	for _, ID := range M.Order {
 		Exec := M.Executions[ID]
-		if Exec.DatabaseID == DatabaseID && Exec.MigrationID == MigrationID && Exec.Direction == DirectionUp && (Exec.Status == ExecutionSucceeded || Exec.Status == ExecutionPartial) {
-			Applied, AppliedOk = Exec, true
+		if Exec.DatabaseID == DatabaseID && Exec.MigrationID == MigrationID && Exec.Status != ExecutionFailed && Exec.Status != ExecutionQueued && Exec.Status != ExecutionRunning {
+			Settled, SettledOk = Exec, true
 		}
 	}
 	switch {
@@ -516,19 +498,13 @@ func (M *MockRepo) RefreshStatus(_ Context.Context, DatabaseID string, Migration
 		Item.Status = StatusDraft
 	case Latest.Status == ExecutionQueued || Latest.Status == ExecutionRunning:
 		Item.Status = StatusPending
-	case Latest.Status == ExecutionPartial:
+	case SettledOk && Settled.Status == ExecutionPartial:
 		Item.Status = StatusPartial
-	case Latest.Status == ExecutionPartiallyReverted:
+	case SettledOk && Settled.Status == ExecutionPartiallyReverted:
 		Item.Status = StatusPartiallyReverted
-	case Latest.Status == ExecutionSucceeded && Latest.Direction == DirectionUp:
+	case SettledOk && Settled.Direction == DirectionUp:
 		Item.Status = StatusApplied
-	case Latest.Status == ExecutionSucceeded && Latest.Direction == DirectionDown:
-		Item.Status = StatusRolledBack
-	case AppliedOk && Applied.Status == ExecutionPartial:
-		Item.Status = StatusPartial
-	case AppliedOk && Applied.Direction == DirectionUp:
-		Item.Status = StatusApplied
-	case SuccessOk && Success.Direction == DirectionDown:
+	case SettledOk && Settled.Direction == DirectionDown:
 		Item.Status = StatusRolledBack
 	default:
 		Item.Status = StatusFailed
@@ -940,5 +916,48 @@ func TestWorkerRetriesTransientFailureWithBackoff(T *Testing.T) {
 	}
 	if Repo.Items[Created.ID].Status != StatusApplied {
 		T.Fatal("retry did not apply the migration")
+	}
+}
+
+func TestFailedRollbackKeepsActivePosition(T *Testing.T) {
+	Ctx := Context.Background()
+	Editor := Auth.Principal{ID: "editor", Username: "editor"}
+	Repo := NewMockRepo()
+	Tx := &MockTx{}
+	Server := newMockService(Repo, Tx)
+	A, Err := Server.Create(Ctx, Editor, "db", validInput("A", "CREATE TABLE a (id INT);", "DROP TABLE a;"))
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	B, Err := Server.Create(Ctx, Editor, "db", validInput("B", "CREATE TABLE b (id INT);", "DROP TABLE b;"))
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Server.Execute(Ctx, Editor, "db", A.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	ApplyB, Err := Server.Execute(Ctx, Editor, "db", B.ID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Tx.ExecError = Errors.New("relation is in use")
+	Failed, Err := Server.Rollback(Ctx, Editor, "db", B.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) || Failed.Status != ExecutionFailed {
+		T.Fatalf("rollback should fail: %+v %v", Failed, Err)
+	}
+	if Repo.Items[B.ID].Status != StatusApplied {
+		T.Fatalf("a failed rollback must leave B applied, got %s", Repo.Items[B.ID].Status)
+	}
+	if _, Err := Server.Rollback(Ctx, Editor, "db", A.ID); !Errors.Is(Err, ErrRollbackOrder) {
+		T.Fatalf("B is still the last active migration, got %v", Err)
+	}
+	Hidden, Err := Server.History(Ctx, Editor, "db", true)
+	if Err != nil || len(Hidden) != 3 {
+		T.Fatalf("hide rollback must keep the failed rollback and the execution it targeted: %+v %v", Hidden, Err)
+	}
+	Tx.ExecError = nil
+	Done, Err := Server.Rollback(Ctx, Editor, "db", B.ID)
+	if Err != nil || Done.RollbackOfExecutionID == nil || *Done.RollbackOfExecutionID != ApplyB.ID {
+		T.Fatalf("rollback after the failure should undo B's apply: %+v %v", Done, Err)
 	}
 }

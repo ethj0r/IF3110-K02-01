@@ -95,6 +95,12 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 422, "execution_timeout", "Migration exceeded its execution timeout")
 	case Errors.Is(Err, ErrReconcileNotAllowed):
 		Httpx.Error(W, 409, "reconcile_not_allowed", "Only a queued or running execution can be reconciled")
+	case Errors.Is(Err, ErrDatabaseBusy):
+		Httpx.Error(W, 409, "database_busy", "A worker still holds this database; wait for the job or its lease to end")
+	case Errors.Is(Err, ErrEvidenceMismatch):
+		Httpx.Error(W, 409, "evidence_mismatch", "The outcome contradicts the target evidence")
+	case Errors.Is(Err, ErrBatchReconcile):
+		Httpx.Error(W, 409, "batch_reconcile", "Batch executions stop at their checkpoint; reconcile as failed and retry")
 	case Errors.Is(Err, ErrConflict):
 		Httpx.Error(W, 409, "conflict", "Migration version conflict")
 	case Errors.Is(Err, ErrLocked):
