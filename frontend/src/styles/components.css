@@ -970,3 +970,9 @@ details[open] > summary {
     opacity: 0.35;
   }
 }
+
+.reconcile-panel {
+  display: grid;
+  gap: 12px;
+  margin-block: 12px;
+}

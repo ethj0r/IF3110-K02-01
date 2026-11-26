@@ -467,27 +467,70 @@ Test('keeps the active job visible across navigation and shows partial batch pro
   Expect(Screen.queryByRole('region', { name: 'Apply job' })).toBeNull()
 })
 
-Test('administrators can reconcile an uncertain execution', async () => {
+function ReconcileFetch(Options: { Admin: boolean; Level: string; Evidence: unknown[]; Calls: { Path: string; Body?: string }[] }) {
   const Running = ExecutionFixture({ status: 'running', finished_at: undefined })
-  const Reconciled = ExecutionFixture({ status: 'failed', finished_at: '2026-01-01T00:10:00Z', reconciled_at: '2026-01-01T00:10:00Z', reconcile_note: 'verified rolled back' })
-  Vi.stubGlobal('fetch', Vi.fn(async (Path: string, Options?: RequestInit) => {
-    if (Path === '/api/auth/me') return Response.json({ user: { id: 'admin-1', username: 'admin', is_platform_admin: true }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
+  let Settled = false
+  return Vi.fn(async (Path: string, Init?: RequestInit) => {
+    Options.Calls.push({ Path, Body: typeof Init?.body === 'string' ? Init.body : undefined })
+    if (Path === '/api/auth/me') return Response.json({ user: { id: 'admin-1', username: 'admin', is_platform_admin: Options.Admin }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
     if (Path === '/api/auth/csrf') return Response.json({ csrf_token: 'c'.repeat(43) })
-    if (Path === '/api/databases') return Response.json(Databases)
+    if (Path === '/api/databases') return Response.json(Databases.map(Item => ({ ...Item, level: Options.Level })))
     if (Path === '/api/databases/db-1/jobs') return Response.json([])
-    if (Path.includes('/migrations/history')) return Response.json([Running])
+    if (Path.includes('/migrations/history')) {
+      return Response.json([Settled
+        ? ExecutionFixture({ status: 'failed', finished_at: '2026-01-01T00:10:00Z', reconciled_at: '2026-01-01T00:10:00Z', reconcile_note: 'worker host lost' })
+        : Running])
+    }
     if (Path === '/api/databases/db-1/migrations') return Response.json([MigrationFixture()])
-    if (Path.endsWith('/executions/exec-1/evidence')) return Response.json([])
-    if (Path.endsWith('/executions/exec-1/reconcile') && Options?.method === 'POST') return Response.json(Reconciled)
+    if (Path.endsWith('/executions/exec-1/evidence')) return Response.json(Options.Evidence)
+    if (Path.endsWith('/executions/exec-1/reconcile') && Init?.method === 'POST') {
+      Settled = true
+      return Response.json(ExecutionFixture({ status: 'failed' }))
+    }
     return new Response(null, { status: 404 })
-  }))
+  })
+}
+
+Test('administrators reconcile an uncertain execution from its target evidence', async () => {
+  const Calls: { Path: string; Body?: string }[] = []
+  Vi.stubGlobal('fetch', ReconcileFetch({ Admin: true, Level: 'view_edit', Evidence: [], Calls }))
   Mount()
   const User = UserEvent.setup()
   await Screen.findByText('Initial Schema')
   await User.click(Screen.getByRole('button', { name: 'Inspect' }))
-  const Reconcile = await Screen.findByRole('button', { name: 'Reconcile execution' })
-  await User.selectOptions(Screen.getByLabelText('Verified outcome'), 'failed')
-  await User.type(Screen.getByLabelText('Evidence note'), 'verified rolled back')
-  await User.click(Reconcile)
-  Expect(await Screen.findByText('Execution reconciled. History refreshed.')).toBeTruthy()
+  const Panel = await Screen.findByRole('region', { name: 'Reconcile execution' })
+  Expect(await Within(Panel).findByText('No commit')).toBeTruthy()
+  await User.type(Within(Panel).getByLabelText('Note'), 'worker host lost')
+  await User.click(Within(Panel).getByRole('button', { name: 'Mark failed' }))
+  await Screen.findByText('worker host lost')
+  Expect(Screen.queryByRole('region', { name: 'Reconcile execution' })).toBeNull()
+  const Sent = Calls.find(Call => Call.Path.endsWith('/reconcile'))
+  Expect(JSON.parse(Sent?.Body ?? '{}')).toEqual({ outcome: 'failed', note: 'worker host lost' })
+})
+
+Test('committed evidence offers only the succeeded outcome', async () => {
+  const Calls: { Path: string; Body?: string }[] = []
+  const Evidence = [{ execution_id: 'exec-1', batch_no: 0, direction: 'up', cursor_from: 0, cursor_to: 0, row_count: 0, attempt_no: 1, created_at: '2026-01-01T00:00:00Z' }]
+  Vi.stubGlobal('fetch', ReconcileFetch({ Admin: true, Level: 'view_edit', Evidence, Calls }))
+  Mount()
+  const User = UserEvent.setup()
+  await Screen.findByText('Initial Schema')
+  await User.click(Screen.getByRole('button', { name: 'Inspect' }))
+  const Panel = await Screen.findByRole('region', { name: 'Reconcile execution' })
+  Expect(await Within(Panel).findByText('Committed')).toBeTruthy()
+  Expect(Within(Panel).getByRole('button', { name: 'Mark succeeded' })).toBeTruthy()
+  Expect(Within(Panel).queryByRole('button', { name: 'Mark failed' })).toBeNull()
+})
+
+Test('reconcile needs a platform administrator with edit access', async () => {
+  for (const Options of [{ Admin: false, Level: 'view_edit' }, { Admin: true, Level: 'view_only' }]) {
+    Vi.stubGlobal('fetch', ReconcileFetch({ ...Options, Evidence: [], Calls: [] }))
+    const View = Mount()
+    const User = UserEvent.setup()
+    await Screen.findByText('Initial Schema')
+    await User.click(Screen.getByRole('button', { name: 'Inspect' }))
+    await Screen.findByText('Executed SQL snapshot')
+    Expect(Screen.queryByRole('region', { name: 'Reconcile execution' })).toBeNull()
+    View.unmount()
+  }
 })

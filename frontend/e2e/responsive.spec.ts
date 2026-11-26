@@ -2,6 +2,7 @@ import { expect as Expect, test as Test } from '@playwright/test'
 import type { Page } from '@playwright/test'
 
 const Viewports = [
+  { Name: 'small mobile', Width: 320, Height: 640 },
   { Name: 'mobile', Width: 360, Height: 780 },
   { Name: 'tablet', Width: 820, Height: 1180 },
   { Name: 'desktop', Width: 1440, Height: 900 },
