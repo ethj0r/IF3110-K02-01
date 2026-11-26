@@ -110,12 +110,12 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 		"event", "migration.job.claimed", "queue_wait_ms", QueueWait)
 
 	Latest, LatestErr := W.Repo.LatestExecution(Ctx, Job.DatabaseID, Job.MigrationID)
-	UseRetry := LatestErr == nil && (Latest.Status.IsFailure() || Latest.Status == ExecutionPartial || Latest.Status == ExecutionPartiallyReverted)
+	AutoRetry := Job.Attempts > 1 && LatestErr == nil && Latest.Status.IsFailure() && Latest.Kind == kindForJobAction(Job.Action)
 
 	var Exec Execution
 	var Err error
-	if UseRetry {
-		Exec, Err = W.Service.Retry(Ctx, User, Job.DatabaseID, Job.MigrationID)
+	if AutoRetry {
+		Exec, Err = W.Service.RetryTransient(Ctx, User, Job.DatabaseID, Job.MigrationID, Latest.ID, kindForJobAction(Job.Action))
 	} else {
 		switch Job.Action {
 		case JobApply:
@@ -214,6 +214,8 @@ func jobErrorMessage(Err error) string {
 		return "migration store or target database unavailable"
 	case Errors.Is(Err, ErrForbidden):
 		return "permission denied for database migration"
+	case Errors.Is(Err, ErrApprovalRequired):
+		return "migration requires approval from every group"
 	case Errors.Is(Err, ErrInvalidInput):
 		return "invalid migration request"
 	case Errors.Is(Err, ErrNotFound):

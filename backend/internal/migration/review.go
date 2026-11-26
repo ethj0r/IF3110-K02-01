@@ -170,3 +170,49 @@ SELECT EXISTS (SELECT 1 FROM current_review WHERE id::text = $4), EXISTS (SELECT
 	}
 	return nil
 }
+
+func (Repo *Repository) hasReviewApproval(Ctx Context.Context, Key reviewKey, SQLText string) (bool, error) {
+	var Approved bool
+	Err := Repo.queryRow(Ctx, reviewGroups+`
+SELECT EXISTS (
+    SELECT 1 FROM current_review R JOIN review_groups G ON G.review_id = R.id
+    WHERE R.sql_text = $4
+    GROUP BY R.id HAVING bool_and(G.approved)
+)`, Key.DatabaseID, Key.MigrationID, Key.Action, SQLText).Scan(&Approved)
+	if Err != nil {
+		return false, ErrUnavailable
+	}
+	return Approved, nil
+}
+
+func (Repo *Repository) hasExecutionApproval(Ctx Context.Context, DatabaseID, ExecutionID string) (bool, error) {
+	var Approved bool
+	Err := Repo.queryRow(Ctx, `WITH target_exec AS (
+    SELECT E.id, E.migration_id, E.database_id, E.revision, E.kind, E.sql_text, E.created_at,
+           (SELECT P.id FROM migration_executions P
+            WHERE P.migration_id = E.migration_id
+              AND (P.created_at < E.created_at OR (P.created_at = E.created_at AND P.id < E.id))
+            ORDER BY P.created_at DESC, P.id DESC LIMIT 1) AS previous_execution_id
+    FROM migration_executions E
+    WHERE E.database_id::text = $1 AND E.id::text = $2
+), matched_review AS (
+    SELECT R.id, T.database_id
+    FROM target_exec T
+    JOIN migration_reviews R ON R.migration_id = T.migration_id
+    WHERE R.revision = T.revision AND R.action = T.kind AND R.sql_text = T.sql_text
+      AND R.previous_execution_id IS NOT DISTINCT FROM T.previous_execution_id
+)
+SELECT EXISTS (
+    SELECT 1 FROM matched_review R
+    JOIN group_database_access A ON A.database_id = R.database_id
+    JOIN groups G ON G.id = A.group_id
+    LEFT JOIN group_leaders L ON L.group_id = G.id
+    LEFT JOIN users U ON U.id = L.user_id AND U.is_active
+    LEFT JOIN migration_review_approvals V ON V.review_id = R.id AND V.group_id = G.id
+    GROUP BY R.id HAVING bool_and(COALESCE(V.approved_by = U.id, FALSE))
+)`, DatabaseID, ExecutionID).Scan(&Approved)
+	if Err != nil {
+		return false, ErrUnavailable
+	}
+	return Approved, nil
+}
