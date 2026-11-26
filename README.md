@@ -635,3 +635,75 @@ The administration UI is available at `/admin` for platform administrators:
 | `/admin/connections` | Add, edit, test, and remove target connections |
 
 The admin API is under `/api/admin` and every route requires an authenticated platform administrator. Creating or promoting administrators is not supported through the API. Deactivating or deleting the last active administrator is rejected with `last_admin`.
+
+## Stress Testing with k6
+
+Stress testing is implemented with [Grafana k6](https://k6.io/) in [`k6/stress.js`](k6/stress.js) to evaluate API latency, throughput, queue wait time, asynchronous migration completion, same-database contention, multi-database parallelism, and post-peak system recovery.
+
+### Script Overview
+
+[`k6/stress.js`](k6/stress.js) runs two concurrent `ramping-vus` scenarios across four load stages (**Normal → Stress → Peak → Recovery**, total `3m10s` plus graceful ramp-down):
+
+1. **`api_stress` (0 → 10 → 40 → 80 → 10 → 0 VUs):**
+   Continuously exercises authenticated read endpoints (`GET /api/databases`, `GET /api/databases/{dbId}/migrations`, `GET /api/databases/{dbId}/migrations/history`, and `GET /api/databases/{dbId}/schemas`) across both target databases.
+2. **`migration_jobs` (0 → 2 → 6 → 12 → 2 → 0 VUs):**
+   In `setup()`, the script authenticates as the bootstrap administrator, ensures the group leader is assigned, selects two target databases (`local-target` and `local-target_b`), and clears any unexecuted leftover drafts. During the test, VUs distribute across both databases (`__VU % 2`): at 2 VUs both databases run in parallel without contention; at 6 and 12 VUs multiple VUs contend on the **same database** while other VUs execute concurrently on a **different database**. Each iteration:
+   - Creates a reversible migration draft (`SELECT 1;`), submits an `apply` review, and approves it as the group leader.
+   - Submits the approved migration via `POST /api/databases/{dbId}/migrations/{id}/apply` (retrying briefly on expected `409` same-database active-job / linear-order contention, tracked separately as `migration_same_db_conflicts`).
+   - Polls `GET /api/databases/{dbId}/jobs/{jobId}` every `150ms` until the job reaches a terminal state (`succeeded`, `failed`, or `cancelled`). A `202 Accepted` enqueue response is **not** counted as migration success; only jobs reaching `status === "succeeded"` are counted.
+   - Computes server-side **queue wait** (`locked_at - created_at`) and **job completion duration** (`finished_at - created_at`) directly from job timestamps.
+
+### Thresholds & How to Run
+
+Configured k6 thresholds:
+
+- `api_response_time_ms`: `p(95) < 500` ms
+- `api_error_rate`: `rate < 0.05` (`< 5%`)
+- `migration_job_success_rate`: `rate > 0.95` (`> 95%`)
+
+Run locally against the API server and two asynchronous workers:
+
+```sh
+make db-up && make bootstrap && make seed-dev
+make build
+
+# Terminal 1 (API)
+set -a && . ./.env && set +a && LOG_LEVEL=warn ./bin/server
+
+# Terminal 2 & 3 (2 parallel workers)
+set -a && . ./.env && set +a && WORKER_ID=worker-1 WORKER_POLL=100ms LOG_LEVEL=warn ./bin/worker
+set -a && . ./.env && set +a && WORKER_ID=worker-2 WORKER_POLL=100ms LOG_LEVEL=warn ./bin/worker
+
+# Terminal 4 (k6 stress test)
+set -a && . ./.env && set +a && k6 run k6/stress.js
+```
+
+### Results (2 Target Databases, 2 Workers, `WORKER_POLL=100ms`)
+
+Overall run summary (`190.3s` total):
+
+- **Total HTTP Requests:** `24,521` (`128.84 req/s`)
+- **API Response Time:** `p50 = 137.01 ms`, `p95 = 601.48 ms` *(crossed `500 ms` threshold at Peak load — see analysis)*
+- **API Error Rate:** `0.000%` *(passed `< 5%` threshold)*
+- **Migration Jobs:** `713` submitted, `713` succeeded (`100.0%`, passed `> 95%` threshold), `0` failed (`3.75 jobs/s` overall)
+- **Same-DB `409` Contention:** `501` expected conflicts
+- **Queue Wait:** `p50 = 52.00 ms`, `p95 = 121.40 ms`
+- **Job Completion Duration:** `p50 = 158.00 ms`, `p95 = 379.80 ms`
+
+| Stage | VUs (API + Jobs) | Window | API Reqs (req/s) | API p50 (ms) | API p95 (ms) | API Error (%) | Queue Wait p50 / p95 (ms) | Job Dur p50 / p95 (ms) | Jobs Done (jobs/s) | 409 Conflicts |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Normal** | `10 + 2` | 45s | `3,682` (`81.8`) | `15.70` | `35.59` | `0.00%` | `37.00` / `85.00` | `93.00` / `151.00` | `283` (`6.29`) | `0` |
+| **Stress** | `40 + 6` | 45s | `6,983` (`155.2`) | `122.80` | `293.25` | `0.00%` | `66.00` / `128.70` | `246.00` / `394.10` | `167` (`3.71`) | `145` |
+| **Peak** | `80 + 12` | 45s | `6,460` (`143.6`) | `443.24` | `718.23` | `0.00%` | `83.00` / `140.90` | `295.00` / `421.00` | `83` (`1.84`) | `289` |
+| **Recovery** | `10 + 2` → `0` | 55s | `4,235` (`77.0`) | `63.36` | `564.21` | `0.00%` | `52.50` / `129.15` | `195.00` / `398.40` | `180` (`3.27`) | `67` |
+
+### Analysis per Load Level
+
+1. **Normal (`10` API VUs + `2` Job VUs):**
+   The platform easily stays within SLA (`p50 = 15.70 ms`, `p95 = 35.59 ms`, `0.00%` errors). Because each job VU targets a different database and two workers run in parallel, there are `0` same-DB conflicts and job throughput peaks at `6.29 jobs/s` (`283` completed jobs, `p50` queue wait `37 ms` within the `100 ms` poll interval).
+2. **Stress (`40` API VUs + `6` Job VUs):**
+   API throughput nearly doubles to `155.2 req/s` with `p95 = 293.25 ms` (still well under the `500 ms` threshold) and `0.00%` errors. With 3 job VUs contending per database, same-DB serialization triggers `145` expected `409` conflicts, increasing median queue wait to `66 ms` and job completion duration to `246 ms` (`3.71 jobs/s`).
+3. **Peak (`80` API VUs + `12` Job VUs):**
+   The system reaches its saturation knee: API throughput plateaus/dips slightly to `143.6 req/s` while `p50` rises to `443.24 ms` and `p95` reaches `718.23 ms`, crossing the `500 ms` `p95` threshold. The primary bottlenecks are platform PostgreSQL connection pool contention (`pgxpool` default `MaxConns`) shared across 92 concurrent VUs plus heavier `GET /migrations` and `/migrations/history` reads as the history table grows past 600+ executions, along with `289` same-DB `409` conflicts from 6 VUs per database competing for linear execution order. Crucially, the system degrades gracefully: **`0.00%` API errors**, **`0` failed jobs**, and no stuck locks or double commits.
+4. **Recovery (`80 → 10` API VUs, `12 → 2` Job VUs):**
+   As load drops back to normal, the system recovers automatically without intervention: median API latency drops **7×** (`443.24 ms → 63.36 ms`; `p95` remains `564.21 ms` only because of the 15-second ramp-down tail from 80 to 10 VUs), queue wait drops (`83 ms → 52.5 ms`), job duration drops (`295 ms → 195 ms`), and job throughput rebounds to `3.27 jobs/s` (`180` jobs completed, `0` failures).
