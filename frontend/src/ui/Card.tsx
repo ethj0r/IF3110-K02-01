@@ -63,3 +63,12 @@ export function CodeBlock({ Label, Code, Actions }: { Label: string; Code: strin
     </div>
   )
 }
+
+export function Metric({ Label, Value }: { Label: string; Value: string }) {
+  return (
+    <div className="metric">
+      <span className="label">{Label}</span>
+      <span className="metric-value">{Value}</span>
+    </div>
+  )
+}

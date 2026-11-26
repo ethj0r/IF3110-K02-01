@@ -519,6 +519,7 @@ status, and error category. Application logs are separate and go to stdout/stder
 | `PUT` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `DELETE` | `/api/databases/{dbId}/migrations/{id}` | View + Edit |
 | `GET` | `/api/databases/{dbId}/migrations/history?hide_rollback=false` | View Only / View + Edit |
+| `GET` | `/api/databases/{dbId}/jobs?limit=10` | View Only / View + Edit |
 | `GET` | `/api/databases/{dbId}/jobs/{jobId}` | View Only / View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/execute` | View + Edit |
 | `POST` | `/api/databases/{dbId}/migrations/{id}/apply` | View + Edit |

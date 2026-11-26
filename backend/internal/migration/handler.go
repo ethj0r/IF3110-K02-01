@@ -47,6 +47,8 @@ func (Routes *Handler) Register(Api Chi.Router) {
 	Api.Group(func(R Chi.Router) {
 		R.Use(Auth.NoStore)
 		R.Use(Routes.Auth.RequireSession)
+		R.Get("/databases/{dbID}/jobs", Routes.Jobs)
+		R.Get("/connections/{dbID}/jobs", Routes.Jobs)
 		R.Get("/databases/{dbID}/jobs/{jobID}", Routes.Job)
 		R.Get("/connections/{dbID}/jobs/{jobID}", Routes.Job)
 	})
@@ -199,6 +201,25 @@ func (Routes *Handler) Execute(W Http.ResponseWriter, R *Http.Request) {
 func (Routes *Handler) Job(W Http.ResponseWriter, R *Http.Request) {
 	User, _ := Auth.PrincipalFromContext(R.Context())
 	Result, Err := Routes.Service.GetJob(R.Context(), User, Chi.URLParam(R, "dbID"), Chi.URLParam(R, "jobID"))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Jobs(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Limit := DefaultJobLimit
+	if Raw := R.URL.Query().Get("limit"); Raw != "" {
+		Parsed, Err := Strconv.Atoi(Raw)
+		if Err != nil || Parsed < 1 || Parsed > MaxJobLimit {
+			Httpx.Error(W, 400, "invalid_request", "limit must be between 1 and 50")
+			return
+		}
+		Limit = Parsed
+	}
+	Result, Err := Routes.Service.ListJobs(R.Context(), User, Chi.URLParam(R, "dbID"), Limit)
 	if Err != nil {
 		WriteMigrationError(W, Err)
 		return
