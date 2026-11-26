@@ -57,7 +57,7 @@ type MigrationRepository interface {
 	RecordBatchReverted(Ctx Context.Context, RollbackExecutionID string, UpExecutionID string, DatabaseID string, BatchNo int64) (Execution, error)
 	ListCommittedBatches(Ctx Context.Context, ExecutionID string) ([]Batch, error)
 	CloseRunningAttempts(Ctx Context.Context, ExecutionID string, Status AttemptStatus, Message string) error
-	ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error)
+	ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Status ExecutionStatus, ActorID *string, Note string) (Execution, error)
 }
 
 type Service struct {
@@ -744,6 +744,20 @@ func LatestSuccessfulFor(History []Execution, MigrationID string) (Execution, bo
 	return Execution{}, false
 }
 
+// SettledFor returns the latest execution of a migration that changed (or
+// partly changed) the target. Plain failures roll back their transaction, so
+// they never move the migration: after a failed rollback the migration is still
+// applied, and after a failed forward it is still rolled back.
+func SettledFor(History []Execution, MigrationID string) (Execution, bool) {
+	for Index := len(History) - 1; Index >= 0; Index-- {
+		Item := History[Index]
+		if Item.MigrationID == MigrationID && Item.Status != ExecutionFailed {
+			return Item, true
+		}
+	}
+	return Execution{}, false
+}
+
 func ValidateApply(Current Migration, Items []Migration, History []Execution) error {
 	if Current.LockedAt != nil || !Current.Status.IsDraft() {
 		return ErrAlreadyExecuted
@@ -764,7 +778,7 @@ func ValidateRollback(Current Migration, Items []Migration, History []Execution)
 	if Current.Irreversible || Current.DownSQL == nil {
 		return Execution{}, ErrIrreversible
 	}
-	Latest, Ok := LatestFor(History, Current.ID)
+	Latest, Ok := SettledFor(History, Current.ID)
 	if !Ok || Latest.Direction != DirectionUp {
 		return Execution{}, ErrNotApplied
 	}
@@ -781,7 +795,7 @@ func ValidateRollback(Current Migration, Items []Migration, History []Execution)
 }
 
 func ValidateForward(Current Migration, Items []Migration, History []Execution) error {
-	Latest, Ok := LatestFor(History, Current.ID)
+	Latest, Ok := SettledFor(History, Current.ID)
 	if !Ok || Latest.Direction != DirectionDown || Latest.Status != ExecutionSucceeded {
 		return ErrNotRolledBack
 	}
@@ -861,9 +875,13 @@ func CanApplyNow(Items []Migration, Version int64) bool {
 
 func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 	Latest := map[string]Execution{}
+	Settled := map[string]Execution{}
 	Pending := false
 	for _, Item := range History {
 		Latest[Item.MigrationID] = Item
+		if Item.Status != ExecutionFailed {
+			Settled[Item.MigrationID] = Item
+		}
 		if Item.Status == ExecutionQueued || Item.Status == ExecutionRunning {
 			Pending = true
 		}
@@ -889,11 +907,11 @@ func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 		case Item.LockedAt == nil && Item.Status.IsDraft():
 			Item.CanApply = CanApplyNow(Result, Item.Version)
 		case Item.Status.IsApplied() || Item.Status == StatusPartial:
-			LatestItem, HasLatest := Latest[Item.ID]
+			LatestItem, HasLatest := Settled[Item.ID]
 			Item.CanRollback = Item.Version == FrontierVersion(Result) && !Item.Irreversible && Item.DownSQL != nil &&
 				HasLatest && LatestItem.Direction == DirectionUp && (LatestItem.Status == ExecutionSucceeded || LatestItem.Status == ExecutionPartial)
 		case Item.Status.IsRolledBack():
-			LatestItem, HasLatest := Latest[Item.ID]
+			LatestItem, HasLatest := Settled[Item.ID]
 			Item.CanForward = Item.Version == Next && HasLatest && LatestItem.Direction == DirectionDown && LatestItem.Status == ExecutionSucceeded
 		}
 		if LatestItem, Ok := Latest[Item.ID]; Ok && LatestItem.ID == Last.ID && (LatestItem.Status.IsFailure() || LatestItem.Status == ExecutionPartial || LatestItem.Status == ExecutionPartiallyReverted) {
@@ -903,10 +921,16 @@ func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 	return Result
 }
 
+// Reconcile settles an execution left queued/running by a lost commit result or
+// a dead worker. It needs a platform administrator who also holds View + Edit
+// on the database (admins do not bypass grants). A normal execution is checked
+// against its target evidence row, written in the same transaction as the
+// change, so the recorded outcome cannot contradict the target. A batch
+// execution stops at its checkpoint; a retry then reconciles the last batch from
+// its evidence and continues.
 func (Server *Service) Reconcile(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string, Outcome string, Note string) (Execution, error) {
-	if !User.IsPlatformAdmin {
-		return Execution{}, ErrForbidden
-	}
+	Ctx, Cancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	defer Cancel()
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	MigrationID = Strings.TrimSpace(MigrationID)
 	ExecutionID = Strings.TrimSpace(ExecutionID)
@@ -915,26 +939,52 @@ func (Server *Service) Reconcile(Ctx Context.Context, User Auth.Principal, Datab
 	if DatabaseID == "" || MigrationID == "" || ExecutionID == "" {
 		return Execution{}, ErrNotFound
 	}
-	if Outcome != "succeeded" && Outcome != "failed" {
+	if !User.IsPlatformAdmin {
+		return Execution{}, ErrForbidden
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionEdit, DatabaseID); Err != nil {
+		return Execution{}, Err
+	}
+	if (Outcome != "succeeded" && Outcome != "failed") || len(Note) > 500 {
 		return Execution{}, ErrInvalidInput
 	}
-	if len(Note) > 500 {
-		return Execution{}, ErrInvalidInput
+	Current, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID)
+	if Errors.Is(Err, ErrNotFound) || (Err == nil && Current.MigrationID != MigrationID) {
+		return Execution{}, ErrExecutionMissing
 	}
-	Result, Err := Server.Repo.WithExecutionLock(Ctx, DatabaseID, func(Repo MigrationRepository) (Execution, error) {
-		return Repo.ReconcileExecution(Ctx, DatabaseID, MigrationID, ExecutionID, Outcome == "succeeded", actorID(User), Note)
-	})
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Current.Status != ExecutionQueued && Current.Status != ExecutionRunning {
+		return Execution{}, ErrReconcileNotAllowed
+	}
+	Status, Err := ReconcileStatus(Current, Outcome == "succeeded")
+	if Err != nil {
+		return Execution{}, Err
+	}
+	if Current.Mode != ModeBatch {
+		Evidence, Err := Server.readEvidence(Ctx, DatabaseID, Current.ID)
+		if Err != nil {
+			return Execution{}, Err
+		}
+		if (len(Evidence) > 0) != (Status == ExecutionSucceeded) {
+			return Execution{}, ErrEvidenceMismatch
+		}
+	}
+	Result, Err := Server.Repo.ReconcileExecution(Ctx, DatabaseID, MigrationID, Current.ID, Status, actorID(User), Note)
 	if Err != nil {
 		return Execution{}, Err
 	}
 	Server.logger().InfoContext(Ctx, "migration execution reconciled",
 		"event", "migration.execution.reconciled", "actor_id", User.ID, "actor", User.Username,
-		"database_id", DatabaseID, "migration_id", MigrationID, "execution_id", ExecutionID,
-		"outcome", Outcome, "note", Note)
+		"database_id", Logging.SanitizeLogValue(Result.DatabaseID), "migration_id", Logging.SanitizeLogValue(Result.MigrationID),
+		"execution_id", Logging.SanitizeLogValue(Result.ID), "mode", Result.Mode, "status", Result.Status, "note_length", len(Note))
 	return Result, nil
 }
 
 func (Server *Service) ExecutionEvidence(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string) ([]Evidence, error) {
+	Ctx, Cancel := Context.WithTimeout(Ctx, 15*Time.Second)
+	defer Cancel()
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	MigrationID = Strings.TrimSpace(MigrationID)
 	ExecutionID = Strings.TrimSpace(ExecutionID)
@@ -944,9 +994,20 @@ func (Server *Service) ExecutionEvidence(Ctx Context.Context, User Auth.Principa
 	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
 		return nil, Err
 	}
-	if _, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID); Err != nil {
+	Current, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID)
+	if Errors.Is(Err, ErrNotFound) || (Err == nil && Current.MigrationID != MigrationID) {
+		return nil, ErrExecutionMissing
+	}
+	if Err != nil {
 		return nil, Err
 	}
+	return Server.readEvidence(Ctx, DatabaseID, Current.ID)
+}
+
+// readEvidence lists the target-side evidence rows of an execution. A target
+// that never ran a platform migration has no evidence table, which simply means
+// no evidence.
+func (Server *Service) readEvidence(Ctx Context.Context, DatabaseID string, ExecutionID string) ([]Evidence, error) {
 	if Server.Resolver == nil {
 		return nil, ErrUnavailable
 	}
@@ -962,6 +1023,9 @@ func (Server *Service) ExecutionEvidence(Ctx Context.Context, User Auth.Principa
 	Rows, Err := Target.Query(Ctx, `SELECT execution_id::text, batch_no, direction, cursor_from, cursor_to, row_count, attempt_no, created_at
 FROM platform_migration.batches WHERE execution_id = $1::uuid ORDER BY batch_no`, ExecutionID)
 	if Err != nil {
+		if isUndefinedTable(Err) {
+			return []Evidence{}, nil
+		}
 		return nil, ErrUnavailable
 	}
 	defer Rows.Close()
@@ -974,6 +1038,9 @@ FROM platform_migration.batches WHERE execution_id = $1::uuid ORDER BY batch_no`
 		Result = append(Result, Item)
 	}
 	if Err := Rows.Err(); Err != nil {
+		if isUndefinedTable(Err) {
+			return []Evidence{}, nil
+		}
 		return nil, ErrUnavailable
 	}
 	return Result, nil

@@ -200,9 +200,17 @@ func (W *Worker) heartbeat(Ctx Context.Context, JobID string) {
 		case <-Ctx.Done():
 			return
 		case <-Ticker.C:
-			if Err := W.Repo.RenewJobLease(Ctx, JobID, W.ID, W.lease()); Err != nil {
-				W.logger().WarnContext(Ctx, "worker could not renew job lease",
-					"event", "migration.job.heartbeat_failed", "worker_id", W.ID, "job_id", JobID, "error", Err)
+			// A transient store error is retried on the next tick (two more fit in
+			// one lease). Only a lost lease stops the heartbeat: the job row was
+			// expired or reassigned, and the advisory lock still prevents a second
+			// execution on this database.
+			Err := W.Repo.RenewJobLease(Ctx, JobID, W.ID, W.lease())
+			if Err == nil || Ctx.Err() != nil {
+				continue
+			}
+			W.logger().WarnContext(Ctx, "worker could not renew job lease",
+				"event", "migration.job.heartbeat_failed", "worker_id", W.ID, "job_id", JobID, "error", Err)
+			if Errors.Is(Err, ErrJobNotFound) {
 				return
 			}
 		}

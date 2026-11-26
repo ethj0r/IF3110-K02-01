@@ -114,7 +114,32 @@ var (
 	ErrExecutionMissing    = Errors.New("migration execution not found")
 	ErrExecutionTimeout    = Errors.New("migration execution exceeded its deadline")
 	ErrReconcileNotAllowed = Errors.New("execution cannot be reconciled in its current state")
+	ErrDatabaseBusy        = Errors.New("a migration job is running on this database")
+	ErrEvidenceMismatch    = Errors.New("reconcile outcome contradicts the target evidence")
+	ErrBatchReconcile      = Errors.New("batch executions resume from their checkpoint")
 )
+
+// ReconcileStatus maps a verified outcome to the execution status it settles
+// on. A batch execution never jumps to succeeded: it stops at its checkpoint
+// (partial when batches committed) and a retry finishes the remaining work.
+func ReconcileStatus(Exec Execution, Succeeded bool) (ExecutionStatus, error) {
+	if Exec.Mode != ModeBatch {
+		if Succeeded {
+			return ExecutionSucceeded, nil
+		}
+		return ExecutionFailed, nil
+	}
+	if Succeeded {
+		return "", ErrBatchReconcile
+	}
+	if Exec.Direction == DirectionUp && Exec.CommittedBatches > 0 {
+		return ExecutionPartial, nil
+	}
+	if Exec.Direction == DirectionDown && Exec.RevertedBatches > 0 {
+		return ExecutionPartiallyReverted, nil
+	}
+	return ExecutionFailed, nil
+}
 
 type Migration struct {
 	ID                 string     `json:"id"`
