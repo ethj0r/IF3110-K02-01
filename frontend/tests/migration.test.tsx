@@ -1,5 +1,5 @@
 import { afterEach as AfterEach, expect as Expect, test as Test, vi as Vi } from 'vitest'
-import { cleanup as Cleanup, render as Render, screen as Screen } from '@testing-library/react'
+import { cleanup as Cleanup, render as Render, screen as Screen, waitFor as WaitFor, within as Within } from '@testing-library/react'
 import UserEvent from '@testing-library/user-event'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router-dom'
@@ -137,6 +137,31 @@ Test('loads and displays migration definitions and views details', async () => {
   Expect(Details.textContent).toContain('Revision')
 })
 
+function JobFixture(Overrides: Record<string, unknown> = {}) {
+  return {
+    id: 'job-1',
+    database_id: 'db-1',
+    migration_id: 'mig-1',
+    version: 1,
+    title: 'Initial Schema',
+    action: 'apply',
+    status: 'queued',
+    attempts: 0,
+    max_attempts: 3,
+    available_at: '2026-01-01T00:00:00Z',
+    committed_batches: 0,
+    committed_rows: 0,
+    reverted_batches: 0,
+    reverted_rows: 0,
+    checkpoint_cursor: 0,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...Overrides,
+  }
+}
+
+const Finished = { status: 'succeeded', attempts: 1, execution_status: 'succeeded', finished_at: '2026-01-01T00:00:01Z' }
+
 Test('creates and applies a draft migration', async () => {
   let Migrations = [
     MigrationFixture({
@@ -152,6 +177,7 @@ Test('creates and applies a draft migration', async () => {
 
   let ReviewRequested = false
   let ReviewApproved = false
+  let Jobs: unknown[] = []
 
   Vi.stubGlobal(
     'fetch',
@@ -183,11 +209,10 @@ Test('creates and applies a draft migration', async () => {
         return Response.json(Created, { status: 201 })
       }
       if (Path === '/api/databases/db-1/migrations/mig-1/apply') {
-        return Response.json({ id: 'job-1', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Draft Migration', action: 'apply', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
+        Jobs = [JobFixture({ title: 'Draft Migration', execution_id: 'exec-1', ...Finished })]
+        return Response.json(JobFixture({ title: 'Draft Migration' }), { status: 202 })
       }
-      if (Path === '/api/databases/db-1/jobs/job-1') {
-        return Response.json({ id: 'job-1', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Draft Migration', action: 'apply', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-1', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', finished_at: '2026-01-01T00:00:01Z' })
-      }
+      if (Path === '/api/databases/db-1/jobs') return Response.json(Jobs)
       return new Response(null, { status: 404 })
     }),
   )
@@ -218,9 +243,10 @@ Test('creates and applies a draft migration', async () => {
   await Screen.findByText(/All groups approved/)
   await User.click(Apply)
   await User.click(await Screen.findByRole('button', { name: 'Run apply' }))
-  Expect(await Screen.findByText(/Apply job:/)).toBeTruthy()
-  Expect(Screen.getByText(/succeeded/)).toBeTruthy()
-  Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true)
+  Expect(await Screen.findByRole('heading', { name: /Apply job/ })).toBeTruthy()
+  Expect(await Screen.findByText('Apply job succeeded', {}, { timeout: 3000 })).toBeTruthy()
+  Expect(Screen.getByRole('heading', { name: 'Jobs' })).toBeTruthy()
+  await WaitFor(() => Expect(Client.getQueryState(SchemaKey)?.isInvalidated).toBe(true))
 })
 
 function InstallMigrationAPI(Level = 'view_edit', Status = 'draft') {
@@ -228,6 +254,7 @@ function InstallMigrationAPI(Level = 'view_edit', Status = 'draft') {
     if (Path === '/api/auth/me') return Response.json({ user: { id: 'u1', username: 'tester', is_platform_admin: false }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
     if (Path === '/api/databases') return Response.json([...Databases.map(Item => ({ ...Item, level: Level })), { ...Databases[0], id: 'db-2', name: 'Analytics' }])
     if (Path.includes('/migrations/history')) return Response.json(Status === 'pending' ? [ExecutionFixture({ status: 'running', finished_at: undefined })] : [])
+    if (Path.endsWith('/jobs')) return Response.json([])
     if (Path.startsWith('/api/databases/db-2/migrations')) return Response.json([MigrationFixture({ database_id: 'db-2', title: 'Analytics history' })])
     if (Path.startsWith('/api/databases/db-1/migrations')) return Response.json([
       MigrationFixture({ id: 'first', version: 1, title: 'First migration', status: Status, locked_at: Status === 'draft' ? undefined : '2026-01-01T00:05:00Z', can_apply: Status === 'draft', can_rollback: Status === 'applied' }),
@@ -335,6 +362,7 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   let Definitions = [MigrationFixture({ status: 'applied', can_rollback: true })]
   const History = [ExecutionFixture()]
   const Calls: string[] = []
+  let Jobs: unknown[] = []
   Vi.stubGlobal('fetch', Vi.fn(async (Path: string, Options?: RequestInit) => {
     Calls.push(Path)
     if (Path === '/api/databases') return Response.json(Databases)
@@ -346,18 +374,15 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
     if (Path.endsWith('/reviews/forward')) return Response.json(ReviewFixture('forward'))
     if (Path.endsWith('/rollback') && Options?.method === 'POST') {
       Definitions = [MigrationFixture({ status: 'rolled_back', can_rollback: false, can_forward: true })]
-      return Response.json({ id: 'job-rollback', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'rollback', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
+      Jobs = [JobFixture({ id: 'job-rollback', action: 'rollback', execution_id: 'exec-rollback', ...Finished }), ...Jobs]
+      return Response.json(JobFixture({ id: 'job-rollback', action: 'rollback' }), { status: 202 })
     }
     if (Path.endsWith('/forward') && Options?.method === 'POST') {
       Definitions = [MigrationFixture({ status: 'applied', can_rollback: true })]
-      return Response.json({ id: 'job-forward', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'forward', status: 'queued', attempts: 0, max_attempts: 3, available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' })
+      Jobs = [JobFixture({ id: 'job-forward', action: 'forward', execution_id: 'exec-forward', ...Finished }), ...Jobs]
+      return Response.json(JobFixture({ id: 'job-forward', action: 'forward' }), { status: 202 })
     }
-    if (Path.endsWith('/jobs/job-rollback')) {
-      return Response.json({ id: 'job-rollback', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'rollback', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-rollback', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:01Z', finished_at: '2026-01-01T00:00:01Z' })
-    }
-    if (Path.endsWith('/jobs/job-forward')) {
-      return Response.json({ id: 'job-forward', database_id: 'db-1', migration_id: 'mig-1', version: 1, title: 'Initial Schema', action: 'forward', status: 'succeeded', attempts: 1, max_attempts: 3, execution_id: 'exec-forward', available_at: '2026-01-01T00:00:00Z', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:01Z', finished_at: '2026-01-01T00:00:01Z' })
-    }
+    if (Path === '/api/databases/db-1/jobs') return Response.json(Jobs)
     return new Response(null, { status: 404 })
   }))
   Mount()
@@ -367,13 +392,77 @@ Test('rolls back, forwards, and filters successful rollback pairs', async () => 
   await Screen.findByText(/All groups approved/)
   await User.click(Screen.getByRole('button', { name: /^Rollback$/ }))
   await User.click(await Screen.findByRole('button', { name: 'Run rollback' }))
-  Expect(await Screen.findByText(/Rollback job:/)).toBeTruthy()
+  Expect(await Screen.findByText('Rollback job succeeded', {}, { timeout: 3000 })).toBeTruthy()
   await User.click(await Screen.findByRole('button', { name: /^Review forward$/ }))
   await Screen.findByText(/All groups approved/)
   await User.click(Screen.getByRole('button', { name: /^Forward$/ }))
   await User.click(await Screen.findByRole('button', { name: 'Run forward' }))
-  Expect(await Screen.findByText(/Forward job:/)).toBeTruthy()
+  Expect(await Screen.findByText('Forward job succeeded', {}, { timeout: 3000 })).toBeTruthy()
+  Expect(Screen.getAllByRole('button', { name: 'Inspect' }).length).toBeGreaterThanOrEqual(2)
   await User.click(Screen.getByRole('checkbox', { name: 'Hide rollback' }))
   await Screen.findByText('No execution attempts recorded.')
   Expect(Calls.some(Path => Path.includes('hide_rollback=true'))).toBe(true)
+})
+
+Test('keeps the active job visible across navigation and shows partial batch progress', async () => {
+  let Jobs: Record<string, unknown>[] = [JobFixture({
+    id: 'job-batch',
+    title: 'Backfill views',
+    status: 'running',
+    attempts: 1,
+    locked_by: 'worker-a',
+    locked_at: '2026-01-01T00:00:01Z',
+    requested_by_username: 'operator',
+    execution_id: 'exec-batch-1',
+    execution_status: 'running',
+    mode: 'batch',
+    committed_batches: 3,
+    committed_rows: 3000,
+    checkpoint_cursor: 3000,
+  })]
+  const Calls: string[] = []
+  Vi.stubGlobal('fetch', Vi.fn(async (Path: string) => {
+    Calls.push(Path)
+    if (Path === '/api/auth/me') return Response.json({ user: { id: 'u1', username: 'tester', is_platform_admin: false }, csrf_token: 'c'.repeat(43), expires_at: '2099-01-01T00:00:00Z' })
+    if (Path === '/api/databases') return Response.json(Databases)
+    if (Path === '/api/databases/db-1/jobs') return Response.json(Jobs)
+    if (Path.includes('/migrations/history')) return Response.json([])
+    if (Path === '/api/databases/db-1/migrations') return Response.json([MigrationFixture({ title: 'Backfill views', status: 'pending', can_rollback: false })])
+    if (Path.endsWith('/schemas')) return Response.json({ schemas: ['public'] })
+    if (Path.includes('/tables')) return Response.json({ tables: [] })
+    return new Response(null, { status: 404 })
+  }))
+  Mount()
+  const User = UserEvent.setup()
+
+  const Panel = await Screen.findByRole('region', { name: 'Apply job' })
+  Expect(Within(Panel).getByRole('progressbar')).toBeTruthy()
+  Expect(Within(Panel).getAllByText('3,000')).toHaveLength(2)
+  Expect(Within(Panel).getByText('worker-a')).toBeTruthy()
+  Expect((Screen.getByRole('button', { name: 'New migration' }) as HTMLButtonElement).disabled).toBe(true)
+
+  await User.click(Screen.getByRole('link', { name: 'Browse database' }))
+  const MigrationsTab = await Screen.findByRole('link', { name: 'Migrations' })
+  Expect(MigrationsTab.getAttribute('aria-describedby')).toBeTruthy()
+  Expect(Screen.getByText('Apply job running')).toBeTruthy()
+
+  await User.click(MigrationsTab)
+  Expect(await Screen.findByRole('region', { name: 'Apply job' })).toBeTruthy()
+
+  await User.click(Screen.getByRole('link', { name: 'Browse database' }))
+  const SchemaCalls = Calls.filter(Path => Path.endsWith('/schemas')).length
+  Jobs = [{ ...Jobs[0], status: 'failed', execution_status: 'partial', last_error: 'target SQL execution failed', finished_at: '2026-01-01T00:00:09Z' }]
+  await WaitFor(() => Expect(Screen.getByRole('link', { name: 'Migrations' }).getAttribute('aria-describedby')).toBeNull(), { timeout: 3000 })
+  await WaitFor(() => Expect(Calls.filter(Path => Path.endsWith('/schemas')).length).toBeGreaterThan(SchemaCalls))
+
+  await User.click(Screen.getByRole('link', { name: 'Migrations' }))
+  const Row = (await Screen.findByRole('heading', { name: 'Jobs' })).closest('section')!
+  Expect(Within(Row).getByText('partial')).toBeTruthy()
+  Expect(Screen.queryByRole('region', { name: 'Apply job' })).toBeNull()
+  await User.click(Within(Row).getByRole('button', { name: 'Inspect' }))
+  const Failed = await Screen.findByRole('region', { name: 'Apply job' })
+  Expect(Within(Failed).getByRole('alert').textContent).toBe('target SQL execution failed')
+  Expect(Within(Failed).queryByRole('progressbar')).toBeNull()
+  await User.click(Within(Failed).getByRole('button', { name: 'Close' }))
+  Expect(Screen.queryByRole('region', { name: 'Apply job' })).toBeNull()
 })

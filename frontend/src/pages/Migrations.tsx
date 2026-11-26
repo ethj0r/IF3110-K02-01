@@ -11,7 +11,6 @@ import {
   CreateMigration,
   DeleteMigrationDraft,
   ForwardMigration,
-  GetMigrationJob,
   GetMigrationReview,
   ListMigrationHistory,
   ListMigrations,
@@ -24,12 +23,14 @@ import {
   type MigrationExecution,
   type QueryPlanAnalysis,
 } from '../api/client'
+import { ActionLabel, TrackEnqueuedJob, useMigrationJobs } from '../api/jobs'
 import { DatabaseTabs } from '../layout/DatabaseTabs'
-import { Card, CodeBlock, PageHeader } from '../ui/Card'
+import { Card, CodeBlock, Metric, PageHeader } from '../ui/Card'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
 import { Badge, EmptyState, Loading, Notice, RequestError, StateBadge } from '../ui/Feedback'
 import { Icon } from '../ui/Icon'
 import { ErrorMessage } from '../ui/errors'
+import { JobPanel, RecentJobs } from './MigrationJobs'
 
 const ReviewActions: ExecutionKind[] = ['apply', 'rollback', 'forward', 'retry']
 
@@ -65,7 +66,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const [HideRollback, SetHideRollback] = useState(false)
   const [ExecutionError, SetExecutionError] = useState<string | null>(null)
   const [SuccessMessage, SetSuccessMessage] = useState<string | null>(null)
-  const [ActiveJobID, SetActiveJobID] = useState<string | null>(null)
+  const [SelectedJobID, SetSelectedJobID] = useState<string | null>(null)
   const [Confirmation, SetConfirmation] = useState<PendingConfirmation | null>(null)
 
   const MigrationsQuery = useQuery({
@@ -129,7 +130,8 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
       SetExecutionError(null)
       SetConfirmation(null)
       SetSuccessMessage(null)
-      SetActiveJobID(Job.id)
+      TrackEnqueuedJob(QueryCache, Job)
+      SetSelectedJobID(Job.id)
     },
     onError: Error => {
       SetConfirmation(null)
@@ -138,25 +140,10 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
     },
   })
 
-  const JobQuery = useQuery({
-    queryKey: ['migration-job', ActiveDatabase, ActiveJobID],
-    queryFn: ({ signal }) => GetMigrationJob(ActiveDatabase, ActiveJobID!, signal),
-    enabled: Boolean(Database && ActiveJobID),
-    refetchInterval: Query => {
-      const Status = Query.state.data?.status
-      return Status === 'succeeded' || Status === 'failed' || Status === 'cancelled' ? false : 1000
-    },
-  })
-
-  const Job = JobQuery.data
-  const JobFinished = Boolean(Job && (Job.status === 'succeeded' || Job.status === 'failed' || Job.status === 'cancelled'))
-  const JobActive = Boolean(ActiveJobID) && !JobFinished
-
-  useEffect(() => {
-    if (!JobFinished) return
-    void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
-    void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
-  }, [JobFinished, QueryCache, ActiveDatabase])
+  const Jobs = useMigrationJobs(ActiveDatabase, Boolean(Database))
+  const RecentJobList = Jobs.Query.data ?? []
+  const ShownJob = RecentJobList.find(Item => Item.id === SelectedJobID) ?? Jobs.Active
+  const JobActive = Boolean(Jobs.Active)
 
   const DeleteMutation = useMutation({
     mutationFn: (ID: string) => DeleteMigrationDraft(ActiveDatabase, ID),
@@ -308,22 +295,12 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           </form>
         </Card>
       )}
-      {ActiveJobID && Job && (
-        <Notice Tone={Job.status === 'failed' ? 'danger' : Job.status === 'succeeded' ? 'success' : 'warning'} Role={Job.status === 'failed' ? 'alert' : 'status'}>
-          <strong>{ActionLabel(Job.action)} job:</strong> {Job.status} (attempt {Job.attempts}/{Job.max_attempts})
-          {Job.execution_id && <> · execution <code>{Job.execution_id.slice(0, 8)}</code></>}
-          {Job.mode === 'batch' && <> · {Job.committed_batches} batch(es) / {Job.committed_rows} row(s) committed{Job.reverted_batches > 0 ? `, ${Job.reverted_batches} batch(es) / ${Job.reverted_rows} row(s) reverted` : ''}</>}
-          {Job.last_error && <div>{Job.last_error}</div>}
-          {JobFinished && <button type="button" className="btn btn-ghost btn-sm" onClick={() => SetActiveJobID(null)}>Dismiss</button>}
-        </Notice>
-      )}
-      {ActiveJobID && JobQuery.isError && (
-        <Notice Tone="danger" Role="alert">Unable to read migration job status.</Notice>
-      )}
+      {Database && ShownJob && <JobPanel Job={ShownJob} OnClose={() => SetSelectedJobID(null)} />}
+      {Database && Jobs.Query.isError && <Notice Tone="danger" Role="alert">Unable to read migration job status.</Notice>}
 
       {Database && (
         <Card Title="Definitions" Flush>
-          {HasPending && <div className="card-body"><Notice Tone="warning" Role="status">An execution is pending. Verify the target outcome before retrying.</Notice></div>}
+          {HasPending && !JobActive && <div className="card-body"><Notice Tone="warning" Role="status">An execution is pending. Verify the target outcome before retrying.</Notice></div>}
           {MigrationsQuery.isPending && <div className="card-body"><Loading>Loading migrations…</Loading></div>}
           {MigrationsQuery.isError && <div className="card-body"><Notice Tone="danger" Role="alert">{ErrorMessage(MigrationsQuery.error, 'Failed to load migrations.')}</Notice></div>}
           {MigrationsQuery.data && MigrationsQuery.data.length === 0 && (
@@ -410,6 +387,10 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
           {DetailsAnalyze.isError && <Notice Tone="danger" Role="alert">Plan analysis failed: {ErrorMessage(DetailsAnalyze.error, 'Unable to analyze query plan.')}</Notice>}
           {DetailsAnalyze.data && <PlanAnalysisReport Analysis={DetailsAnalyze.data} OnDismiss={() => DetailsAnalyze.reset()} />}
         </Card>
+      )}
+
+      {Database && RecentJobList.length > 0 && (
+        <RecentJobs Jobs={RecentJobList} SelectedID={ShownJob?.id} OnSelect={SetSelectedJobID} />
       )}
 
       {Database && (
@@ -565,15 +546,6 @@ function MigrationReviewPanel({ Item, Action, CanEdit, Busy, OnClose, OnExecute 
   )
 }
 
-function ActionLabel(Action: string): string {
-  switch (Action) {
-    case 'rollback': return 'Rollback'
-    case 'forward': return 'Forward'
-    case 'retry': return 'Retry'
-    default: return 'Apply'
-  }
-}
-
 function SQLBlock({ Label, SQL, OnAnalyze, Pending }: { Label: string; SQL: string; OnAnalyze?: () => void; Pending?: boolean }) {
   return (
     <CodeBlock
@@ -680,13 +652,4 @@ function PlanAnalysisReport({ Analysis, OnDismiss }: { Analysis: QueryPlanAnalys
 function TagList({ Items }: { Items: string[] }) {
   if (Items.length === 0) return <span className="muted">None</span>
   return <span className="badge-list">{Items.map(Item => <Badge key={Item}>{Item}</Badge>)}</span>
-}
-
-function Metric({ Label, Value }: { Label: string; Value: string }) {
-  return (
-    <div className="metric">
-      <span className="label">{Label}</span>
-      <span className="metric-value">{Value}</span>
-    </div>
-  )
 }

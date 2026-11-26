@@ -242,6 +242,7 @@ export interface MigrationJob {
   requested_by?: string
   requested_by_username?: string
   traceparent?: string
+  execution_status?: ExecutionStatus
   mode?: string
   committed_batches: number
   committed_rows: number
@@ -277,6 +278,10 @@ export function ForwardMigration(DatabaseID: string, MigrationID: string): Promi
 
 export function RetryMigration(DatabaseID: string, MigrationID: string): Promise<MigrationJob> {
   return ActionRequest(DatabaseID, MigrationID, 'retry')
+}
+
+export function ListMigrationJobs(DatabaseID: string, Signal?: AbortSignal): Promise<MigrationJob[]> {
+  return ApiRequest<MigrationJob[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/jobs`, { signal: Signal })
 }
 
 export function GetMigrationJob(DatabaseID: string, JobID: string, Signal?: AbortSignal): Promise<MigrationJob> {
