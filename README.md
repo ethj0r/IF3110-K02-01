@@ -905,7 +905,12 @@ The reconciliation endpoint added in PR #27 raised `5` new findings on `dev`
 
 | # | Rule (CWE) | Severity | Location | Potential Impact | Decision & Rationale | Fix |
 | --- | --- | --- | --- | --- | --- | --- |
-| 8–10 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:932` | `database_id`, `migration_id`, and `execution_id` came straight from route parameters into the `migration.execution.reconciled` event. | **Valid — Fixed.** The event now logs the IDs of the execution read back from the platform database, passed through `Logging.SanitizeLogValue`. | `fix(reconcile): verify target evidence` |
-| 11–12 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:933` | `outcome` and the free-text `note` from the request body were logged verbatim. | **Valid — Fixed.** The event logs the resulting execution `status` and `note_length`; the note itself is stored only in the platform database (`reconcile_note`). | `fix(reconcile): verify target evidence` |
+| 8–10 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:932` | `database_id`, `migration_id`, and `execution_id` came straight from route parameters into the `migration.execution.reconciled` event. | **Valid — Fixed.** The event now logs the IDs of the execution read back from the platform database, passed through `Logging.SanitizeLogValue`. | `64a3546` |
+| 11–12 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/service.go:933` | `outcome` and the free-text `note` from the request body were logged verbatim. | **Valid — Fixed.** The event logs the resulting execution `status` and `note_length`; the note itself is stored only in the platform database (`reconcile_note`). | `64a3546` |
+
+**Re-scan:** the CodeQL run on PR #28 (merge ref `ecd0b61`) reported `0` findings for
+`go` (down from `5` on `dev` at `e41cbbc`) and `0` for `javascript-typescript`; GitHub
+closed alerts #8–#12 as fixed when PR #28 merged into `dev`. The same workflow then ran
+on `main` after the release merge.
 
 > **Note on SAST Limitations:** A clean CodeQL scan (`0` findings) does not guarantee that the application is completely free of security vulnerabilities. SAST analyzes source code statically against known patterns and data-flow rules, so it cannot replace runtime/dynamic testing (DAST), dependency auditing, authentication/authorization review, or proper deployment hardening.
