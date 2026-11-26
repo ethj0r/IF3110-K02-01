@@ -10,6 +10,7 @@ import (
 	Driver "github.com/ethj0r/IF3110-K02-01/backend/internal/driver"
 	Pgx "github.com/jackc/pgx/v5"
 	Pgxpool "github.com/jackc/pgx/v5/pgxpool"
+	Os "os"
 	Strings "strings"
 	Testing "testing"
 	Time "time"
@@ -392,5 +393,203 @@ INSERT INTO batch_retry SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != n
 	var Count int
 	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_retry WHERE value = 1").Scan(&Count); Err != nil || Count != 24 {
 		T.Fatalf("batch retry did not apply remaining rows: %d %v", Count, Err)
+	}
+}
+
+func TestServiceExecutionTimeoutIsConfirmedFailure(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:             &Repository{Pool: Platform},
+		Access:           Access.AllowAll(),
+		Resolver:         DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:           testTargetDriver{Pool: Target},
+		ExecutionTimeout: 100 * Time.Millisecond,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Slow", SQLText: "SELECT pg_sleep(1);", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	TimedOut, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, ErrExecutionTimeout) {
+		T.Fatalf("expected ErrExecutionTimeout, got %v", Err)
+	}
+	if TimedOut.Status != ExecutionFailed || TimedOut.ErrorMessage == nil || *TimedOut.ErrorMessage != ErrExecutionTimeout.Error() {
+		T.Fatalf("timeout was not recorded as a confirmed failure: %+v", TimedOut)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusFailed {
+		T.Fatalf("migration should be failed after timeout: %+v %v", Migration, Err)
+	}
+	Next, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Next", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Service.Apply(Ctx, User, DBID, Next.ID); Err != nil {
+		T.Fatalf("a timeout left the database blocked: %v", Err)
+	}
+}
+
+func TestServiceReconcileUncertainExecution(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Admin := Auth.Principal{ID: UserID, Username: "test_migrator", IsPlatformAdmin: true}
+	Repo := &Repository{Pool: Platform}
+	Service := &Service{
+		Repo:     Repo,
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Uncertain", SQLText: "CREATE TABLE reconcile_test (id int);", DownSQL: "DROP TABLE reconcile_test;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Exec, Err := Repo.CreateExecution(Ctx, DBID, Created.ID, ExecutionRequest{Kind: KindApply, Direction: DirectionUp, SQLText: Created.SQLText, RequestedBy: &UserID})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Repo.CreateAttempt(Ctx, Exec.ID, &UserID, Created.SQLText); Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Repo.RefreshStatus(Ctx, DBID, Created.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Reconciled, Err := Service.Reconcile(Ctx, Admin, DBID, Created.ID, Exec.ID, "failed", "verified no target changes")
+	if Err != nil {
+		T.Fatalf("reconcile failed: %v", Err)
+	}
+	if Reconciled.Status != ExecutionFailed || Reconciled.ReconciledAt == nil || Reconciled.ReconcileNote == nil || *Reconciled.ReconcileNote != "verified no target changes" {
+		T.Fatalf("reconcile fields are incomplete: %+v", Reconciled)
+	}
+	if len(Reconciled.Attempts) != 1 || Reconciled.Attempts[0].Status != AttemptFailed {
+		T.Fatalf("open attempt was not closed: %+v", Reconciled.Attempts)
+	}
+	Migration, Err := Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusFailed {
+		T.Fatalf("migration status was not refreshed: %+v %v", Migration, Err)
+	}
+}
+
+func TestServiceExecutionEvidenceForNormalRun(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Evidence", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Executed, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Evidence, Err := Service.ExecutionEvidence(Ctx, User, DBID, Created.ID, Executed.ID)
+	if Err != nil || len(Evidence) != 1 {
+		T.Fatalf("normal execution evidence missing: %+v %v", Evidence, Err)
+	}
+	if Evidence[0].BatchNo != 0 || Evidence[0].Direction != string(DirectionUp) || Evidence[0].AttemptNo != 1 {
+		T.Fatalf("unexpected normal evidence: %+v", Evidence[0])
+	}
+}
+
+func TestServiceBatchPartialRevertResume(T *Testing.T) {
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:     &Repository{Pool: Platform},
+		Access:   Access.AllowAll(),
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   testTargetDriver{Pool: Target},
+	}
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_revert (id BIGINT PRIMARY KEY, value INT NOT NULL);
+INSERT INTO batch_revert SELECT g, 0 FROM generate_series(1, 25) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{
+		Title:       "Batch revert resume",
+		SQLText:     `UPDATE batch_revert SET value = 1 WHERE id IN (SELECT id FROM batch_revert WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_revert SET value = 0 / (CASE WHEN id = 20 THEN 0 ELSE 1 END) WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Service.Apply(Ctx, User, DBID, Created.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	Partial, Err := Service.Rollback(Ctx, User, DBID, Created.ID)
+	if !Errors.Is(Err, Driver.ErrExecution) {
+		T.Fatalf("expected a down-batch failure, got %v", Err)
+	}
+	if Partial.Status != ExecutionPartiallyReverted || Partial.RevertedBatches != 1 || Partial.RevertedRows != 5 {
+		T.Fatalf("unexpected partially reverted state: %+v", Partial)
+	}
+	Migration, Err := Service.Repo.Get(Ctx, DBID, Created.ID)
+	if Err != nil || Migration.Status != StatusPartiallyReverted {
+		T.Fatalf("migration should be partially reverted: %+v %v", Migration, Err)
+	}
+	if _, Err := Target.Exec(Ctx, "DELETE FROM batch_revert WHERE id = 20"); Err != nil {
+		T.Fatal(Err)
+	}
+	Resumed, Err := Service.Retry(Ctx, User, DBID, Created.ID)
+	if Err != nil {
+		T.Fatalf("resume revert failed: %v", Err)
+	}
+	if Resumed.Status != ExecutionSucceeded || Resumed.RevertedBatches != 3 || Resumed.RevertedRows != 25 {
+		T.Fatalf("resume did not finish the revert: %+v", Resumed)
+	}
+	var Count int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_revert WHERE value = 0").Scan(&Count); Err != nil || Count != 24 {
+		T.Fatalf("reverted rows were not restored: %d %v", Count, Err)
+	}
+}
+
+func TestServiceLongMigrationBeyondLegacyLimit(T *Testing.T) {
+	if Os.Getenv("SLOW_MIGRATION_TEST") != "1" {
+		T.Skip("set SLOW_MIGRATION_TEST=1 to run the 31-second regression")
+	}
+	Platform := NewMigrationDatabase(T)
+	Target := NewMigrationDatabase(T)
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Platform)
+	User := Auth.Principal{ID: UserID, Username: "test_migrator"}
+	Service := &Service{
+		Repo:             &Repository{Pool: Platform},
+		Access:           Access.AllowAll(),
+		Resolver:         DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:           testTargetDriver{Pool: Target},
+		ExecutionTimeout: 45 * Time.Second,
+	}
+	Created, Err := Service.Create(Ctx, User, DBID, MigrationInput{Title: "Legacy 30s regression", SQLText: "SELECT pg_sleep(31);", DownSQL: "SELECT 1;"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Started := Time.Now()
+	Done, Err := Service.Apply(Ctx, User, DBID, Created.ID)
+	Duration := Time.Since(Started)
+	if Err != nil || Done.Status != ExecutionSucceeded {
+		T.Fatalf("31-second migration failed: %+v %v", Done, Err)
+	}
+	if Duration < 30*Time.Second {
+		T.Fatalf("regression migration finished too quickly: %s", Duration)
 	}
 }

@@ -109,6 +109,9 @@ export interface MigrationExecution {
   started_at?: string
   finished_at?: string
   error_message?: string
+  reconciled_at?: string
+  reconciled_by?: string
+  reconcile_note?: string
   attempts: MigrationAttempt[]
 }
 
@@ -252,6 +255,19 @@ export interface MigrationJob {
   created_at: string
   updated_at: string
   finished_at?: string
+  reconciled_at?: string
+  reconciled_by?: string
+}
+
+export interface ExecutionEvidence {
+  execution_id: string
+  batch_no: number
+  direction: string
+  cursor_from: number
+  cursor_to: number
+  row_count: number
+  attempt_no: number
+  created_at: string
 }
 
 function ActionRequest(DatabaseID: string, MigrationID: string, Action: JobAction | 'execute'): Promise<MigrationJob> {
@@ -308,6 +324,17 @@ export function SubmitMigrationReview(DatabaseID: string, MigrationID: string, A
 export function ApproveMigrationReview(DatabaseID: string, MigrationID: string, Action: ExecutionKind, ReviewID: string, GroupID: string) {
   const Path = MigrationReviewPath(DatabaseID, MigrationID, Action)
   return ApiRequest<void>(`${Path}/${encodeURIComponent(ReviewID)}/approvals/${encodeURIComponent(GroupID)}`, { method: 'PUT' })
+}
+
+export function GetExecutionEvidence(DatabaseID: string, MigrationID: string, ExecutionID: string, Signal?: AbortSignal): Promise<ExecutionEvidence[]> {
+  return ApiRequest<ExecutionEvidence[]>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/executions/${encodeURIComponent(ExecutionID)}/evidence`, { signal: Signal })
+}
+
+export function ReconcileExecution(DatabaseID: string, MigrationID: string, ExecutionID: string, Outcome: 'succeeded' | 'failed', Note: string): Promise<MigrationExecution> {
+  return ApiRequest<MigrationExecution>(`/api/databases/${encodeURIComponent(DatabaseID)}/migrations/${encodeURIComponent(MigrationID)}/executions/${encodeURIComponent(ExecutionID)}/reconcile`, {
+    method: 'POST',
+    body: JSON.stringify({ outcome: Outcome, note: Note }),
+  })
 }
 
 export async function ListMigrationHistory(DatabaseID: string, HideRollback: boolean, Signal?: AbortSignal): Promise<MigrationExecution[]> {

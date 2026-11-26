@@ -11,9 +11,11 @@ import {
   CreateMigration,
   DeleteMigrationDraft,
   ForwardMigration,
+  GetExecutionEvidence,
   GetMigrationReview,
   ListMigrationHistory,
   ListMigrations,
+  ReconcileExecution,
   RetryMigration,
   RollbackMigration,
   SubmitMigrationReview,
@@ -24,6 +26,7 @@ import {
   type QueryPlanAnalysis,
 } from '../api/client'
 import { ActionLabel, TrackEnqueuedJob, useMigrationJobs } from '../api/jobs'
+import { SessionQuery } from '../auth/query'
 import { DatabaseTabs } from '../layout/DatabaseTabs'
 import { Card, CodeBlock, Metric, PageHeader } from '../ui/Card'
 import { ConfirmDialog } from '../ui/ConfirmDialog'
@@ -50,6 +53,8 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   const Databases = useQuery({ queryKey: AccessQueryKeys.databases, queryFn: ListAccessibleDatabases })
   const Database = Databases.data?.find(Item => Item.id === ActiveDatabase)
   const QueryCache = useQueryClient()
+  const Session = useQuery(SessionQuery)
+  const IsAdmin = Session.data?.user.is_platform_admin === true
   const [SelectedMigrationID, SetSelectedMigrationID] = useState<string | null>(null)
   const [SelectedExecutionID, SetSelectedExecutionID] = useState<string | null>(null)
   const [ReviewSelection, SetReviewSelection] = useState<{ ID: string; Action: ExecutionKind } | null>(null)
@@ -90,6 +95,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
   function Refresh() {
     void QueryCache.invalidateQueries({ queryKey: ['migrations', ActiveDatabase] })
     void QueryCache.invalidateQueries({ queryKey: ['databases', ActiveDatabase] })
+    void QueryCache.invalidateQueries({ queryKey: ['migration-jobs', ActiveDatabase] })
   }
 
   const SaveMutation = useMutation({
@@ -445,7 +451,7 @@ function DatabaseMigrations({ ActiveDatabase, InitialDraft }: { ActiveDatabase: 
               </table>
             </div>
           )}
-          {SelectedExecution && <ExecutionDetails Execution={SelectedExecution} />}
+          {SelectedExecution && <ExecutionDetails Execution={SelectedExecution} IsAdmin={IsAdmin} OnReconciled={Refresh} />}
         </Card>
       )}
 
@@ -577,7 +583,65 @@ function SQLInput({ Label, Value, OnChange, OnAnalyze, Pending }: { Label: strin
   )
 }
 
-function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
+function ReconcilePanel({ Execution, OnReconciled }: { Execution: MigrationExecution; OnReconciled: () => void }) {
+  const [Outcome, SetOutcome] = useState<'succeeded' | 'failed'>('failed')
+  const [Note, SetNote] = useState('')
+  const [EvidenceOpen, SetEvidenceOpen] = useState(false)
+  const Evidence = useQuery({
+    queryKey: ['migration-evidence', Execution.id],
+    queryFn: ({ signal }) => GetExecutionEvidence(Execution.database_id, Execution.migration_id, Execution.id, signal),
+    enabled: EvidenceOpen,
+  })
+  const Reconcile = useMutation({
+    mutationFn: () => ReconcileExecution(Execution.database_id, Execution.migration_id, Execution.id, Outcome, Note),
+    onSuccess: () => {
+      SetNote('')
+      OnReconciled()
+    },
+  })
+  return (
+    <div className="reconcile-panel">
+      <Notice Tone="warning" Role="status">
+        This execution is still running or uncertain. Verify the target database and reconcile it before running later migrations.
+      </Notice>
+      <div className="form-grid">
+        <div className="field">
+          <label htmlFor="reconcile-outcome">Verified outcome</label>
+          <select id="reconcile-outcome" className="select" value={Outcome} onChange={Event => SetOutcome(Event.target.value as 'succeeded' | 'failed')}>
+            <option value="failed">Failed — transaction rolled back</option>
+            <option value="succeeded">Succeeded — transaction committed</option>
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="reconcile-note">Evidence note</label>
+          <input id="reconcile-note" className="input" value={Note} onChange={Event => SetNote(Event.target.value)} maxLength={500} placeholder="What was verified in the target database?" />
+        </div>
+      </div>
+      <div className="form-actions">
+        <button className="btn" type="button" disabled={Reconcile.isPending} onClick={() => Reconcile.mutate()}>{Reconcile.isPending ? 'Reconciling…' : 'Reconcile execution'}</button>
+        <button className="btn btn-secondary" type="button" onClick={() => SetEvidenceOpen(Value => !Value)}>{EvidenceOpen ? 'Hide evidence' : 'Load target evidence'}</button>
+      </div>
+      {Reconcile.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Reconcile.error, 'Unable to reconcile the execution.')}</Notice>}
+      {Reconcile.isSuccess && <Notice Tone="success" Role="status">Execution reconciled. History refreshed.</Notice>}
+      {EvidenceOpen && Evidence.isPending && <Loading>Loading target evidence…</Loading>}
+      {EvidenceOpen && Evidence.isError && <Notice Tone="danger" Role="alert">{ErrorMessage(Evidence.error, 'Unable to read target evidence.')}</Notice>}
+      {EvidenceOpen && Evidence.data && (Evidence.data.length === 0 ? <p className="muted">No target evidence rows found.</p> : (
+        <div className="table-scroll inset-table">
+          <table className="table">
+            <thead><tr><th>Batch</th><th>Direction</th><th>Cursor from</th><th>Cursor to</th><th>Rows</th><th>Attempt</th><th>Created</th></tr></thead>
+            <tbody>{Evidence.data.map(Row => (
+              <tr key={`${Row.execution_id}:${Row.batch_no}`}>
+                <td className="mono">{Row.batch_no}</td><td>{Row.direction}</td><td className="mono">{Row.cursor_from}</td><td className="mono">{Row.cursor_to}</td><td className="mono">{Row.row_count}</td><td className="mono">{Row.attempt_no}</td><td className="muted cell-nowrap">{new Date(Row.created_at).toLocaleString()}</td>
+              </tr>
+            ))}</tbody>
+          </table>
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function ExecutionDetails({ Execution, IsAdmin, OnReconciled }: { Execution: MigrationExecution; IsAdmin: boolean; OnReconciled: () => void }) {
   return (
     <div className="card-body execution-details">
       <hr className="divider" />
@@ -602,6 +666,9 @@ function ExecutionDetails({ Execution }: { Execution: MigrationExecution }) {
       )}
       <SQLBlock Label="Executed SQL snapshot" SQL={Execution.sql_text} />
       {Execution.error_message && <Notice Tone="danger" Role="alert">{Execution.error_message}</Notice>}
+      {IsAdmin && (Execution.status === 'running' || Execution.status === 'queued') && (
+        <ReconcilePanel Execution={Execution} OnReconciled={OnReconciled} />
+      )}
       <div className="table-scroll inset-table">
         <table className="table">
           <thead><tr><th>Attempt</th><th>Status</th><th>Actor</th><th>Started</th><th>Duration</th><th>Error</th></tr></thead>

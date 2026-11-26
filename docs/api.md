@@ -90,6 +90,8 @@ the definition (`locked_at`); later edits must be new migrations.
 | `POST` | `/databases/{dbId}/migrations/{id}/rollback` | View + Edit | None | `202` job | Enqueues a rollback |
 | `POST` | `/databases/{dbId}/migrations/{id}/forward` | View + Edit | None | `202` job | Enqueues a forward |
 | `POST` | `/databases/{dbId}/migrations/{id}/retry` | View + Edit | None | `202` job | Enqueues a retry |
+| `GET` | `/databases/{dbId}/migrations/{id}/executions/{executionId}/evidence` | View Only, View + Edit | None | `200` `[...]` | Lists target-side execution evidence |
+| `POST` | `/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile` | Platform Admin | `{"outcome":"succeeded"\|"failed","note":"..."}` | `200` `{...}` | Reconciles a queued/running execution after target verification |
 | `POST` | `/databases/{dbId}/migrations/analyze` | View Only, View + Edit | `{"sql_text":"..."}` | `200` `{...}` | Runs EXPLAIN (ANALYZE) in a target rollback transaction |
 
 Action endpoints enqueue a migration job and return it immediately. A job contains
@@ -155,7 +157,19 @@ batch, allowing the worker to reconcile a commit whose platform record was lost.
 12. **Safe errors:** Confirmed SQL failures record a generic error in the platform. Raw PostgreSQL errors and credentials are not persisted or returned by the API.
 13. **Uncertain outcomes:** A lost commit response, rollback failure, or failed result write leaves the execution running/pending. Retry and later actions are blocked until the target outcome is verified and reconciled.
 14. **Logging:** Every attempt logs structured JSON with actor, database, migration, execution, version/revision, kind/direction, attempt number, SQL, status, and error category. Application logs remain separate from migration history.
-15. **Timeout:** Execution and lock acquisition share a 30-second deadline; rollback and result recording use a separate five-second cleanup window. Queue-based asynchronous execution replaces this synchronous path in the async milestone.
+15. **Timeout:** Worker executions use `WORKER_EXECUTION_TIMEOUT` (default `30m`), independent of HTTP timeouts. The worker renews its job lease while executing so long jobs are not expired by another worker. A statement cancelled by its own deadline is rolled back and recorded as a confirmed timeout failure; rollback and result recording use separate five-second cleanup windows.
+
+### Reconciliation
+
+Normal and batch executions write a target-side evidence row inside the same target
+transaction as the change (`platform_migration.batches`, `batch_no=0` for normal
+mode). If a commit result is lost, a worker dies, or the lease expires, the
+execution remains `running` and blocks later actions. A platform administrator
+verifies the target and calls the reconcile endpoint with `outcome` and a `note`.
+Reconciliation only accepts `queued` or `running` executions; it closes open
+attempts, updates the execution and related job, refreshes the migration status,
+and records the actor/note. `GET .../evidence` exposes the target evidence rows for
+verification. Reconciliation never rewrites execution/attempt SQL history.
 
 ### Migration Review
 

@@ -48,6 +48,7 @@ type MigrationRepository interface {
 	GetJob(Ctx Context.Context, DatabaseID string, JobID string) (Job, error)
 	ListJobs(Ctx Context.Context, DatabaseID string, Limit int) ([]Job, error)
 	ClaimJob(Ctx Context.Context, WorkerID string, Lease Time.Duration) (Job, error)
+	RenewJobLease(Ctx Context.Context, JobID string, WorkerID string, Lease Time.Duration) error
 	FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error
 	ExpireStaleJobs(Ctx Context.Context, Limit int) (int, error)
 	RequeueJob(Ctx Context.Context, JobID string, AvailableAt Time.Time, LastError string) error
@@ -55,15 +56,25 @@ type MigrationRepository interface {
 	RecordBatchUp(Ctx Context.Context, ExecutionID string, DatabaseID string, BatchNo int64, CursorFrom int64, CursorTo int64, RowCount int64) (Execution, error)
 	RecordBatchReverted(Ctx Context.Context, RollbackExecutionID string, UpExecutionID string, DatabaseID string, BatchNo int64) (Execution, error)
 	ListCommittedBatches(Ctx Context.Context, ExecutionID string) ([]Batch, error)
+	CloseRunningAttempts(Ctx Context.Context, ExecutionID string, Status AttemptStatus, Message string) error
+	ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error)
 }
 
 type Service struct {
-	Repo     MigrationRepository
-	Reviews  *Repository
-	Access   Access.Evaluator
-	Resolver DSNResolver
-	Driver   Driver.Driver
-	Logger   *Slog.Logger
+	Repo             MigrationRepository
+	Reviews          *Repository
+	Access           Access.Evaluator
+	Resolver         DSNResolver
+	Driver           Driver.Driver
+	Logger           *Slog.Logger
+	ExecutionTimeout Time.Duration
+}
+
+func (Server *Service) executionTimeout() Time.Duration {
+	if Server.ExecutionTimeout > 0 {
+		return Server.ExecutionTimeout
+	}
+	return 30 * Time.Minute
 }
 
 func (Server *Service) logger() *Slog.Logger {
@@ -100,7 +111,9 @@ func actorID(User Auth.Principal) *string {
 
 func safeMessage(Err error) *string {
 	Message := Driver.ErrExecution.Error()
-	if Errors.Is(Err, ErrUnavailable) || Errors.Is(Err, Driver.ErrUnavailable) || Errors.Is(Err, Driver.ErrInvalidDSN) {
+	if Errors.Is(Err, ErrExecutionTimeout) || Errors.Is(Err, Context.DeadlineExceeded) {
+		Message = ErrExecutionTimeout.Error()
+	} else if Errors.Is(Err, ErrUnavailable) || Errors.Is(Err, Driver.ErrUnavailable) || Errors.Is(Err, Driver.ErrInvalidDSN) {
 		Message = Driver.ErrUnavailable.Error()
 	}
 	return &Message
@@ -280,7 +293,7 @@ func (Server *Service) reviewStore(Repo MigrationRepository) *Repository {
 }
 
 func (Server *Service) withAction(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Run func(Context.Context, MigrationRepository, Auth.Principal, Migration) (Execution, error)) (Execution, error) {
-	Ctx, Cancel := Context.WithTimeout(Ctx, 30*Time.Second)
+	Ctx, Cancel := Context.WithTimeout(Ctx, Server.executionTimeout())
 	defer Cancel()
 	DatabaseID = Strings.TrimSpace(DatabaseID)
 	ID = Strings.TrimSpace(ID)
@@ -507,6 +520,9 @@ func (Server *Service) ListJobs(Ctx Context.Context, User Auth.Principal, Databa
 }
 
 func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration, Latest Execution) (Execution, error) {
+	if Err := Repo.CloseRunningAttempts(Ctx, Latest.ID, AttemptFailed, "superseded by retry"); Err != nil {
+		return Execution{}, Err
+	}
 	Running, Err := Repo.SetExecutionRunning(Ctx, Current.DatabaseID, Latest.ID)
 	if Err != nil {
 		return Execution{}, Err
@@ -586,13 +602,16 @@ func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository,
 	}
 	TargetConn, Err := Server.getDriver().Open(DSN)
 	if Err != nil {
-		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Err)
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, Err))
 	}
 	defer TargetConn.Close()
+	if Err := Server.ensureBatchEvidence(Ctx, TargetConn); Err != nil {
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
+	}
 
 	TargetTx, Err := TargetConn.Begin(Ctx)
 	if Err != nil {
-		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Err)
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, Err))
 	}
 	Closed := false
 	defer func() {
@@ -605,7 +624,18 @@ func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository,
 	}()
 
 	if Err := TargetTx.ExecScript(Ctx, Exec.SQLText); Err != nil {
-		if RollbackErr := TargetTx.Rollback(Ctx); RollbackErr != nil {
+		RollbackCtx, RollbackCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+		RollbackErr := TargetTx.Rollback(RollbackCtx)
+		RollbackCancel()
+		if RollbackErr != nil {
+			if Cause := timeoutCause(Ctx, nil); Cause != nil {
+				Closed = true
+				Server.logger().WarnContext(Ctx, "migration deadline closed the target connection; transaction was aborted",
+					"event", "migration.execution.timeout_cleanup",
+					"database_id", Current.DatabaseID, "migration_id", Current.ID,
+					"execution_id", Exec.ID, "sql", Exec.SQLText)
+				return Server.finishFailure(Ctx, Repo, Exec, Attempt, Cause)
+			}
 			Server.logger().ErrorContext(Ctx, "migration execution outcome is uncertain after rollback failure",
 				"event", "migration.execution.uncertain",
 				"database_id", Current.DatabaseID, "migration_id", Current.ID,
@@ -613,11 +643,18 @@ func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository,
 			return Exec, ErrUnavailable
 		}
 		Closed = true
+		Cause := timeoutCause(Ctx, Driver.ErrExecution)
 		Server.logger().ErrorContext(Ctx, "migration SQL failed; target transaction rolled back",
 			"event", "migration.execution.rolled_back",
 			"database_id", Current.DatabaseID, "migration_id", Current.ID,
-			"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText)
-		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Driver.ErrExecution)
+			"execution_id", Exec.ID, "attempt", Attempt.AttemptNo, "sql", Exec.SQLText, "error", Cause)
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, Cause)
+	}
+	if Err := writeBatchEvidence(Ctx, TargetTx, Exec.ID, 0, string(Exec.Direction), 0, 0, 0, Attempt.AttemptNo); Err != nil {
+		RollbackCtx, RollbackCancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+		_ = TargetTx.Rollback(RollbackCtx)
+		RollbackCancel()
+		return Server.finishFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
 	}
 
 	if Err := TargetTx.Commit(Ctx); Err != nil {
@@ -655,6 +692,13 @@ func (Server *Service) runAttempt(Ctx Context.Context, Repo MigrationRepository,
 		"execution_id", Exec.ID, "version", Current.Version, "revision", Exec.Revision,
 		"kind", Exec.Kind, "direction", Exec.Direction, "attempt", Attempt.AttemptNo)
 	return Updated, nil
+}
+
+func timeoutCause(Ctx Context.Context, Fallback error) error {
+	if Errors.Is(Ctx.Err(), Context.DeadlineExceeded) {
+		return ErrExecutionTimeout
+	}
+	return Fallback
 }
 
 func (Server *Service) finishFailure(Ctx Context.Context, Repo MigrationRepository, Exec Execution, Attempt Attempt, Cause error) (Execution, error) {
@@ -857,6 +901,82 @@ func AnnotateCapabilities(Items []Migration, History []Execution) []Migration {
 		}
 	}
 	return Result
+}
+
+func (Server *Service) Reconcile(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string, Outcome string, Note string) (Execution, error) {
+	if !User.IsPlatformAdmin {
+		return Execution{}, ErrForbidden
+	}
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	MigrationID = Strings.TrimSpace(MigrationID)
+	ExecutionID = Strings.TrimSpace(ExecutionID)
+	Outcome = Strings.TrimSpace(Outcome)
+	Note = Strings.TrimSpace(Note)
+	if DatabaseID == "" || MigrationID == "" || ExecutionID == "" {
+		return Execution{}, ErrNotFound
+	}
+	if Outcome != "succeeded" && Outcome != "failed" {
+		return Execution{}, ErrInvalidInput
+	}
+	if len(Note) > 500 {
+		return Execution{}, ErrInvalidInput
+	}
+	Result, Err := Server.Repo.WithExecutionLock(Ctx, DatabaseID, func(Repo MigrationRepository) (Execution, error) {
+		return Repo.ReconcileExecution(Ctx, DatabaseID, MigrationID, ExecutionID, Outcome == "succeeded", actorID(User), Note)
+	})
+	if Err != nil {
+		return Execution{}, Err
+	}
+	Server.logger().InfoContext(Ctx, "migration execution reconciled",
+		"event", "migration.execution.reconciled", "actor_id", User.ID, "actor", User.Username,
+		"database_id", DatabaseID, "migration_id", MigrationID, "execution_id", ExecutionID,
+		"outcome", Outcome, "note", Note)
+	return Result, nil
+}
+
+func (Server *Service) ExecutionEvidence(Ctx Context.Context, User Auth.Principal, DatabaseID string, MigrationID string, ExecutionID string) ([]Evidence, error) {
+	DatabaseID = Strings.TrimSpace(DatabaseID)
+	MigrationID = Strings.TrimSpace(MigrationID)
+	ExecutionID = Strings.TrimSpace(ExecutionID)
+	if DatabaseID == "" || MigrationID == "" || ExecutionID == "" {
+		return nil, ErrNotFound
+	}
+	if Err := Server.checkAccess(Ctx, User, Access.ActionView, DatabaseID); Err != nil {
+		return nil, Err
+	}
+	if _, Err := Server.Repo.GetExecution(Ctx, DatabaseID, ExecutionID); Err != nil {
+		return nil, Err
+	}
+	if Server.Resolver == nil {
+		return nil, ErrUnavailable
+	}
+	DSN, Err := Server.Resolver.DialTargetDSN(Ctx, DatabaseID)
+	if Err != nil {
+		return nil, Err
+	}
+	Target, Err := Server.getDriver().Open(DSN)
+	if Err != nil {
+		return nil, ErrUnavailable
+	}
+	defer Target.Close()
+	Rows, Err := Target.Query(Ctx, `SELECT execution_id::text, batch_no, direction, cursor_from, cursor_to, row_count, attempt_no, created_at
+FROM platform_migration.batches WHERE execution_id = $1::uuid ORDER BY batch_no`, ExecutionID)
+	if Err != nil {
+		return nil, ErrUnavailable
+	}
+	defer Rows.Close()
+	Result := []Evidence{}
+	for Rows.Next() {
+		var Item Evidence
+		if Err := Rows.Scan(&Item.ExecutionID, &Item.BatchNo, &Item.Direction, &Item.CursorFrom, &Item.CursorTo, &Item.RowCount, &Item.AttemptNo, &Item.CreatedAt); Err != nil {
+			return nil, ErrUnavailable
+		}
+		Result = append(Result, Item)
+	}
+	if Err := Rows.Err(); Err != nil {
+		return nil, ErrUnavailable
+	}
+	return Result, nil
 }
 
 func (Server *Service) AnalyzePlan(Ctx Context.Context, User Auth.Principal, DatabaseID string, SQL string) (QueryPlanAnalysis, error) {

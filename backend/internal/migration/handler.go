@@ -40,6 +40,8 @@ func (Routes *Handler) Register(Api Chi.Router) {
 			R.Get(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
 			R.With(Logging.Activity("migration.review.submit")).Post(Prefix+"/{migrationID}/reviews/{action}", Routes.Review)
 			R.With(Logging.Activity("migration.review.approve")).Put(Prefix+"/{migrationID}/reviews/{action}/{reviewID}/approvals/{groupID}", Routes.ApproveReview)
+			R.With(Logging.Activity("migration.execution.reconcile")).Post(Prefix+"/{migrationID}/executions/{executionID}/reconcile", Routes.Reconcile)
+			R.Get(Prefix+"/{migrationID}/executions/{executionID}/evidence", Routes.Evidence)
 		})
 	}
 	registerRoutes("/databases/{dbID}/migrations")
@@ -89,6 +91,10 @@ func WriteMigrationError(W Http.ResponseWriter, Err error) {
 		Httpx.Error(W, 409, "out_of_order", "Earlier migrations must finish first; only the latest attempt can be retried")
 	case Errors.Is(Err, ErrPending):
 		Httpx.Error(W, 409, "execution_pending", "Verify the previous execution outcome before retrying")
+	case Errors.Is(Err, ErrExecutionTimeout):
+		Httpx.Error(W, 422, "execution_timeout", "Migration exceeded its execution timeout")
+	case Errors.Is(Err, ErrReconcileNotAllowed):
+		Httpx.Error(W, 409, "reconcile_not_allowed", "Only a queued or running execution can be reconciled")
 	case Errors.Is(Err, ErrConflict):
 		Httpx.Error(W, 409, "conflict", "Migration version conflict")
 	case Errors.Is(Err, ErrLocked):
@@ -315,6 +321,39 @@ func (Routes *Handler) ApproveReview(W Http.ResponseWriter, R *Http.Request) {
 		return
 	}
 	W.WriteHeader(Http.StatusNoContent)
+}
+
+func (Routes *Handler) Reconcile(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	var Input struct {
+		Outcome string `json:"outcome"`
+		Note    string `json:"note"`
+	}
+	Decoder := Json.NewDecoder(Http.MaxBytesReader(W, R.Body, 8192))
+	Decoder.DisallowUnknownFields()
+	if Err := Decoder.Decode(&Input); Err != nil {
+		Httpx.Error(W, 400, "invalid_request", "Invalid reconciliation request")
+		return
+	}
+	Result, Err := Routes.Service.Reconcile(R.Context(), User,
+		Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Chi.URLParam(R, "executionID"),
+		Input.Outcome, Input.Note)
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
+}
+
+func (Routes *Handler) Evidence(W Http.ResponseWriter, R *Http.Request) {
+	User, _ := Auth.PrincipalFromContext(R.Context())
+	Result, Err := Routes.Service.ExecutionEvidence(R.Context(), User,
+		Chi.URLParam(R, "dbID"), Chi.URLParam(R, "migrationID"), Chi.URLParam(R, "executionID"))
+	if Err != nil {
+		WriteMigrationError(W, Err)
+		return
+	}
+	Httpx.JSON(W, 200, Result)
 }
 
 func (Routes *Handler) Analyze(W Http.ResponseWriter, R *Http.Request) {
