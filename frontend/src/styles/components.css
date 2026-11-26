@@ -305,6 +305,7 @@
 
 /* Tables */
 .table-scroll {
+  position: relative;
   width: 100%;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
