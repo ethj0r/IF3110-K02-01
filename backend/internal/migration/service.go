@@ -239,6 +239,45 @@ func (Server *Service) Retry(Ctx Context.Context, User Auth.Principal, DatabaseI
 	})
 }
 
+func (Server *Service) RetryTransient(Ctx Context.Context, User Auth.Principal, DatabaseID, ID, ExecutionID string, ExpectedKind ExecutionKind) (Execution, error) {
+	return Server.withAction(Ctx, User, DatabaseID, ID, func(Ctx Context.Context, Repo MigrationRepository, User Auth.Principal, Current Migration) (Execution, error) {
+		Latest, Err := Repo.LatestExecution(Ctx, Current.DatabaseID, Current.ID)
+		if Err != nil {
+			if Errors.Is(Err, ErrNotFound) {
+				return Execution{}, ErrNoFailedAttempt
+			}
+			return Execution{}, Err
+		}
+		_, History, Err := Server.loadState(Ctx, Repo, Current.DatabaseID)
+		if Err != nil {
+			return Execution{}, Err
+		}
+		if Err := ValidateRetry(Current, History); Err != nil {
+			return Execution{}, Err
+		}
+		if Latest.ID != ExecutionID || Latest.Kind != ExpectedKind || !Latest.Status.IsFailure() {
+			return Execution{}, ErrOutOfOrder
+		}
+		if Server.Reviews != nil && Server.Reviews.requireReview {
+			Approved, Err := Server.reviewStore(Repo).hasExecutionApproval(Ctx, Current.DatabaseID, Latest.ID)
+			if Err != nil {
+				return Execution{}, Err
+			}
+			if !Approved {
+				return Execution{}, ErrApprovalRequired
+			}
+		}
+		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
+	})
+}
+
+func (Server *Service) reviewStore(Repo MigrationRepository) *Repository {
+	if Locked, Ok := Repo.(*Repository); Ok {
+		return Locked
+	}
+	return Server.Reviews
+}
+
 func (Server *Service) withAction(Ctx Context.Context, User Auth.Principal, DatabaseID string, ID string, Run func(Context.Context, MigrationRepository, Auth.Principal, Migration) (Execution, error)) (Execution, error) {
 	Ctx, Cancel := Context.WithTimeout(Ctx, 30*Time.Second)
 	defer Cancel()
@@ -326,6 +365,15 @@ func (Server *Service) retryLocked(Ctx Context.Context, Repo MigrationRepository
 		return Execution{}, Err
 	}
 	if Latest.Mode == ModeBatch {
+		if Server.Reviews != nil && Server.Reviews.requireReview {
+			Approved, Err := Server.reviewStore(Repo).hasReviewApproval(Ctx, reviewKey{Current.DatabaseID, Current.ID, KindRetry}, Latest.SQLText)
+			if Err != nil {
+				return Execution{}, Err
+			}
+			if !Approved {
+				return Execution{}, ErrApprovalRequired
+			}
+		}
 		return Server.resumeExecution(Ctx, Repo, User, Current, Latest)
 	}
 	return Server.startExecution(Ctx, Repo, User, Current, ExecutionRequest{
@@ -440,6 +488,11 @@ func (Server *Service) resumeExecution(Ctx Context.Context, Repo MigrationReposi
 	Running, Err := Repo.SetExecutionRunning(Ctx, Current.DatabaseID, Latest.ID)
 	if Err != nil {
 		return Execution{}, Err
+	}
+	RecordCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	if _, Err := Repo.RefreshStatus(RecordCtx, Current.DatabaseID, Current.ID); Err != nil {
+		return Running, ErrUnavailable
 	}
 	return Server.runExecution(Ctx, Repo, User, Current, Running)
 }

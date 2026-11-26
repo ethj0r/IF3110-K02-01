@@ -305,3 +305,181 @@ func TestRealGroupGrantsProtectAuthenticatedMigrationWorkflow(T *Testing.T) {
 	Client.Request(T, "editor", "POST", "/api/auth/logout", nil, 204)
 	Client.Request(T, "editor", "GET", Base+"/migrations", nil, 401)
 }
+
+type flakyTargetDriver struct {
+	Base     Driver.Driver
+	Failures int
+}
+
+func (F *flakyTargetDriver) Open(DSN string) (Driver.Conn, error) {
+	if F.Failures > 0 {
+		F.Failures--
+		return nil, Driver.ErrUnavailable
+	}
+	return F.Base.Open(DSN)
+}
+
+func TestReviewedWorkerRetriesTransientFailureAndRevalidatesBatchRetry(T *Testing.T) {
+	Ctx := Context.Background()
+	Platform, Target := Testdb.PlatformDatabase(T), Testutil.Database(T)
+	DBID, EditorID := setupFixture(T, Platform)
+	AdminService := Admin.NewService(&Admin.Repository{Pool: Platform})
+	Group, Err := AdminService.CreateGroup(Ctx, Admin.CreateGroupInput{Name: "editors"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := AdminService.AddMember(Ctx, Group.ID, EditorID); Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := AdminService.SetGroupLeader(Ctx, Group.ID, EditorID); Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := AdminService.SetAccess(Ctx, Group.ID, DBID, string(Access.LevelViewEdit)); Err != nil {
+		T.Fatal(Err)
+	}
+	Editor := Auth.Principal{ID: EditorID, Username: "editor"}
+	Repo := NewReviewedRepository(Platform)
+	Flaky := &flakyTargetDriver{Base: testTargetDriver{Pool: Target}, Failures: 1}
+	Service := &Service{
+		Repo:     Repo,
+		Reviews:  Repo,
+		Access:   &Access.Repository{Pool: Platform},
+		Resolver: DSNResolverFunc(func(Context.Context, string) (string, error) { return "target", nil }),
+		Driver:   Flaky,
+	}
+	approve := func(MigrationID string, Action ExecutionKind) {
+		T.Helper()
+		Key := reviewKey{DatabaseID: DBID, MigrationID: MigrationID, Action: Action}
+		if Err := Repo.submitReview(Ctx, Key, EditorID); Err != nil {
+			T.Fatal(Err)
+		}
+		Review, Err := Repo.getReview(Ctx, Key, EditorID)
+		if Err != nil {
+			T.Fatal(Err)
+		}
+		if Err := Repo.approveReview(Ctx, Key, Review.ID, Group.ID, EditorID); Err != nil {
+			T.Fatal(Err)
+		}
+	}
+
+	// 1. Approved apply job automatically retries transient target failure without needing a new retry review.
+	First, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{
+		Title:   "Transient apply",
+		SQLText: "CREATE TABLE retry_ok (id int primary key);",
+		DownSQL: "DROP TABLE retry_ok;",
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	approve(First.ID, KindApply)
+	Queued, Err := Service.Enqueue(Ctx, Editor, DBID, First.ID, JobApply, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	AfterFirst := RunNextJob(T, Repo, Service)
+	if AfterFirst.ID != Queued.ID || AfterFirst.Status != JobQueued || AfterFirst.Attempts != 1 {
+		T.Fatalf("transient failure was not requeued: %+v", AfterFirst)
+	}
+	if _, Err := Platform.Exec(Ctx, "UPDATE migration_jobs SET available_at = CURRENT_TIMESTAMP WHERE id = $1", Queued.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	AfterSecond := RunNextJob(T, Repo, Service)
+	if AfterSecond.Status != JobSucceeded || AfterSecond.Attempts != 2 || AfterSecond.ExecutionID == nil {
+		T.Fatalf("automatic worker retry failed with reviews enabled: %+v", AfterSecond)
+	}
+	Exec, Err := Repo.GetExecution(Ctx, DBID, *AfterSecond.ExecutionID)
+	if Err != nil || Exec.Status != ExecutionSucceeded || len(Exec.Attempts) != 2 {
+		T.Fatalf("expected 2 attempts on resumed execution: %+v %v", Exec, Err)
+	}
+
+	// 2. Manual batch retry revalidates approval under lock if group access changes after enqueue.
+	if _, Err := Target.Exec(Ctx, `CREATE TABLE batch_rev (id BIGINT PRIMARY KEY, val INT NOT NULL);
+INSERT INTO batch_rev SELECT g, 0 FROM generate_series(1, 15) AS g`); Err != nil {
+		T.Fatal(Err)
+	}
+	BatchItem, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{
+		Title:       "Batch approval gate",
+		SQLText:     `UPDATE batch_rev SET val = 1 / (CASE WHEN id = 12 THEN 0 ELSE 1 END) WHERE id IN (SELECT id FROM batch_rev WHERE id > $1 ORDER BY id LIMIT $2) RETURNING id`,
+		DownSQL:     `UPDATE batch_rev SET val = 0 WHERE id > $2 AND id <= $1`,
+		BatchMode:   true,
+		BatchColumn: "id",
+		BatchSize:   10,
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	approve(BatchItem.ID, KindApply)
+	if _, Err := Service.Enqueue(Ctx, Editor, DBID, BatchItem.ID, JobApply, ""); Err != nil {
+		T.Fatal(Err)
+	}
+	PartialJob := RunNextJob(T, Repo, Service)
+	if PartialJob.Status != JobFailed {
+		T.Fatalf("expected partial batch failure, got %+v", PartialJob)
+	}
+	if _, Err := Target.Exec(Ctx, "DELETE FROM batch_rev WHERE id = 12"); Err != nil {
+		T.Fatal(Err)
+	}
+	approve(BatchItem.ID, KindRetry)
+	if _, Err := Service.Enqueue(Ctx, Editor, DBID, BatchItem.ID, JobRetry, ""); Err != nil {
+		T.Fatal(Err)
+	}
+	// Grant a second group access before the worker claims the queued retry job.
+	NewGroup, Err := AdminService.CreateGroup(Ctx, Admin.CreateGroupInput{Name: "reviewers"})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if Err := AdminService.SetAccess(Ctx, NewGroup.ID, DBID, string(Access.LevelViewOnly)); Err != nil {
+		T.Fatal(Err)
+	}
+	BlockedJob := RunNextJob(T, Repo, Service)
+	if BlockedJob.Status != JobFailed || BlockedJob.LastError == nil || *BlockedJob.LastError != "migration requires approval from every group" {
+		T.Fatalf("queued batch retry was not blocked after new group access: %+v", BlockedJob)
+	}
+	var UpdatedCount int
+	if Err := Target.QueryRow(Ctx, "SELECT count(*) FROM batch_rev WHERE val = 1").Scan(&UpdatedCount); Err != nil || UpdatedCount != 10 {
+		T.Fatalf("blocked batch retry mutated remaining rows: %d %v", UpdatedCount, Err)
+	}
+
+	// 3. Automatic worker retry is also blocked if approval is revoked between attempts.
+	if Err := AdminService.RemoveAccess(Ctx, NewGroup.ID, DBID); Err != nil {
+		T.Fatal(Err)
+	}
+	approve(BatchItem.ID, KindRetry)
+	if _, Err := Service.Enqueue(Ctx, Editor, DBID, BatchItem.ID, JobRetry, ""); Err != nil {
+		T.Fatal(Err)
+	}
+	if Finished := RunNextJob(T, Repo, Service); Finished.Status != JobSucceeded {
+		T.Fatalf("re-approved batch retry failed: %+v", Finished)
+	}
+	Flaky.Failures = 1
+	Third, Err := Service.Create(Ctx, Editor, DBID, MigrationInput{
+		Title:   "Transient revoked",
+		SQLText: "CREATE TABLE retry_blocked (id int primary key);",
+		DownSQL: "DROP TABLE retry_blocked;",
+	})
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	approve(Third.ID, KindApply)
+	RevokedQueued, Err := Service.Enqueue(Ctx, Editor, DBID, Third.ID, JobApply, "")
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	if Requeued := RunNextJob(T, Repo, Service); Requeued.Status != JobQueued || Requeued.Attempts != 1 {
+		T.Fatalf("expected transient requeue: %+v", Requeued)
+	}
+	if Err := AdminService.SetAccess(Ctx, NewGroup.ID, DBID, string(Access.LevelViewOnly)); Err != nil {
+		T.Fatal(Err)
+	}
+	if _, Err := Platform.Exec(Ctx, "UPDATE migration_jobs SET available_at = CURRENT_TIMESTAMP WHERE id = $1", RevokedQueued.ID); Err != nil {
+		T.Fatal(Err)
+	}
+	RevokedResult := RunNextJob(T, Repo, Service)
+	if RevokedResult.Status != JobFailed || RevokedResult.LastError == nil || *RevokedResult.LastError != "migration requires approval from every group" {
+		T.Fatalf("auto-retry should fail when approval was invalidated: %+v", RevokedResult)
+	}
+	var BlockedExists bool
+	if Err := Target.QueryRow(Ctx, "SELECT to_regclass('retry_blocked') IS NOT NULL").Scan(&BlockedExists); Err != nil || BlockedExists {
+		T.Fatalf("revoked auto-retry mutated target table: %v %v", BlockedExists, Err)
+	}
+}
