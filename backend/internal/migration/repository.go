@@ -6,6 +6,7 @@ import (
 	Slog "log/slog"
 	Time "time"
 
+	Logging "github.com/ethj0r/IF3110-K02-01/backend/internal/logging"
 	Tracing "github.com/ethj0r/IF3110-K02-01/backend/internal/tracing"
 	Attribute "go.opentelemetry.io/otel/attribute"
 
@@ -70,12 +71,13 @@ func (Repo *Repository) acquireLock(Ctx Context.Context, DatabaseID string) (*Pg
 	}
 	Wait := float64(Time.Since(Started).Microseconds()) / 1000
 	Span.SetAttributes(Attribute.Float64("lock.wait_ms", Wait))
+	SafeDatabaseID := Logging.SanitizeLogValue(DatabaseID)
 	if Err != nil {
 		Tracing.Fail(Span, Err, "migration lock unavailable")
-		Slog.ErrorContext(Ctx, "migration lock unavailable", "event", "migration.lock.failed", "database_id", DatabaseID, "wait_ms", Wait)
+		Slog.ErrorContext(Ctx, "migration lock unavailable", "event", "migration.lock.failed", "database_id", SafeDatabaseID, "wait_ms", Wait)
 		return nil, Time.Time{}, ErrUnavailable
 	}
-	Slog.InfoContext(Ctx, "migration lock acquired", "event", "migration.lock.acquired", "database_id", DatabaseID, "wait_ms", Wait)
+	Slog.InfoContext(Ctx, "migration lock acquired", "event", "migration.lock.acquired", "database_id", SafeDatabaseID, "wait_ms", Wait)
 	return Conn, Time.Now(), nil
 }
 
@@ -83,13 +85,14 @@ func (Repo *Repository) releaseLock(Ctx Context.Context, Conn *Pgxpool.Conn, Dat
 	Cleanup, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
 	defer Cancel()
 	Held := float64(Time.Since(Acquired).Microseconds()) / 1000
+	SafeDatabaseID := Logging.SanitizeLogValue(DatabaseID)
 	if _, Err := Conn.Exec(Cleanup, "SELECT pg_advisory_unlock(hashtext('migration_' || $1::uuid::text))", DatabaseID); Err != nil {
 		_ = Conn.Hijack().Close(Cleanup)
-		Slog.WarnContext(Cleanup, "migration lock released by closing the connection", "event", "migration.lock.released", "database_id", DatabaseID, "held_ms", Held, "status", "connection_closed")
+		Slog.WarnContext(Cleanup, "migration lock released by closing the connection", "event", "migration.lock.released", "database_id", SafeDatabaseID, "held_ms", Held, "status", "connection_closed")
 		return
 	}
 	Conn.Release()
-	Slog.InfoContext(Cleanup, "migration lock released", "event", "migration.lock.released", "database_id", DatabaseID, "held_ms", Held, "status", "ok")
+	Slog.InfoContext(Cleanup, "migration lock released", "event", "migration.lock.released", "database_id", SafeDatabaseID, "held_ms", Held, "status", "ok")
 }
 
 func (Repo *Repository) WithDatabaseLock(Ctx Context.Context, DatabaseID string, Run func(MigrationRepository) (Migration, error)) (Migration, error) {

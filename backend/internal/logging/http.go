@@ -2,6 +2,7 @@ package Logging
 
 import (
 	Context "context"
+	Fmt "fmt"
 	Slog "log/slog"
 	Http "net/http"
 	Time "time"
@@ -48,7 +49,7 @@ func RequestLogger(Logger *Slog.Logger) func(Http.Handler) Http.Handler {
 				Logger.LogAttrs(Ctx, Level, "http request completed",
 					Slog.String("event", "http.request"),
 					Slog.String("method", R.Method),
-					Slog.String("route", Route),
+					Slog.String("route", SanitizeLogValue(Route)),
 					Slog.Int("status", Status),
 					Slog.Int("bytes", Writer.BytesWritten()),
 					Slog.Float64("duration_ms", float64(Time.Since(Started).Microseconds())/1000),
@@ -104,7 +105,24 @@ func Activity(Event string) func(Http.Handler) Http.Handler {
 
 // Record writes a named event using the default logger and the context scope.
 func Record(Ctx Context.Context, Level Slog.Level, Event string, Args ...any) {
-	Slog.Default().Log(Ctx, Level, Event, append([]any{"event", Event}, Args...)...)
+	SafeEvent := SanitizeLogValue(Event)
+	Attrs := make([]Slog.Attr, 0, len(Args)/2+1)
+	Attrs = append(Attrs, Slog.String("event", SafeEvent))
+	for I := 0; I < len(Args); {
+		if Attr, Ok := Args[I].(Slog.Attr); Ok {
+			Attrs = append(Attrs, Slog.String(SanitizeLogValue(Attr.Key), SanitizeLogValue(Attr.Value.String())))
+			I++
+			continue
+		}
+		if Key, Ok := Args[I].(string); Ok && I+1 < len(Args) {
+			Attrs = append(Attrs, Slog.String(SanitizeLogValue(Key), SanitizeLogValue(Fmt.Sprint(Args[I+1]))))
+			I += 2
+			continue
+		}
+		Attrs = append(Attrs, Slog.String("!BADKEY", SanitizeLogValue(Fmt.Sprint(Args[I]))))
+		I++
+	}
+	Slog.Default().LogAttrs(Ctx, Level, SafeEvent, Attrs...)
 }
 
 // DatabaseParam adds the named URL parameter as database_id to the request

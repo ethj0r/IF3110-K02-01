@@ -707,3 +707,41 @@ Overall run summary (`190.3s` total):
    The system reaches its saturation knee: API throughput plateaus/dips slightly to `143.6 req/s` while `p50` rises to `443.24 ms` and `p95` reaches `718.23 ms`, crossing the `500 ms` `p95` threshold. The primary bottlenecks are platform PostgreSQL connection pool contention (`pgxpool` default `MaxConns`) shared across 92 concurrent VUs plus heavier `GET /migrations` and `/migrations/history` reads as the history table grows past 600+ executions, along with `289` same-DB `409` conflicts from 6 VUs per database competing for linear execution order. Crucially, the system degrades gracefully: **`0.00%` API errors**, **`0` failed jobs**, and no stuck locks or double commits.
 4. **Recovery (`80 → 10` API VUs, `12 → 2` Job VUs):**
    As load drops back to normal, the system recovers automatically without intervention: median API latency drops **7×** (`443.24 ms → 63.36 ms`; `p95` remains `564.21 ms` only because of the 15-second ramp-down tail from 80 to 10 VUs), queue wait drops (`83 ms → 52.5 ms`), job duration drops (`295 ms → 195 ms`), and job throughput rebounds to `3.27 jobs/s` (`180` jobs completed, `0` failures).
+
+## Security: SAST with CodeQL
+
+Static Application Security Testing (SAST) is automated via GitHub Actions in [`.github/workflows/codeql.yml`](.github/workflows/codeql.yml) using GitHub CodeQL (`+security-extended` query suite).
+
+### Analysis Scope
+
+| Language | Build Mode | Scope Analyzed | Ignored Paths |
+| --- | --- | --- | --- |
+| `go` | `manual` (`go build ./...` in `backend/`) | All Go backend and worker packages (`backend/cmd/...`, `backend/internal/...`, `backend/migrations/...`) | `backend/internal/webui/dist` |
+| `javascript-typescript` | `none` | React SPA frontend (`frontend/src/...`, `frontend/tests/...`, `frontend/e2e/...`) | `frontend/dist`, `frontend/node_modules` |
+
+The workflow runs on `push` to `main`, `dev`, and `feat/codeql`, on `pull_request` to `main` and `dev`, and via manual `workflow_dispatch`. Results are uploaded to GitHub **Security → Code scanning** and also exported as SARIF artifacts (`codeql-sarif-go`, `codeql-sarif-javascript-typescript`) with a summary printed in the workflow logs.
+
+### Initial Scan Results & Findings Triage (Commit `98a96c9`)
+
+- **`javascript-typescript`:** `0` findings.
+- **`go`:** `6` findings (all `go/log-injection`, CWE-117, severity **Medium**, score `6.1`).
+
+| # | Rule (CWE) | Severity | Location | Potential Impact | Decision & Rationale | Fix Commit |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:75` | User-controlled `database_id` from HTTP route params logged on `migration.lock.failed`; unescaped CR/LF could forge log entries in line-oriented log consumers. | **Valid — Fixed.** Although `slog.JSONHandler` escapes newlines in JSON output, sanitizing CR/LF before logging provides defense-in-depth across all log handlers/OTLP exporters. | `0677e19` |
+| 2 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:78` | Same as #1, on `migration.lock.acquired`. | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 3 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:88` | Same as #1, on `migration.lock.released` (`connection_closed`). | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 4 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/migration/repository.go:92` | Same as #1, on `migration.lock.released` (`ok`). | **Valid — Fixed.** Sanitized `DatabaseID` via `Logging.SanitizeLogValue` before logging. | `0677e19` |
+| 5 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/logging/http.go:51` | Raw `R.URL.Path` logged as `route` on unmatched routes; attacker-controlled path could inject CR/LF into log entries. | **Valid — Fixed.** Sanitized `Route` with `SanitizeLogValue(Route)` before `Logger.LogAttrs`. | `0677e19` |
+| 6 | `go/log-injection` (CWE-117) | Medium (6.1) | `backend/internal/logging/http.go:107` | Variadic `Args ...any` in `Logging.Record` forwarded user-controlled fields (e.g., `database_id`, `actor`) directly to `slog.Default().Log`. | **Valid — Fixed.** Normalized and sanitized `Event` and every attribute through `SanitizeLogValue` and logged via `slog.Default().LogAttrs`. | `0677e19`, `8fdff64` |
+
+### Remediation & Re-Scan Verification
+
+1. **Commit `0677e19`**: Added `Logging.SanitizeLogValue` in `backend/internal/logging/redact.go` to strip `\r` and `\n`, applied it in `backend/internal/migration/repository.go` and `backend/internal/logging/http.go`, and added unit test coverage in `backend/internal/logging/activity_test.go`. Re-scan reduced findings from **6 → 1** (alerts #1–#5 closed).
+2. **Commit `8fdff64`**: Updated `Logging.Record` in `backend/internal/logging/http.go` to convert all arguments into sanitized `slog.Attr` values via `LogAttrs`.
+3. **Final Re-Scan Result:**
+   - **`go`:** `0` findings (`go.sarif`: 0 findings; all 6 previous alerts closed in GitHub Code Scanning).
+   - **`javascript-typescript`:** `0` findings.
+   - All backend checks (`make check-fmt`, `make vet`, `go test -race ./...`) pass.
+
+> **Note on SAST Limitations:** A clean CodeQL scan (`0` findings) does not guarantee that the application is completely free of security vulnerabilities. SAST analyzes source code statically against known patterns and data-flow rules, so it cannot replace runtime/dynamic testing (DAST), dependency auditing, authentication/authorization review, or proper deployment hardening.
