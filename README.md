@@ -8,6 +8,8 @@ The repository includes a Go server, configuration loading, PostgreSQL pooling, 
 
 Authentication, session management, CSRF protection, administrator bootstrap, group-based database access, administration, encrypted target connection management, schema/data inspection, transactional target migrations, schema comparison with editable migration generation, and query execution plan analysis are available.
 
+Milestone 2 adds immutable up/down definitions, rollback/forward and complete execution history, per-group leader approvals, a durable asynchronous migration job queue with a worker, batch mode with checkpoints and partial/reverted progress, target-side execution evidence and administrator reconciliation, structured JSON logging, OpenTelemetry tracing, and observability metrics/dashboards.
+
 ## Requirements
 
 - Go matching `backend/go.mod`.
@@ -257,6 +259,8 @@ Local check (batch migration, 12 rows, batch size 5, forwarded through the queue
 
 Run `make dev-api METRICS_ENABLED=true` and scrape `GET /api/metrics` on the API listener.
 With the default address, verify the response using `curl -fsS http://127.0.0.1:8080/api/metrics`.
+The metrics endpoint is unauthenticated; bind the API to a trusted internal interface or
+place it behind an authenticated reverse proxy when exposing it beyond localhost.
 The endpoint is disabled by default. When enabled, restrict access to the monitoring network.
 
 | Metric | Meaning |
@@ -553,10 +557,36 @@ outcome is verified. Duplicate delivery cannot commit twice because the executio
 gate rejects a second run once an execution exists. See [`docs/api.md`](docs/api.md)
 for the full execution model and error specifications.
 
+### Approvals, Timeouts, and Recovery
+
+Every apply, rollback, forward, and retry action requires a review approved by the
+leader of every group with any access to the database. Review identity includes the
+migration revision, action, and previous execution; editing the definition or the
+previous execution invalidates the review. Approvals are checked when the action is
+enqueued, when the execution is created, and again when the worker retries.
+
+Worker executions use `WORKER_EXECUTION_TIMEOUT` (default `30m`), independent of the
+API timeout. While a job runs, the worker renews its lease every third of
+`WORKER_LEASE`, so another worker does not expire a legitimately long migration. A
+statement cancelled by its deadline is rolled back with a fresh cleanup context and
+recorded as a confirmed `execution_timeout` failure; later migrations are not
+blocked.
+
+If a commit result is lost or a worker dies, the job becomes failed/uncertain and
+the execution stays `running`, blocking later actions. A platform administrator
+verifies the target and uses the execution reconcile action (or
+`POST /api/databases/{dbId}/migrations/{id}/executions/{executionId}/reconcile`)
+with `{"outcome":"succeeded"|"failed","note":"..."}`. Target evidence is available
+at `GET .../executions/{executionId}/evidence`. Reconciliation closes open attempts,
+updates the execution and job, refreshes the migration status, and preserves the
+SQL history. The per-database advisory lock is released when the worker's platform
+connection closes; the pending execution is what blocks later actions until
+reconciliation.
+
 Worker configuration: `WORKER_ID` overrides the generated worker identity,
-`WORKER_LEASE` controls the claim lease (default `2m`), and `WORKER_POLL` controls
-idle polling (default `2s`). The production build creates both `bin/server` and
-`bin/worker`.
+`WORKER_EXECUTION_TIMEOUT` controls execution time (default `30m`), `WORKER_LEASE`
+controls the claim lease (default `2m`), and `WORKER_POLL` controls idle polling
+(default `2s`). The production build creates both `bin/server` and `bin/worker`.
 
 ## Query Execution Plan Analysis
 

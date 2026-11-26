@@ -96,22 +96,24 @@ const (
 )
 
 var (
-	ErrInvalidInput     = Errors.New("invalid migration input")
-	ErrNotFound         = Errors.New("migration not found")
-	ErrConflict         = Errors.New("migration version already exists")
-	ErrAlreadyExecuted  = Errors.New("migration has already been executed")
-	ErrPending          = Errors.New("migration execution outcome requires verification")
-	ErrOutOfOrder       = Errors.New("migration must execute in version order")
-	ErrUnavailable      = Errors.New("migration store is unavailable")
-	ErrForbidden        = Errors.New("permission denied for database migration")
-	ErrIrreversible     = Errors.New("migration is irreversible")
-	ErrNotApplied       = Errors.New("migration is not currently applied")
-	ErrNotRolledBack    = Errors.New("migration is not currently rolled back")
-	ErrRollbackOrder    = Errors.New("only the last active migration can be rolled back")
-	ErrForwardOrder     = Errors.New("migration must be forwarded in linear order")
-	ErrLocked           = Errors.New("migration definition is locked")
-	ErrNoFailedAttempt  = Errors.New("migration has no failed execution to retry")
-	ErrExecutionMissing = Errors.New("migration execution not found")
+	ErrInvalidInput        = Errors.New("invalid migration input")
+	ErrNotFound            = Errors.New("migration not found")
+	ErrConflict            = Errors.New("migration version already exists")
+	ErrAlreadyExecuted     = Errors.New("migration has already been executed")
+	ErrPending             = Errors.New("migration execution outcome requires verification")
+	ErrOutOfOrder          = Errors.New("migration must execute in version order")
+	ErrUnavailable         = Errors.New("migration store is unavailable")
+	ErrForbidden           = Errors.New("permission denied for database migration")
+	ErrIrreversible        = Errors.New("migration is irreversible")
+	ErrNotApplied          = Errors.New("migration is not currently applied")
+	ErrNotRolledBack       = Errors.New("migration is not currently rolled back")
+	ErrRollbackOrder       = Errors.New("only the last active migration can be rolled back")
+	ErrForwardOrder        = Errors.New("migration must be forwarded in linear order")
+	ErrLocked              = Errors.New("migration definition is locked")
+	ErrNoFailedAttempt     = Errors.New("migration has no failed execution to retry")
+	ErrExecutionMissing    = Errors.New("migration execution not found")
+	ErrExecutionTimeout    = Errors.New("migration execution exceeded its deadline")
+	ErrReconcileNotAllowed = Errors.New("execution cannot be reconciled in its current state")
 )
 
 type Migration struct {
@@ -221,6 +223,9 @@ type Execution struct {
 	StartedAt             *Time.Time      `json:"started_at,omitempty"`
 	FinishedAt            *Time.Time      `json:"finished_at,omitempty"`
 	ErrorMessage          *string         `json:"error_message,omitempty"`
+	ReconciledAt          *Time.Time      `json:"reconciled_at,omitempty"`
+	ReconciledBy          *string         `json:"reconciled_by,omitempty"`
+	ReconcileNote         *string         `json:"reconcile_note,omitempty"`
 	Attempts              []Attempt       `json:"attempts"`
 }
 
@@ -292,6 +297,8 @@ type Job struct {
 	CreatedAt           Time.Time  `json:"created_at"`
 	UpdatedAt           Time.Time  `json:"updated_at"`
 	FinishedAt          *Time.Time `json:"finished_at,omitempty"`
+	ReconciledAt        *Time.Time `json:"reconciled_at,omitempty"`
+	ReconciledBy        *string    `json:"reconciled_by,omitempty"`
 }
 
 var (
@@ -312,4 +319,15 @@ type Batch struct {
 	CommittedAt           Time.Time  `json:"committed_at"`
 	RevertedAt            *Time.Time `json:"reverted_at,omitempty"`
 	RevertedByExecutionID *string    `json:"reverted_by_execution_id,omitempty"`
+}
+
+type Evidence struct {
+	ExecutionID string    `json:"execution_id"`
+	BatchNo     int64     `json:"batch_no"`
+	Direction   string    `json:"direction"`
+	CursorFrom  int64     `json:"cursor_from"`
+	CursorTo    int64     `json:"cursor_to"`
+	RowCount    int64     `json:"row_count"`
+	AttemptNo   int       `json:"attempt_no"`
+	CreatedAt   Time.Time `json:"created_at"`
 }

@@ -106,6 +106,9 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 	Ctx = Logging.NewScope(Ctx, "job_id", Job.ID, "worker_id", W.ID, "database_id", Job.DatabaseID,
 		"migration_id", Job.MigrationID, "action", string(Job.Action), "attempt", Job.Attempts,
 		"actor_id", User.ID, "actor", User.Username)
+	HeartbeatCtx, StopHeartbeat := Context.WithCancel(Ctx)
+	defer StopHeartbeat()
+	go W.heartbeat(HeartbeatCtx, Job.ID)
 	W.logger().InfoContext(Ctx, "worker claimed migration job",
 		"event", "migration.job.claimed", "queue_wait_ms", QueueWait)
 
@@ -185,6 +188,27 @@ func (W *Worker) Process(Ctx Context.Context, Job Job) {
 		"attempt", Job.Attempts, "error", Message)
 }
 
+func (W *Worker) heartbeat(Ctx Context.Context, JobID string) {
+	Interval := W.lease() / 3
+	if Interval < Time.Second {
+		Interval = Time.Second
+	}
+	Ticker := Time.NewTicker(Interval)
+	defer Ticker.Stop()
+	for {
+		select {
+		case <-Ctx.Done():
+			return
+		case <-Ticker.C:
+			if Err := W.Repo.RenewJobLease(Ctx, JobID, W.ID, W.lease()); Err != nil {
+				W.logger().WarnContext(Ctx, "worker could not renew job lease",
+					"event", "migration.job.heartbeat_failed", "worker_id", W.ID, "job_id", JobID, "error", Err)
+				return
+			}
+		}
+	}
+}
+
 func (W *Worker) retryable(Err error) bool {
 	return Errors.Is(Err, ErrUnavailable) || Errors.Is(Err, Driver.ErrUnavailable) || Errors.Is(Err, ErrJobUnavailable)
 }
@@ -208,6 +232,8 @@ func jobErrorMessage(Err error) string {
 	switch {
 	case Errors.Is(Err, ErrPending):
 		return "execution outcome requires verification"
+	case Errors.Is(Err, ErrExecutionTimeout):
+		return "migration exceeded its execution timeout; transaction rolled back"
 	case Errors.Is(Err, Driver.ErrExecution):
 		return "target SQL execution failed"
 	case Errors.Is(Err, Driver.ErrUnavailable), Errors.Is(Err, ErrUnavailable), Errors.Is(Err, ErrJobUnavailable):

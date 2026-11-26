@@ -234,6 +234,14 @@ func (M *MockRepo) ClaimJob(_ Context.Context, WorkerID string, _ Time.Duration)
 	return Job{}, ErrJobNotFound
 }
 
+func (M *MockRepo) RenewJobLease(_ Context.Context, JobID string, WorkerID string, _ Time.Duration) error {
+	Item, Ok := M.Jobs[JobID]
+	if !Ok || Item.LockedBy == nil || *Item.LockedBy != WorkerID || Item.Status != JobRunning {
+		return ErrJobNotFound
+	}
+	return nil
+}
+
 func (M *MockRepo) FinishJob(_ Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error {
 	Item, Ok := M.Jobs[JobID]
 	if !Ok {
@@ -288,6 +296,64 @@ func (M *MockRepo) RecordBatchReverted(_ Context.Context, RollbackExecutionID st
 
 func (M *MockRepo) ListCommittedBatches(_ Context.Context, _ string) ([]Batch, error) {
 	return []Batch{}, nil
+}
+
+func (M *MockRepo) CloseRunningAttempts(_ Context.Context, ExecutionID string, Status AttemptStatus, Message string) error {
+	for Execution, Items := range M.Attempts {
+		if Execution != ExecutionID {
+			continue
+		}
+		for Index := range Items {
+			if Items[Index].Status == AttemptRunning {
+				Items[Index].Status = Status
+				Items[Index].ErrorMessage = &Message
+			}
+		}
+		M.Attempts[Execution] = Items
+	}
+	return nil
+}
+
+func (M *MockRepo) ReconcileExecution(_ Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error) {
+	Exec, Ok := M.Executions[ExecutionID]
+	if !Ok || Exec.DatabaseID != DatabaseID || Exec.MigrationID != MigrationID {
+		return Execution{}, ErrExecutionMissing
+	}
+	if Exec.Status != ExecutionRunning && Exec.Status != ExecutionQueued {
+		return Execution{}, ErrReconcileNotAllowed
+	}
+	Status := ExecutionFailed
+	AttemptStatus := AttemptFailed
+	if Succeeded {
+		Status = ExecutionSucceeded
+		AttemptStatus = AttemptSucceeded
+	}
+	Exec.Status = Status
+	Exec.ErrorMessage = nil
+	if !Succeeded && Note != "" {
+		Exec.ErrorMessage = &Note
+	}
+	Now := Time.Now().UTC()
+	Exec.FinishedAt = &Now
+	Exec.ReconciledAt = &Now
+	Exec.ReconciledBy = ActorID
+	Exec.ReconcileNote = &Note
+	M.Executions[ExecutionID] = Exec
+	_ = M.CloseRunningAttempts(Context.Background(), ExecutionID, AttemptStatus, Note)
+	for ID, Job := range M.Jobs {
+		if Job.ExecutionID != nil && *Job.ExecutionID == ExecutionID {
+			Job.Status = JobFailed
+			if Succeeded {
+				Job.Status = JobSucceeded
+			}
+			Job.FinishedAt = &Now
+			Job.ReconciledAt = &Now
+			Job.ReconciledBy = ActorID
+			M.Jobs[ID] = Job
+		}
+	}
+	_, _ = M.RefreshStatus(Context.Background(), DatabaseID, MigrationID)
+	return M.GetExecution(Context.Background(), DatabaseID, ExecutionID)
 }
 
 func (M *MockRepo) CreateExecution(_ Context.Context, DatabaseID string, MigrationID string, Request ExecutionRequest) (Execution, error) {

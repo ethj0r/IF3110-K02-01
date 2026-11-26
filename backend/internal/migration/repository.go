@@ -131,7 +131,8 @@ const ExecutionColumns = `E.id::text, E.migration_id::text, E.database_id::text,
 E.kind, E.direction, E.status, E.sql_text, E.up_sql, E.down_sql,
 E.mode, E.batch_column, E.batch_size, E.committed_batches, E.committed_rows, E.reverted_batches, E.reverted_rows, E.checkpoint_cursor,
 E.rollback_of_execution_id::text, E.retry_of_execution_id::text,
-E.requested_by::text, U.username, E.created_at, E.started_at, E.finished_at, E.error_message`
+E.requested_by::text, U.username, E.created_at, E.started_at, E.finished_at, E.error_message,
+E.reconciled_at, E.reconciled_by::text, E.reconcile_note`
 
 func isConflict(Err error) bool {
 	var PgErr *Pgconn.PgError
@@ -216,6 +217,9 @@ func scanExecution(Row rowScanner) (Execution, error) {
 		&Item.StartedAt,
 		&Item.FinishedAt,
 		&Item.ErrorMessage,
+		&Item.ReconciledAt,
+		&Item.ReconciledBy,
+		&Item.ReconcileNote,
 	)
 	if Errors.Is(Err, Pgx.ErrNoRows) {
 		return Execution{}, ErrNotFound
@@ -669,7 +673,7 @@ J.lease_expires_at, J.last_error, COALESCE(J.execution_id, E.id)::text, J.reques
 (SELECT U.username FROM users U WHERE U.id = J.requested_by), J.traceparent,
 E.status, E.mode, COALESCE(E.committed_batches, 0), COALESCE(E.committed_rows, 0),
 COALESCE(E.reverted_batches, 0), COALESCE(E.reverted_rows, 0), COALESCE(E.checkpoint_cursor, 0),
-J.created_at, J.updated_at, J.finished_at`
+J.created_at, J.updated_at, J.finished_at, J.reconciled_at, J.reconciled_by::text`
 
 // JobSource joins each job with its execution. The worker records execution_id
 // only when a job finishes, so a running job falls back to the migration's
@@ -715,6 +719,8 @@ func scanJob(Row rowScanner) (Job, error) {
 		&Item.CreatedAt,
 		&Item.UpdatedAt,
 		&Item.FinishedAt,
+		&Item.ReconciledAt,
+		&Item.ReconciledBy,
 	)
 	if Errors.Is(Err, Pgx.ErrNoRows) {
 		return Job{}, ErrJobNotFound
@@ -799,6 +805,21 @@ RETURNING J.id::text, J.database_id::text`, WorkerID, Lease.String()).Scan(&JobI
 		return Job{}, ErrJobUnavailable
 	}
 	return Repo.GetJob(Ctx, DatabaseID, JobID)
+}
+
+func (Repo *Repository) RenewJobLease(Ctx Context.Context, JobID string, WorkerID string, Lease Time.Duration) error {
+	var ID string
+	Err := Repo.queryRow(Ctx, `UPDATE migration_jobs
+SET lease_expires_at = CURRENT_TIMESTAMP + $3::interval, updated_at = CURRENT_TIMESTAMP
+WHERE id::text = $1 AND locked_by = $2 AND status = 'running'
+RETURNING id::text`, JobID, WorkerID, Lease.String()).Scan(&ID)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return ErrJobNotFound
+	}
+	if Err != nil {
+		return ErrJobUnavailable
+	}
+	return nil
 }
 
 func (Repo *Repository) FinishJob(Ctx Context.Context, JobID string, Status JobStatus, ExecutionID *string, LastError *string) error {
@@ -949,4 +970,84 @@ ORDER BY batch_no DESC`, ExecutionID)
 		return nil, ErrUnavailable
 	}
 	return Result, nil
+}
+
+func (Repo *Repository) CloseRunningAttempts(Ctx Context.Context, ExecutionID string, Status AttemptStatus, Message string) error {
+	_, Err := Repo.exec(Ctx, `UPDATE migration_attempts
+SET status = $2, error_message = $3, finished_at = CURRENT_TIMESTAMP,
+    duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000)::bigint)
+WHERE execution_id::text = $1 AND status = 'running'`, ExecutionID, string(Status), Message)
+	if Err != nil {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func (Repo *Repository) ReconcileExecution(Ctx Context.Context, DatabaseID string, MigrationID string, ExecutionID string, Succeeded bool, ActorID *string, Note string) (Execution, error) {
+	Tx, Err := Repo.begin(Ctx)
+	if Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	defer Tx.Rollback(Ctx)
+	var CurrentStatus string
+	Err = Tx.QueryRow(Ctx, `SELECT status FROM migration_executions
+WHERE database_id::text = $1 AND migration_id::text = $2 AND id::text = $3 FOR UPDATE`, DatabaseID, MigrationID, ExecutionID).Scan(&CurrentStatus)
+	if Errors.Is(Err, Pgx.ErrNoRows) {
+		return Execution{}, ErrExecutionMissing
+	}
+	if Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	if CurrentStatus != string(ExecutionRunning) && CurrentStatus != string(ExecutionQueued) {
+		return Execution{}, ErrReconcileNotAllowed
+	}
+	Status := ExecutionFailed
+	AttemptStatus := AttemptFailed
+	if Succeeded {
+		Status = ExecutionSucceeded
+		AttemptStatus = AttemptSucceeded
+	}
+	ErrorText := Note
+	if Succeeded {
+		ErrorText = ""
+	}
+	if _, Err := Tx.Exec(Ctx, `UPDATE migration_attempts
+SET status = $2,
+    error_message = CASE WHEN $2 = 'succeeded' THEN NULL ELSE $3 END,
+    finished_at = CURRENT_TIMESTAMP,
+    duration_ms = GREATEST(0, (EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - started_at)) * 1000)::bigint)
+WHERE execution_id::text = $1 AND status = 'running'`, ExecutionID, string(AttemptStatus), ErrorText); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	var NoteValue *string
+	if Note != "" {
+		NoteValue = &Note
+	}
+	var ErrorValue *string
+	if !Succeeded && Note != "" {
+		ErrorValue = &Note
+	}
+	if _, Err := Tx.Exec(Ctx, `UPDATE migration_executions
+SET status = $2, error_message = $3, finished_at = CURRENT_TIMESTAMP,
+    reconciled_at = CURRENT_TIMESTAMP, reconciled_by = $4, reconcile_note = $5
+WHERE database_id::text = $1 AND migration_id::text = $6 AND id::text = $7`,
+		DatabaseID, string(Status), ErrorValue, ActorID, NoteValue, MigrationID, ExecutionID); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	if _, Err := Tx.Exec(Ctx, `UPDATE migration_jobs
+SET status = $2,
+    last_error = CASE WHEN $2 = 'failed' THEN $3 ELSE NULL END,
+    finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+    reconciled_at = CURRENT_TIMESTAMP, reconciled_by = $4,
+    locked_by = NULL, lease_expires_at = NULL, updated_at = CURRENT_TIMESTAMP
+WHERE execution_id::text = $1`, ExecutionID, string(Status), NoteValue, ActorID); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	if Err := Tx.Commit(Ctx); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	if _, Err := Repo.RefreshStatus(Ctx, DatabaseID, MigrationID); Err != nil {
+		return Execution{}, ErrUnavailable
+	}
+	return Repo.GetExecution(Ctx, DatabaseID, ExecutionID)
 }

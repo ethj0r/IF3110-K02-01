@@ -334,3 +334,36 @@ func TestWorkerProcessesQueuedJob(T *Testing.T) {
 		T.Fatalf("target table was not created: %v", Err)
 	}
 }
+
+func TestJobLeaseRenewal(T *Testing.T) {
+	Pool := NewMigrationDatabase(T)
+	Repo := &Repository{Pool: Pool}
+	Ctx := Context.Background()
+	DBID, UserID := setupFixture(T, Pool)
+	M1, Err := Repo.Create(Ctx, DBID, MigrationInput{Title: "Lease", SQLText: "SELECT 1;", DownSQL: "SELECT 1;"}, &UserID)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Job, Err := Repo.EnqueueJob(Ctx, DBID, M1.ID, JobApply, &UserID, nil)
+	if Err != nil {
+		T.Fatal(Err)
+	}
+	Claimed, Err := Repo.ClaimJob(Ctx, "worker-lease", Time.Minute)
+	if Err != nil || Claimed.ID != Job.ID {
+		T.Fatalf("claim failed: %+v %v", Claimed, Err)
+	}
+	if Claimed.LeaseExpiresAt == nil {
+		T.Fatal("claimed job has no lease")
+	}
+	Before := *Claimed.LeaseExpiresAt
+	if Err := Repo.RenewJobLease(Ctx, Job.ID, "worker-lease", 5*Time.Minute); Err != nil {
+		T.Fatal(Err)
+	}
+	Renewed, Err := Repo.GetJob(Ctx, DBID, Job.ID)
+	if Err != nil || Renewed.LeaseExpiresAt == nil || !Renewed.LeaseExpiresAt.After(Before) {
+		T.Fatalf("lease was not renewed: %+v %v", Renewed, Err)
+	}
+	if Err := Repo.RenewJobLease(Ctx, Job.ID, "another-worker", Time.Minute); !Errors.Is(Err, ErrJobNotFound) {
+		T.Fatalf("another worker renewed the lease: %v", Err)
+	}
+}

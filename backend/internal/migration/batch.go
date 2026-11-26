@@ -80,7 +80,7 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 	}
 	defer Target.Close()
 	if Err := Server.ensureBatchEvidence(Ctx, Target); Err != nil {
-		return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+		return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
 	}
 	Cursor := Exec.CheckpointCursor
 	BatchNo := Exec.CommittedBatches + 1
@@ -100,7 +100,7 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 		Started := Time.Now()
 		Evidence, Found, Err := readBatchEvidence(BatchCtx, Target, Exec.ID, BatchNo)
 		if Err != nil {
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, ErrUnavailable))
 		}
 		if Found {
 			Exec, Err = Repo.RecordBatchUp(BatchCtx, Exec.ID, Current.DatabaseID, BatchNo, Evidence.CursorFrom, Evidence.CursorTo, Evidence.RowCount)
@@ -117,12 +117,12 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 		}
 		TargetTx, Err := Target.Begin(BatchCtx)
 		if Err != nil {
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Err))
 		}
 		Rows, Err := TargetTx.Query(BatchCtx, Exec.SQLText, Cursor, *Exec.BatchSize)
 		if Err != nil {
-			_ = TargetTx.Rollback(BatchCtx)
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+			rollbackBatch(TargetTx, BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Driver.ErrExecution))
 		}
 		Count := int64(0)
 		CursorTo := Cursor
@@ -130,8 +130,8 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 			var Value int64
 			if Err := Rows.Scan(&Value); Err != nil {
 				Rows.Close()
-				_ = TargetTx.Rollback(BatchCtx)
-				return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+				rollbackBatch(TargetTx, BatchCtx)
+				return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Driver.ErrExecution))
 			}
 			Count++
 			if Value > CursorTo {
@@ -140,17 +140,17 @@ func (Server *Service) runBatchUp(Ctx Context.Context, Repo MigrationRepository,
 		}
 		if Err := Rows.Err(); Err != nil {
 			Rows.Close()
-			_ = TargetTx.Rollback(BatchCtx)
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+			rollbackBatch(TargetTx, BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Driver.ErrExecution))
 		}
 		Rows.Close()
 		if Count == 0 {
-			_ = TargetTx.Rollback(BatchCtx)
+			rollbackBatch(TargetTx, BatchCtx)
 			return Server.finishBatchSuccess(BatchCtx, Repo, Current, Exec, Attempt)
 		}
 		if Err := writeBatchEvidence(BatchCtx, TargetTx, Exec.ID, BatchNo, string(DirectionUp), Cursor, CursorTo, Count, Attempt.AttemptNo); Err != nil {
-			_ = TargetTx.Rollback(BatchCtx)
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+			rollbackBatch(TargetTx, BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, ErrUnavailable))
 		}
 		if Err := TargetTx.Commit(BatchCtx); Err != nil {
 			Tracing.Fail(BatchSpan, ErrUnavailable, "migration batch commit outcome is uncertain")
@@ -188,7 +188,7 @@ func (Server *Service) runBatchDown(Ctx Context.Context, Repo MigrationRepositor
 	}
 	defer Target.Close()
 	if Err := Server.ensureBatchEvidence(Ctx, Target); Err != nil {
-		return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, Err)
+		return Server.finishBatchFailure(Ctx, Repo, Exec, Attempt, timeoutCause(Ctx, ErrUnavailable))
 	}
 	Batches, Err := Repo.ListCommittedBatches(Ctx, *Exec.RollbackOfExecutionID)
 	if Err != nil {
@@ -210,7 +210,7 @@ func (Server *Service) runBatchDown(Ctx Context.Context, Repo MigrationRepositor
 		Started := Time.Now()
 		_, Found, Err := readBatchEvidence(BatchCtx, Target, Exec.ID, Batch.BatchNo)
 		if Err != nil {
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, ErrUnavailable))
 		}
 		if Found {
 			Exec, Err = Repo.RecordBatchReverted(BatchCtx, Exec.ID, *Exec.RollbackOfExecutionID, Current.DatabaseID, Batch.BatchNo)
@@ -224,15 +224,15 @@ func (Server *Service) runBatchDown(Ctx Context.Context, Repo MigrationRepositor
 		}
 		TargetTx, Err := Target.Begin(BatchCtx)
 		if Err != nil {
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Err)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Err))
 		}
 		if Err := TargetTx.Exec(BatchCtx, Exec.SQLText, Batch.CursorTo, Batch.CursorFrom); Err != nil {
-			_ = TargetTx.Rollback(BatchCtx)
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+			rollbackBatch(TargetTx, BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, Driver.ErrExecution))
 		}
 		if Err := writeBatchEvidence(BatchCtx, TargetTx, Exec.ID, Batch.BatchNo, string(DirectionDown), Batch.CursorFrom, Batch.CursorTo, Batch.RowCount, Attempt.AttemptNo); Err != nil {
-			_ = TargetTx.Rollback(BatchCtx)
-			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, Driver.ErrExecution)
+			rollbackBatch(TargetTx, BatchCtx)
+			return Server.finishBatchFailure(BatchCtx, Repo, Exec, Attempt, timeoutCause(BatchCtx, ErrUnavailable))
 		}
 		if Err := TargetTx.Commit(BatchCtx); Err != nil {
 			Tracing.Fail(BatchSpan, ErrUnavailable, "migration batch revert outcome is uncertain")
@@ -253,6 +253,12 @@ func (Server *Service) runBatchDown(Ctx Context.Context, Repo MigrationRepositor
 			"rows", Batch.RowCount, "duration_ms", Time.Since(Started).Milliseconds())
 	}
 	return Server.finishBatchSuccess(Ctx, Repo, Current, Exec, Attempt)
+}
+
+func rollbackBatch(Target Driver.Tx, Ctx Context.Context) {
+	RollbackCtx, Cancel := Context.WithTimeout(Context.WithoutCancel(Ctx), 5*Time.Second)
+	defer Cancel()
+	_ = Target.Rollback(RollbackCtx)
 }
 
 func (Server *Service) finishBatchSuccess(Ctx Context.Context, Repo MigrationRepository, Current Migration, Exec Execution, Attempt Attempt) (Execution, error) {

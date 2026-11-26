@@ -73,6 +73,14 @@ func Run() error {
 	ConnectionService := &Connection.Service{Cipher: Cipher, Repo: &Connection.Repository{Pool: Pool}}
 	AccessRepo := &Access.Repository{Pool: Pool}
 	MigrationRepo := Migration.NewReviewedRepository(Pool)
+	ExecutionTimeout := 30 * Time.Minute
+	if Raw := Strings.TrimSpace(Os.Getenv("WORKER_EXECUTION_TIMEOUT")); Raw != "" {
+		Parsed, Err := Time.ParseDuration(Raw)
+		if Err != nil || Parsed <= 0 {
+			return Errors.New("WORKER_EXECUTION_TIMEOUT must be a positive duration")
+		}
+		ExecutionTimeout = Parsed
+	}
 	Service := &Migration.Service{
 		Repo:    MigrationRepo,
 		Reviews: MigrationRepo,
@@ -81,8 +89,9 @@ func Run() error {
 			_, DSN, Err := ConnectionService.DialDSN(Ctx, DatabaseID)
 			return DSN, Err
 		}),
-		Driver: Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}},
-		Logger: Slog.Default(),
+		Driver:           Driver.PostgresDriver{Tracer: Logging.SQLTracer{Database: "target"}},
+		Logger:           Slog.Default(),
+		ExecutionTimeout: ExecutionTimeout,
 	}
 	WorkerID := Strings.TrimSpace(Os.Getenv("WORKER_ID"))
 	if WorkerID == "" {
